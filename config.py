@@ -71,6 +71,26 @@ IV_RANK_LOOKBACK_DAYS = 365
 ATM_IV_TARGET_DTE = 30             # days-to-expiration iv_logger.py samples ATM IV at
 DAILY_IVR_MIN_HISTORY_POINTS = 252  # ~1 trading year of daily snapshots before IV rank is trusted
 
+# ── Oracle research tuning (backtest.py, Task 2) ─────────────────────────────
+# Delta sweep, alongside the existing DTE sweep (DEFAULT_DTE_BUCKETS, in
+# backtest.py — it's symbol/options-chain-specific, not a global constant).
+DELTA_SWEEP_BUCKETS = (0.15, 0.25, 0.35)
+# Fraction of history used for in-sample selection; the remainder is the
+# out-of-sample validation window (walk-forward).
+WALK_FORWARD_TRAIN_FRACTION = 0.7
+# Simulates paying away part of the bid-ask spread instead of always filling
+# at the theoretical mid: the fraction of the HALF-spread assumed lost.
+# Applies to every backtest_dte() caller, not just the new total-return
+# objective — a broad realism correction, not a narrowly-scoped one.
+FILL_HAIRCUT_FRACTION = 0.5
+# Fallback spread (as % of mid) when the caller doesn't have Scout's live-
+# measured bid_ask_spread_pct for this symbol on hand.
+DEFAULT_ASSUMED_SPREAD_PCT = 0.05
+# Below this many backtested cycles, a symbol's own DTE pick is shrunk
+# toward the cross-symbol consensus DTE (empirical-Bayes-style correction —
+# too little of its own history to trust the pick on its own).
+SHRINKAGE_MIN_CYCLES = 8
+
 # ── Schedule ──────────────────────────────────────────────────────────────────
 # Weekly cycle — covered calls don't need intraday polling.
 CYCLE_DAY_OF_WEEK = "monday"
