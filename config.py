@@ -86,6 +86,16 @@ FILL_HAIRCUT_FRACTION = 0.5
 # Fallback spread (as % of mid) when the caller doesn't have Scout's live-
 # measured bid_ask_spread_pct for this symbol on hand.
 DEFAULT_ASSUMED_SPREAD_PCT = 0.05
+# Smallest drawdown backtest_dte() will divide by when computing
+# risk_adjusted_return. Without this floor, a combo with near-zero observed
+# drawdown (plausible with very few cycles -- nothing to draw down from)
+# got total_return_pct substituted in as a fake "ratio" with NO risk
+# penalty at all, on a totally different scale than a genuine
+# return/drawdown ratio -- which could make a one-cycle lucky combo
+# outrank a well-evidenced multi-cycle one. Flooring the denominator keeps
+# risk_adjusted_return a real, consistently-scaled ratio for every combo,
+# capping (not eliminating) how much credit a thin-evidence path can get.
+MIN_DRAWDOWN_FLOOR_PCT = 0.02
 # Below this many backtested cycles, a symbol's own DTE pick is shrunk
 # toward the cross-symbol consensus DTE (empirical-Bayes-style correction —
 # too little of its own history to trust the pick on its own).

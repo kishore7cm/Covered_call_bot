@@ -8,13 +8,17 @@ produced the best average annualized premium yield. That becomes the
 TASK 2 ADDITIONS (on top of the original yield-sweep above):
   - RANKING OBJECTIVE: backtest_symbol_total_return() ranks (DTE, delta)
     combinations by risk-adjusted total return (premium + stock P&L,
-    divided by max drawdown), not raw average annualized premium yield.
-    Yield alone rewards short DTE almost mechanically (theta decay
-    compounds faster when annualized) without ever penalizing the
-    drawdown risk of actually holding the stock — the same lesson
-    portfolio_backtest.py already learned and fixed for its own DTE
-    picker; Oracle's single-symbol backtest didn't have an equivalent fix
-    until now.
+    divided by max(drawdown, MIN_DRAWDOWN_FLOOR_PCT)), not raw average
+    annualized premium yield. Yield alone rewards short DTE almost
+    mechanically (theta decay compounds faster when annualized) without
+    ever penalizing the drawdown risk of actually holding the stock — the
+    same lesson portfolio_backtest.py already learned and fixed for its
+    own DTE picker; Oracle's single-symbol backtest didn't have an
+    equivalent fix until now. The floor keeps this a real, consistently-
+    scaled ratio even for a combo with near-zero observed drawdown
+    (plausible with very few cycles) — without it, such a combo got
+    total_return_pct substituted in unscaled, with no risk penalty at all,
+    which could let a one-cycle lucky combo outrank a well-evidenced one.
   - DISCRETE LOTS, NOT COMPOUNDING REINVESTMENT: the original
     strategy_total_return/avg_annualized_yield (kept, unchanged, below)
     model a reinvest-100%-of-proceeds-every-cycle return — fine for
@@ -47,7 +51,9 @@ TASK 2 ADDITIONS (on top of the original yield-sweep above):
     symbol's own best pick) pulls a symbol's recommended DTE toward the
     cross-symbol consensus DTE when that symbol's own backtest had too
     few cycles to trust on its own — empirical-Bayes-style, strength
-    controlled by SHRINKAGE_MIN_CYCLES.
+    controlled by SHRINKAGE_MIN_CYCLES. If the refresh backtest at the
+    shrunk DTE finds no valid cycles, this logs a warning and keeps the
+    symbol's original (unshrunk) DTE rather than silently dropping it.
 
 KNOWN LIMITATIONS (read before trusting a number out of this):
   - No real historical options quotes exist for this account (no OPRA
@@ -98,7 +104,8 @@ import yfinance as yf
 
 from config import (
     DEFAULT_ASSUMED_SPREAD_PCT, DELTA_SWEEP_BUCKETS, FILL_HAIRCUT_FRACTION,
-    RISK_FREE_RATE, SHRINKAGE_MIN_CYCLES, TARGET_DELTA, WALK_FORWARD_TRAIN_FRACTION,
+    MIN_DRAWDOWN_FLOOR_PCT, RISK_FREE_RATE, SHRINKAGE_MIN_CYCLES, TARGET_DELTA,
+    WALK_FORWARD_TRAIN_FRACTION,
 )
 from greeks import bs_call_price, strike_from_delta
 
@@ -134,7 +141,7 @@ class CycleStats:
     total_pnl_dollars: float | None = None
     total_return_pct: float | None = None       # total_pnl_dollars / entry capital
     max_drawdown_pct: float | None = None       # see module docstring's caveat
-    risk_adjusted_return: float | None = None   # total_return_pct / max_drawdown_pct
+    risk_adjusted_return: float | None = None   # total_return_pct / max(max_drawdown_pct, MIN_DRAWDOWN_FLOOR_PCT)
 
     # Task 2: walk-forward validation + haircut provenance + shrinkage.
     in_sample_yield: float | None = None
@@ -315,9 +322,12 @@ def backtest_dte(
     entry_capital_dollars = entry_price_for_bh * 100
     total_pnl_dollars = total_return_pct * entry_capital_dollars
     stock_pnl_dollars = total_pnl_dollars - net_premium_dollars
-    risk_adjusted_return = (
-        total_return_pct / max_drawdown_pct if max_drawdown_pct > 1e-9 else total_return_pct
-    )
+    # Always divide by a real (floored) drawdown rather than falling back to
+    # total_return_pct unscaled on near-zero drawdown -- that fallback had NO
+    # risk penalty at all and was on a different scale than a genuine ratio,
+    # which could let a one-cycle lucky combo outrank a well-evidenced one
+    # with real (larger) drawdown. See config.MIN_DRAWDOWN_FLOOR_PCT.
+    risk_adjusted_return = total_return_pct / max(max_drawdown_pct, MIN_DRAWDOWN_FLOOR_PCT)
 
     return CycleStats(
         dte=dte,
@@ -471,7 +481,16 @@ def apply_dte_shrinkage(
             lookback=lookback, spread_pct=stats.spread_pct_used, spread_source=stats.spread_source,
             rate=rate, haircut_fraction=haircut_fraction, train_fraction=train_fraction,
         )
-        shrunk[symbol] = replace(refreshed, shrunk_from_dte=stats.dte) if refreshed else stats
+        if refreshed is None:
+            _log.warning(
+                "%s: shrinkage wanted to move DTE %d -> %d (toward consensus %d) but the refresh "
+                "backtest found no valid cycles there -- keeping the original DTE=%d unshrunk",
+                symbol, stats.dte, new_dte, global_best_dte, stats.dte,
+            )
+            shrunk[symbol] = stats
+            continue
+
+        shrunk[symbol] = replace(refreshed, shrunk_from_dte=stats.dte)
 
     return shrunk
 

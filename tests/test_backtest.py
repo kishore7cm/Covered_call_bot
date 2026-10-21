@@ -1,3 +1,4 @@
+import logging
 from datetime import date, timedelta
 
 import numpy as np
@@ -83,6 +84,41 @@ def test_discrete_lot_dollar_math_matches_trader_state_machine(monkeypatch):
     # the crash in event 2 -- a drawdown that only exists because lot 2's
     # shares were still held (never sold/rebought) across the ROLL.
     assert stats.max_drawdown_pct == pytest.approx(1 - 0.86 / 1.20, abs=1e-6)
+    assert stats.risk_adjusted_return == pytest.approx(stats.total_return_pct / stats.max_drawdown_pct)
+
+
+def test_risk_adjusted_return_floors_near_zero_drawdown_instead_of_passthrough(monkeypatch):
+    """Equity only ever rises -- max_drawdown_pct is exactly 0, nothing real
+    to divide by. Must floor at MIN_DRAWDOWN_FLOOR_PCT, NOT silently fall
+    back to the raw, unpenalized total_return_pct (which would put a
+    one-cycle lucky combo on a different, more generous scale than a
+    well-evidenced combo with genuine drawdown)."""
+    events = [
+        {"pos": 0, "exit_pos": 1, "spot": 100.0, "strike": 110.0, "premium": 2.0, "spot_t": 115.0, "assigned": True},
+    ]
+    monkeypatch.setattr(backtest, "_simulate_cycles", lambda *a, **k: events)
+
+    stats = backtest.backtest_dte(pd.Series(dtype=float), pd.Series(dtype=float), dte=30, target_delta=0.25)
+
+    assert stats.max_drawdown_pct == 0.0
+    assert stats.risk_adjusted_return == pytest.approx(stats.total_return_pct / backtest.MIN_DRAWDOWN_FLOOR_PCT)
+    assert stats.risk_adjusted_return != pytest.approx(stats.total_return_pct)
+
+
+def test_risk_adjusted_return_unaffected_by_floor_when_drawdown_is_real(monkeypatch):
+    """Sanity check the floor doesn't kick in (and doesn't change the
+    answer) once there's a real, above-floor drawdown -- same scenario as
+    the state-machine test above, which has a genuine ~28% drawdown."""
+    events = [
+        {"pos": 0, "exit_pos": 1, "spot": 100.0, "strike": 110.0, "premium": 2.0, "spot_t": 120.0, "assigned": True},
+        {"pos": 1, "exit_pos": 2, "spot": 120.0, "strike": 130.0, "premium": 3.0, "spot_t": 125.0, "assigned": False},
+        {"pos": 2, "exit_pos": 3, "spot": 125.0, "strike": 135.0, "premium": 1.0, "spot_t": 90.0, "assigned": False},
+    ]
+    monkeypatch.setattr(backtest, "_simulate_cycles", lambda *a, **k: events)
+
+    stats = backtest.backtest_dte(pd.Series(dtype=float), pd.Series(dtype=float), dte=30, target_delta=0.25)
+
+    assert stats.max_drawdown_pct > backtest.MIN_DRAWDOWN_FLOOR_PCT
     assert stats.risk_adjusted_return == pytest.approx(stats.total_return_pct / stats.max_drawdown_pct)
 
 
@@ -208,3 +244,24 @@ def test_shrinkage_noop_when_no_symbol_is_trusted():
     recommendations = {"AAA": _stats(dte=7, num_cycles=1), "BBB": _stats(dte=30, num_cycles=2)}
     result = backtest.apply_dte_shrinkage(recommendations, min_cycles=8)
     assert result is recommendations
+
+
+def test_shrinkage_logs_warning_and_keeps_original_dte_when_refresh_finds_no_cycles(monkeypatch, caplog):
+    """If the refresh backtest at the shrunk DTE comes back empty, this must
+    not silently keep the old stats with no trace -- it should log why, and
+    leave the symbol explicitly unshrunk (shrunk_from_dte stays None, since
+    the shrink didn't actually happen)."""
+    recommendations = {
+        "AAA": _stats(dte=30, num_cycles=20),
+        "BBB": _stats(dte=30, num_cycles=15),
+        "OUTLIER": _stats(dte=7, num_cycles=2),
+    }
+    monkeypatch.setattr(backtest, "backtest_symbol_total_return", lambda *a, **k: None)
+
+    with caplog.at_level(logging.WARNING, logger="backtest"):
+        result = backtest.apply_dte_shrinkage(recommendations, min_cycles=8)
+
+    assert result["OUTLIER"].dte == 7  # unchanged -- refresh failed, fell back to the original
+    assert result["OUTLIER"].shrunk_from_dte is None  # NOT marked as shrunk, since it wasn't
+    messages = [rec.message for rec in caplog.records]
+    assert any("OUTLIER" in m and "shrinkage wanted to move DTE" in m for m in messages)
