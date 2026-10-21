@@ -63,6 +63,14 @@ REQUIRE_EXPIRY_BEFORE_EARNINGS = True  # skip contracts expiring on/after a know
 MIN_IV_HISTORY_POINTS = 8       # ~2 months of weekly snapshots before trusting rank at all
 IV_RANK_LOOKBACK_DAYS = 365
 
+# ── Daily IV logging (iv_logger.py) — a separate, research-cadence history
+# from the weekly iv_history table above. Runs once/day (cron/Railway
+# scheduled job, not part of main.py's worker), so a real 1-trading-year IV
+# rank is reachable in ~a year instead of ~5 — but until then this is purely
+# informational, same as the weekly gate: not read by main.py in this phase.
+ATM_IV_TARGET_DTE = 30             # days-to-expiration iv_logger.py samples ATM IV at
+DAILY_IVR_MIN_HISTORY_POINTS = 252  # ~1 trading year of daily snapshots before IV rank is trusted
+
 # ── Schedule ──────────────────────────────────────────────────────────────────
 # Weekly cycle — covered calls don't need intraday polling.
 CYCLE_DAY_OF_WEEK = "monday"

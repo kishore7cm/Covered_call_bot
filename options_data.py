@@ -317,20 +317,51 @@ def pick_strike(
     return best
 
 
-def get_atm_iv(underlying: str, spot_price: float) -> float | None:
+# How far either side of target_dte get_atm_iv() searches when target_dte is
+# given — wide enough to usually contain a real expiration near the target,
+# narrow enough that "nearest expiration" doesn't drift to something only
+# loosely related to the requested tenor.
+ATM_IV_DTE_SEARCH_PAD_DAYS = 10
+
+
+def get_atm_iv(underlying: str, spot_price: float, target_dte: int | None = None) -> float | None:
     """
-    Solve IV for the call contract with strike closest to spot_price, in the
-    standard DTE window. Used for IV-rank/percentile tracking (see iv_rank.py)
-    — intentionally independent of pick_strike()'s delta/liquidity gates,
-    since IV history should reflect the market's general level, not just
-    whatever happened to pass this cycle's filters.
+    Solve IV for a call contract with strike closest to spot_price. Used for
+    IV-rank/percentile tracking (see iv_rank.py) — intentionally independent
+    of pick_strike()'s delta/liquidity gates, since IV history should reflect
+    the market's general level, not just whatever happened to pass this
+    cycle's filters.
+
+    target_dte=None (default — what main.py's weekly cycle already uses):
+    picks nearest-strike-to-spot across every expiration in the standard
+    DTE_MIN..DTE_MAX window, which can mix expirations from one call to the
+    next.
+
+    target_dte=N: first narrows to the single expiration closest to N days
+    out (searching +/- ATM_IV_DTE_SEARCH_PAD_DAYS), then picks nearest strike
+    within just that expiration — gives a consistent, comparable "ATM IV at
+    ~N DTE" reading day over day, which iv_logger.py needs for a clean daily
+    series. Existing callers that don't pass target_dte are unaffected.
     """
-    contracts = list_call_contracts(underlying, spot_price=spot_price)
+    today = date.today()
+
+    if target_dte is not None:
+        dte_min = max(1, target_dte - ATM_IV_DTE_SEARCH_PAD_DAYS)
+        dte_max = target_dte + ATM_IV_DTE_SEARCH_PAD_DAYS
+        contracts = list_call_contracts(underlying, spot_price=spot_price, dte_min=dte_min, dte_max=dte_max)
+    else:
+        contracts = list_call_contracts(underlying, spot_price=spot_price)
+
     if not contracts:
         return None
 
+    if target_dte is not None:
+        nearest_expiration = min(
+            contracts, key=lambda c: abs((c.expiration_date - today).days - target_dte)
+        ).expiration_date
+        contracts = [c for c in contracts if c.expiration_date == nearest_expiration]
+
     snapshots = get_chain_snapshot(underlying)
-    today = date.today()
 
     nearest = min(contracts, key=lambda c: abs(float(c.strike_price) - spot_price))
     snap = snapshots.get(nearest.symbol)
