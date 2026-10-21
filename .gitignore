@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+*.log
+logs/
+.DS_Store
+pipeline_state/
+*.db
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*credentials*
+*secret*
+.pytest_cache/

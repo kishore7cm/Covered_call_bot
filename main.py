@@ -1,0 +1,332 @@
+"""
+Orchestrator: weekly scheduler + per-symbol covered call cycle.
+
+Every symbol's cycle is wrapped in its own try/except, and the scheduler
+loop itself is wrapped too — a single bad cycle (bad quote, API hiccup,
+unexpected position state) logs and notifies, but never kills the process.
+This is a direct response to how the ORB stock bot in this account's history
+died: an unhandled exception in a tight loop with no guard, silent for
+weeks before anyone noticed. Here the cadence is weekly, so a silent death
+would be even easier to miss — the guard matters more, not less.
+"""
+import asyncio
+import json
+import logging
+import os
+import time
+from datetime import date
+
+import schedule
+
+import notifier
+import trader
+from config import (
+    WATCHLIST, SHARES_PER_LOT, TARGET_DELTA,
+    PROFIT_TAKE_PCT, ROLL_TRIGGER_DELTA, ROLL_MIN_DTE, RISK_FREE_RATE,
+    CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET, MIN_IV_HISTORY_POINTS,
+    DTE_MIN, DTE_MAX,
+)
+from greeks import delta_from_quote
+from iv_rank import iv_rank, iv_percentile
+from logger import (
+    init_schema, log_option_trade, log_share_trade, log_error,
+    record_iv_snapshot, get_iv_history, get_last_open_occ_symbol,
+)
+from options_data import pick_strike, get_chain_snapshot, parse_occ_symbol, get_atm_iv
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+ACTIVE_WATCHLIST_PATH = "pipeline_state/active_watchlist.json"
+# How far either side of the backtest's recommended DTE the live chain search
+# is allowed to range — real expirations don't land on the exact day the
+# backtest assumed, so an exact match would too often find nothing.
+DTE_TOLERANCE_DAYS = 5
+
+
+def _load_watchlist() -> dict[str, int | None]:
+    """
+    symbol -> recommended_dte, read from the human-approved
+    active_watchlist.json (written by apply_watchlist.py). Falls back to
+    config.WATCHLIST with the global DTE_MIN/DTE_MAX window (recommended_dte
+    None) if the pipeline hasn't been run yet, so the bot still does
+    something sensible rather than going idle.
+    """
+    if os.path.exists(ACTIVE_WATCHLIST_PATH):
+        with open(ACTIVE_WATCHLIST_PATH) as f:
+            payload = json.load(f)
+        symbols = payload.get("symbols", {})
+        if symbols:
+            return {sym: stats.get("dte") for sym, stats in symbols.items()}
+        logger.warning("%s exists but has no symbols — falling back to config.WATCHLIST", ACTIVE_WATCHLIST_PATH)
+    else:
+        logger.warning(
+            "%s not found — falling back to config.WATCHLIST with the default DTE_MIN/DTE_MAX window. "
+            "Run screener.py -> backtest.py -> apply_watchlist.py to populate it.",
+            ACTIVE_WATCHLIST_PATH,
+        )
+    return {sym: None for sym in WATCHLIST}
+
+
+def _dte_window(recommended_dte: int | None) -> tuple[int, int]:
+    if recommended_dte is None:
+        return DTE_MIN, DTE_MAX
+    return max(1, recommended_dte - DTE_TOLERANCE_DAYS), recommended_dte + DTE_TOLERANCE_DAYS
+
+
+def _run_async(coro):
+    """Fire-and-forget a notifier coroutine from sync code without needing
+    an event loop running at module scope."""
+    try:
+        asyncio.run(coro)
+    except Exception as e:
+        logger.error("notifier send failed: %s", e)
+
+
+def _get_spot_price(symbol: str) -> float | None:
+    from alpaca.data.historical.stock import StockHistoricalDataClient
+    from alpaca.data.requests import StockLatestTradeRequest
+    from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+
+    client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    try:
+        trade = client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))
+        return float(trade[symbol].price)
+    except Exception as e:
+        logger.error("_get_spot_price(%s) failed: %s", symbol, e)
+        return None
+
+
+def _track_iv_history(symbol: str) -> str | None:
+    """
+    Record this cycle's ATM IV and, if enough history has accumulated,
+    return a short "IV rank X%, percentile Y%" string for the digest.
+    Best-effort: any failure here is logged but must never block the
+    actual trading decision for this symbol.
+    """
+    spot = _get_spot_price(symbol)
+    if spot is None:
+        return None
+
+    atm_iv = get_atm_iv(symbol, spot)
+    if atm_iv is None:
+        return None
+
+    record_iv_snapshot(symbol, atm_iv)
+
+    history = get_iv_history(symbol)
+    rank = iv_rank(atm_iv, history)
+    pctl = iv_percentile(atm_iv, history)
+    if rank is None or pctl is None:
+        return f"{symbol}: IV={atm_iv:.2f} (rank unavailable — {len(history)} pts, need {MIN_IV_HISTORY_POINTS})"
+    return f"{symbol}: IV={atm_iv:.2f}, rank={rank:.0f}%, percentile={pctl:.0f}%"
+
+
+def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
+    """
+    Run one covered-call decision cycle for a single symbol. Returns a short
+    human-readable summary string for the cycle-level Telegram digest.
+    Never raises — all failure paths return a string and log via log_error.
+
+    recommended_dte comes from the research pipeline (screener.py ->
+    backtest.py -> apply_watchlist.py); None means the pipeline hasn't been
+    run for this symbol yet and the global DTE_MIN/DTE_MAX window is used.
+    """
+    dte_min, dte_max = _dte_window(recommended_dte)
+
+    share_pos = trader.get_share_position(symbol)
+    share_qty = int(float(share_pos.qty)) if share_pos else 0
+
+    short_call = trader.find_short_call(symbol)
+
+    # ── State 1: no shares — buy a lot ──────────────────────────────────────
+    if share_qty < SHARES_PER_LOT:
+        # Distinguish "never held shares yet" from "shares were just
+        # assigned away" via the trade log, rather than in-process state
+        # that wouldn't survive a restart — find_short_call() already
+        # confirms there's no open short call to account for the missing
+        # shares, and get_last_open_occ_symbol() tells us whether we ever
+        # sold one in the first place.
+        last_occ_symbol = get_last_open_occ_symbol(symbol) if short_call is None else None
+        if share_qty == 0 and last_occ_symbol:
+            status = trader.check_assignment(symbol, SHARES_PER_LOT)
+            if status == "assigned":
+                parsed = parse_occ_symbol(last_occ_symbol)
+                log_option_trade(
+                    symbol, last_occ_symbol, "ASSIGNED",
+                    strike=parsed.strike, expiration=parsed.expiration,
+                    underlying_price=_get_spot_price(symbol),
+                )
+                _run_async(notifier.send_call_closed(symbol, last_occ_symbol, "assigned", 0.0))
+            elif status == "unexpected_shares":
+                log_error("main.run_symbol_cycle", f"{symbol}: share count mismatch after expected assignment")
+
+        result = trader.buy_shares(symbol, SHARES_PER_LOT)
+        if result is None:
+            log_error("main.run_symbol_cycle", f"{symbol}: buy_shares failed")
+            return f"{symbol}: FAILED to buy shares"
+        log_share_trade(symbol, "BUY", SHARES_PER_LOT, price=result.get("price"), order_id=result["order_id"])
+        _run_async(notifier.send_shares_bought(symbol, SHARES_PER_LOT, result["order_id"]))
+        return f"{symbol}: bought {SHARES_PER_LOT} shares"
+
+    # ── State 2: shares held, no short call — sell one ──────────────────────
+    if short_call is None:
+        spot = _get_spot_price(symbol)
+        if spot is None:
+            log_error("main.run_symbol_cycle", f"{symbol}: no spot price available")
+            return f"{symbol}: FAILED to get spot price"
+
+        candidate = pick_strike(symbol, spot, TARGET_DELTA, dte_min=dte_min, dte_max=dte_max)
+        if candidate is None:
+            return f"{symbol}: no suitable strike found this cycle (held)"
+
+        result = trader.sell_to_open_call(candidate.occ_symbol, qty=1)
+        if result is None:
+            log_error("main.run_symbol_cycle", f"{symbol}: sell_to_open_call failed")
+            return f"{symbol}: FAILED to sell call"
+
+        log_option_trade(
+            symbol, candidate.occ_symbol, "SELL_TO_OPEN",
+            strike=candidate.strike, expiration=candidate.expiration,
+            premium=candidate.mid_price, delta_at_entry=candidate.delta,
+            underlying_price=spot, order_id=result["order_id"],
+        )
+        _run_async(notifier.send_call_sold(
+            symbol, candidate.occ_symbol, candidate.strike, candidate.expiration,
+            candidate.mid_price, candidate.delta,
+        ))
+        return f"{symbol}: sold {candidate.occ_symbol} @ ${candidate.mid_price:.2f} (delta {candidate.delta:.2f})"
+
+    # ── State 3: shares + short call open — check close/roll rules ──────────
+    occ_symbol = short_call.symbol
+    # NOTE — unverified against a live position: this assumes Alpaca's
+    # cost_basis/market_value for an option Position already include the
+    # 100x contract multiplier (consistent with how equities report total
+    # dollar cost_basis = qty * price). The account was flat with no open
+    # option positions when this was written, so there was nothing live to
+    # check it against. Verify this against the first real short call this
+    # bot opens — print both raw fields before trusting profit_captured_pct
+    # for a close decision.
+    entry_credit = abs(float(short_call.cost_basis)) / 100.0
+    current_value = abs(float(short_call.market_value)) / 100.0
+    profit_captured_pct = (entry_credit - current_value) / entry_credit if entry_credit else 0.0
+
+    if profit_captured_pct >= PROFIT_TAKE_PCT:
+        result = trader.buy_to_close_call(occ_symbol, qty=1)
+        if result is None:
+            log_error("main.run_symbol_cycle", f"{symbol}: buy_to_close_call failed (profit take)")
+            return f"{symbol}: FAILED to close {occ_symbol} for profit take"
+        pnl = (entry_credit - current_value) * 100
+        log_option_trade(symbol, occ_symbol, "BUY_TO_CLOSE", premium=current_value, order_id=result["order_id"])
+        _run_async(notifier.send_call_closed(symbol, occ_symbol, "profit_take", pnl))
+        return f"{symbol}: closed {occ_symbol} — {profit_captured_pct:.0%} of max profit captured"
+
+    # Check if the short call is being tested (delta risen) or running low on DTE.
+    # Position objects carry no strike/expiration fields for options — both
+    # have to be parsed out of the OCC symbol itself.
+    parsed = parse_occ_symbol(occ_symbol)
+    dte = (parsed.expiration - date.today()).days
+    needs_roll_dte = dte <= ROLL_MIN_DTE
+
+    spot = _get_spot_price(symbol)
+    needs_roll_delta = False
+
+    if spot is not None and dte > 0:
+        snapshots = get_chain_snapshot(symbol)
+        snap = snapshots.get(occ_symbol)
+        if snap is not None and snap.latest_quote and snap.latest_quote.bid_price and snap.latest_quote.ask_price:
+            mid = (snap.latest_quote.bid_price + snap.latest_quote.ask_price) / 2.0
+            cur_delta = delta_from_quote(mid, spot, parsed.strike, dte / 365.0, RISK_FREE_RATE)
+            if cur_delta is not None and cur_delta >= ROLL_TRIGGER_DELTA:
+                needs_roll_delta = True
+
+    if needs_roll_dte or needs_roll_delta:
+        spot = spot or _get_spot_price(symbol)
+        new_candidate = pick_strike(symbol, spot, TARGET_DELTA, dte_min=dte_min, dte_max=dte_max) if spot else None
+        if new_candidate is None:
+            log_error("main.run_symbol_cycle", f"{symbol}: roll triggered but no new candidate found")
+            return f"{symbol}: roll triggered but FAILED to find new strike"
+
+        result = trader.roll_call(occ_symbol, new_candidate.occ_symbol, qty=1)
+        if result is None:
+            log_error("main.run_symbol_cycle", f"{symbol}: roll_call failed")
+            return f"{symbol}: FAILED to roll {occ_symbol}"
+
+        log_option_trade(symbol, new_candidate.occ_symbol, "ROLL",
+                          strike=new_candidate.strike, expiration=new_candidate.expiration,
+                          premium=new_candidate.mid_price, delta_at_entry=new_candidate.delta,
+                          underlying_price=spot, order_id=result["opened"]["order_id"])
+        _run_async(notifier.send_call_rolled(symbol, occ_symbol, new_candidate.occ_symbol, 0.0))
+        return f"{symbol}: rolled {occ_symbol} -> {new_candidate.occ_symbol}"
+
+    return f"{symbol}: holding {occ_symbol} ({profit_captured_pct:.0%} profit captured)"
+
+
+def run_cycle() -> None:
+    logger.info("=" * 60)
+    logger.info("CYCLE START")
+    # Loaded fresh every cycle (not cached at module scope) so an
+    # apply_watchlist.py --confirm run takes effect on the very next
+    # scheduled cycle without needing a restart.
+    watchlist = _load_watchlist()
+    actions = []
+    for symbol, recommended_dte in watchlist.items():
+        try:
+            iv_note = _track_iv_history(symbol)
+            if iv_note:
+                actions.append(iv_note)
+        except Exception as e:
+            # IV tracking is informational — never let it block the actual
+            # trading decision below.
+            logger.exception("IV tracking failed for %s", symbol)
+            log_error("main._track_iv_history", f"{symbol}: {e}")
+
+        try:
+            actions.append(run_symbol_cycle(symbol, recommended_dte))
+        except Exception as e:
+            # Last-resort guard: even if a symbol's cycle has a bug we didn't
+            # anticipate, it must not take down the rest of the watchlist or
+            # the scheduler loop.
+            logger.exception("Unhandled error in run_symbol_cycle(%s)", symbol)
+            log_error("main.run_cycle", f"{symbol}: unhandled exception: {e}")
+            _run_async(notifier.send_error(symbol, str(e)))
+            actions.append(f"{symbol}: UNHANDLED ERROR — {e}")
+    logger.info("CYCLE END")
+    logger.info("=" * 60)
+    _run_async(notifier.send_cycle_summary(actions))
+
+
+def scheduled_run() -> None:
+    try:
+        run_cycle()
+    except Exception as e:
+        # Guard the scheduler callback itself — this is the exact shape of
+        # gap that killed the ORB bot (unhandled exception in the scheduled
+        # callback, no restart-safe recovery).
+        logger.exception("Unhandled error in scheduled_run")
+        log_error("main.scheduled_run", str(e))
+        _run_async(notifier.send_error("SCHEDULER", str(e)))
+
+
+getattr(schedule.every(), CYCLE_DAY_OF_WEEK).at(CYCLE_TIME_ET).do(scheduled_run)
+
+if __name__ == "__main__":
+    startup_watchlist = _load_watchlist()
+    if not startup_watchlist:
+        logger.warning(
+            "No symbols in %s or config.WATCHLIST — add some before this bot can do anything.",
+            ACTIVE_WATCHLIST_PATH,
+        )
+
+    init_schema()
+    logger.info(
+        "Covered call bot started | %d symbols | target_delta=%.2f | %s %s ET",
+        len(startup_watchlist), TARGET_DELTA, CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET,
+    )
+    while True:
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            logger.exception("Unhandled error in schedule.run_pending()")
+            log_error("main.loop", str(e))
+        time.sleep(30)
