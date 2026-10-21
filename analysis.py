@@ -21,6 +21,14 @@ LIMITATIONS, read before trusting a number out of this:
     you what's worth looking into, not "this is definitely why."
   - Stock P&L only covers one lot at a time (this bot never holds more than
     SHARES_PER_LOT per symbol), matched by nearest-prior BUY in share_trades.
+  - TASK 4 (per-IVR-tier breakdown): nothing logs the IVR a real trade was
+    opened under -- main.py stays unedited in this phase, per the project's
+    scoping, so there's no column to read it from directly. Instead,
+    _ivr_at_date() reconstructs it AS OF each trade's own open date from
+    iv_logger.py's daily history (Task 1) -- which means a trade opened
+    before iv_logger.py had 252 days of history for that symbol will show
+    up as "insufficient history" here forever; this breakdown gets more
+    complete the longer iv_logger.py has been running, not retroactively.
 """
 import argparse
 import json
@@ -29,8 +37,10 @@ import os
 from datetime import date, datetime
 
 import backtest
+import iv_logger
 from calendar_data import get_past_earnings_dates
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, DAILY_IVR_MIN_HISTORY_POINTS
+from iv_rank import iv_rank_from_daily_history
 from logger import get_option_trades, get_share_trades
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
@@ -43,6 +53,11 @@ OUT_PATH = "pipeline_state/analysis_report.json"
 YIELD_DRIFT_THRESHOLD_PP = 10.0       # percentage points
 ASSIGNMENT_DRIFT_THRESHOLD_PP = 10.0  # percentage points
 MARKET_WIDE_DECLINE_THRESHOLD = -0.05  # SPY move over the same window, below which we call it "market-wide"
+
+# Task 4: per-IVR-tier breakdown. Plain quintiles -- this is a reporting
+# bucket, unrelated to portfolio_backtest.py's IVR_DTE_TIERS (which encodes
+# a DTE *decision*, a different concern entirely).
+TIER_LABELS = ["0-20", "20-40", "40-60", "60-80", "80-100"]
 
 
 def _get_spot_price(symbol: str) -> float | None:
@@ -65,8 +80,44 @@ def _load_watchlist_stats(path: str) -> dict:
         return json.load(f).get("symbols", {})
 
 
+def _load_predicted(watchlist_path: str) -> dict:
+    """active_watchlist.json's stats, falling back to proposed_watchlist.json
+    if the pipeline hasn't been approved yet -- same fallback run_analysis()
+    already used inline; factored out so Task 4's new functions don't each
+    repeat it."""
+    predicted = _load_watchlist_stats(watchlist_path)
+    if not predicted:
+        predicted = _load_watchlist_stats(PROPOSED_PATH)
+    return predicted
+
+
 def _parse_ts(v) -> datetime:
     return v if isinstance(v, datetime) else datetime.fromisoformat(str(v))
+
+
+def _ivr_at_date(symbol: str, as_of: date) -> float | str | None:
+    """
+    IVR for `symbol` using only iv_logger.py's daily history up to and
+    including `as_of` -- see the module docstring's Task 4 note on why this
+    is reconstructed after the fact rather than read off the trade itself.
+    Returns iv_rank_from_daily_history's own sentinel ("insufficient
+    history") below DAILY_IVR_MIN_HISTORY_POINTS, None if there's enough
+    history but no variation in it to rank against.
+    """
+    history = [h["atm_iv"] for h in iv_logger.get_history(symbol) if h["date"] <= as_of]
+    return iv_rank_from_daily_history(history)
+
+
+def _tier_label(ivr: float) -> str:
+    if ivr >= 80:
+        return "80-100"
+    if ivr >= 60:
+        return "60-80"
+    if ivr >= 40:
+        return "40-60"
+    if ivr >= 20:
+        return "20-40"
+    return "0-20"
 
 
 def _net_option_premium_dollars(rows: list[dict]) -> float:
@@ -258,14 +309,103 @@ def analyze_symbol(symbol: str, predicted: dict | None) -> dict:
 
 
 def run_analysis(watchlist_path: str = ACTIVE_PATH) -> list[dict]:
-    predicted_by_symbol = _load_watchlist_stats(watchlist_path)
-    if not predicted_by_symbol:
-        predicted_by_symbol = _load_watchlist_stats(PROPOSED_PATH)
+    predicted_by_symbol = _load_predicted(watchlist_path)
 
     rows = get_option_trades()
     symbols = sorted(set(r["symbol"] for r in rows)) if rows else sorted(predicted_by_symbol.keys())
 
     return [analyze_symbol(symbol, predicted_by_symbol.get(symbol)) for symbol in symbols]
+
+
+def _ivr_tier_breakdown(rows: list[dict], predicted_by_symbol: dict) -> list[dict]:
+    """
+    Groups every real SELL_TO_OPEN/ROLL cycle by the IVR (Task 1's daily
+    history, as of that cycle's own open date) it was opened under, and
+    reports realized vs. predicted annualized yield + assignment rate per
+    tier -- the same predicted-vs-realized question analyze_symbol already
+    asks per symbol, asked again across the IVR axis instead. Per-cycle
+    annualized yield uses that cycle's OWN logged expiration (more precise
+    than analyze_symbol's symbol-level avg-cycle-span approximation, and
+    available here for free since `expiration` is already a logged column).
+    Assignment matching is by occ_symbol, not a global rate, so each ASSIGNED
+    row counts against the specific tier its OPENING cycle fell into.
+    """
+    opens = [
+        r for r in rows
+        if r["action"] in ("SELL_TO_OPEN", "ROLL") and r["premium"] and r["underlying_price"] and r["expiration"]
+    ]
+    assigned_occ_symbols = {r["occ_symbol"] for r in rows if r["action"] == "ASSIGNED"}
+
+    tier_cycles: dict[str, list[dict]] = {label: [] for label in TIER_LABELS}
+    insufficient_history_count = 0
+
+    for r in opens:
+        opened_at = _parse_ts(r["occurred_at"]).date()
+        ivr = _ivr_at_date(r["symbol"], opened_at)
+        if not isinstance(ivr, float):
+            insufficient_history_count += 1
+            continue
+        tier_cycles[_tier_label(ivr)].append(r)
+
+    breakdown = []
+    for label in TIER_LABELS:
+        cycles = tier_cycles[label]
+        if not cycles:
+            continue
+
+        annualized_yields = []
+        for c in cycles:
+            dte = (c["expiration"] - _parse_ts(c["occurred_at"]).date()).days
+            if dte <= 0:
+                continue
+            annualized_yields.append((float(c["premium"]) / float(c["underlying_price"])) * (365.0 / dte))
+        if not annualized_yields:
+            continue
+
+        predicted_yields = [
+            predicted_by_symbol[c["symbol"]]["avg_annualized_yield"]
+            for c in cycles
+            if c["symbol"] in predicted_by_symbol and predicted_by_symbol[c["symbol"]].get("avg_annualized_yield") is not None
+        ]
+        assigned_count = sum(1 for c in cycles if c["occ_symbol"] in assigned_occ_symbols)
+
+        breakdown.append({
+            "tier": label,
+            "num_cycles": len(cycles),
+            "realized_avg_yield": sum(annualized_yields) / len(annualized_yields),
+            "predicted_avg_yield": sum(predicted_yields) / len(predicted_yields) if predicted_yields else None,
+            "assignment_rate": assigned_count / len(cycles),
+        })
+
+    if insufficient_history_count:
+        breakdown.append({"tier": "insufficient history", "num_cycles": insufficient_history_count})
+
+    return breakdown
+
+
+def run_ivr_tier_analysis(watchlist_path: str = ACTIVE_PATH) -> list[dict]:
+    predicted_by_symbol = _load_predicted(watchlist_path)
+    rows = get_option_trades()
+    return _ivr_tier_breakdown(rows, predicted_by_symbol)
+
+
+def _overall_bias_pp(results: list[dict], predicted_by_symbol: dict) -> float | None:
+    """
+    Single number: mean(realized - predicted annualized yield) across every
+    symbol with both, in percentage points. Positive = live trading is
+    running ahead of what Oracle's backtest predicted on average; negative
+    = behind. None if no symbol has both numbers yet.
+    """
+    diffs = []
+    for r in results:
+        realized = r.get("realized_annualized_yield")
+        predicted = predicted_by_symbol.get(r["symbol"], {}).get("avg_annualized_yield")
+        if realized is not None and predicted is not None:
+            diffs.append(realized - predicted)
+
+    if not diffs:
+        return None
+    return (sum(diffs) / len(diffs)) * 100
 
 
 def _print_report(results: list[dict]) -> None:
@@ -304,16 +444,56 @@ def _print_report(results: list[dict]) -> None:
         print(f"Lost money overall on: {', '.join(lost_money)} — see loss factors above before re-adding/keeping these.")
 
 
+def _print_tier_and_bias(tier_breakdown: list[dict], bias_pp: float | None) -> None:
+    print("\n--- IVR-tier breakdown (realized vs. predicted, by IVR at cycle open) ---")
+    numeric_rows = [row for row in tier_breakdown if row["tier"] != "insufficient history"]
+    if not numeric_rows:
+        print("  No cycles with a resolvable IVR yet.")
+    for row in numeric_rows:
+        predicted_str = (
+            f"{row['predicted_avg_yield'] * 100:.1f}%" if row["predicted_avg_yield"] is not None else "n/a"
+        )
+        print(
+            f"  IVR {row['tier']:>7}: {row['num_cycles']:>3} cycle(s) | "
+            f"realized={row['realized_avg_yield'] * 100:>6.1f}%  predicted={predicted_str:>6}  "
+            f"assignment_rate={row['assignment_rate'] * 100:.1f}%"
+        )
+
+    insufficient = next((row for row in tier_breakdown if row["tier"] == "insufficient history"), None)
+    if insufficient:
+        print(
+            f"  insufficient history: {insufficient['num_cycles']} cycle(s) skipped — iv_logger.py hasn't "
+            f"reached {DAILY_IVR_MIN_HISTORY_POINTS} days for the symbol(s) involved as of their open date"
+        )
+
+    print("\n--- Overall bias (mean realized - predicted annualized yield, across symbols) ---")
+    if bias_pp is None:
+        print("  n/a — no symbol has both a realized and a predicted yield yet.")
+    else:
+        direction = "OUTPERFORMING" if bias_pp > 0 else "UNDERPERFORMING"
+        print(f"  {bias_pp:+.1f}pp — live trading is, on average, {direction} Oracle's backtest predictions.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--watchlist", default=ACTIVE_PATH, help="watchlist JSON to compare realized results against")
     parser.add_argument("--out", default=OUT_PATH)
     args = parser.parse_args()
 
+    predicted_by_symbol = _load_predicted(args.watchlist)
     results = run_analysis(args.watchlist)
     _print_report(results)
 
+    tier_breakdown = run_ivr_tier_analysis(args.watchlist)
+    bias_pp = _overall_bias_pp(results, predicted_by_symbol)
+    _print_tier_and_bias(tier_breakdown, bias_pp)
+
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump({"generated_at": date.today().isoformat(), "results": results}, f, indent=2)
+        json.dump({
+            "generated_at": date.today().isoformat(),
+            "results": results,
+            "ivr_tier_breakdown": tier_breakdown,
+            "overall_bias_pp": bias_pp,
+        }, f, indent=2)
     print(f"\nWrote report to {args.out}")
