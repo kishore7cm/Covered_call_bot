@@ -8,12 +8,13 @@ Every trader.py function this exercises is monkeypatched to a fake -- see
 conftest.py's autouse fixture, which would raise if any of these reached
 the real broker by accident.
 """
+import json
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import main
 import trader
-from config import PROFIT_TAKE_PCT, SHARES_PER_LOT
+from config import PROFIT_TAKE_PCT, SHARES_PER_LOT, WATCHLIST_MAX_AGE_DAYS
 
 
 @dataclass
@@ -73,6 +74,7 @@ def _patch_common(monkeypatch, **overrides):
     monkeypatch.setattr(main, "log_error", lambda *a, **k: logged["errors"].append((a, k)))
     monkeypatch.setattr(main, "_get_spot_price", lambda symbol: 100.0)
     monkeypatch.setattr(main, "get_chain_snapshot", lambda symbol: {})
+    monkeypatch.setattr(main, "_watchlist_is_stale", lambda: False)
     # Coroutines from notifier.send_* are never actually awaited in tests --
     # asyncio.run() would execute the real body (an HTTP call), so close the
     # coroutine object instead of running it. Calling the async function
@@ -80,6 +82,77 @@ def _patch_common(monkeypatch, **overrides):
     # "coroutine was never awaited" warning.
     monkeypatch.setattr(main, "_run_async", lambda coro: coro.close())
     return logged
+
+
+# ── Watchlist expiry (Task 5) ─────────────────────────────────────────────────
+
+def _write_active_watchlist(monkeypatch, tmp_path, confirmed_at=None, include_key=True):
+    path = tmp_path / "active_watchlist.json"
+    payload = {"generated_at": "2020-01-01T00:00:00+00:00", "symbols": {"AAPL": {"dte": 30}}}
+    if include_key:
+        payload["confirmed_at"] = confirmed_at
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(main, "ACTIVE_WATCHLIST_PATH", str(path))
+
+
+def test_watchlist_missing_file_is_stale(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "ACTIVE_WATCHLIST_PATH", str(tmp_path / "does_not_exist.json"))
+    assert main._watchlist_is_stale() is True
+
+
+def test_watchlist_missing_confirmed_at_key_is_stale(monkeypatch, tmp_path):
+    _write_active_watchlist(monkeypatch, tmp_path, include_key=False)
+    assert main._watchlist_is_stale() is True
+
+
+def test_watchlist_fresh_confirmed_at_is_not_stale(monkeypatch, tmp_path):
+    fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    _write_active_watchlist(monkeypatch, tmp_path, confirmed_at=fresh)
+    assert main._watchlist_is_stale() is False
+
+
+def test_watchlist_old_confirmed_at_is_stale(monkeypatch, tmp_path):
+    old = (datetime.now(timezone.utc) - timedelta(days=WATCHLIST_MAX_AGE_DAYS + 1)).isoformat()
+    _write_active_watchlist(monkeypatch, tmp_path, confirmed_at=old)
+    assert main._watchlist_is_stale() is True
+
+
+def test_watchlist_malformed_confirmed_at_is_stale(monkeypatch, tmp_path):
+    _write_active_watchlist(monkeypatch, tmp_path, confirmed_at="not-a-timestamp")
+    assert main._watchlist_is_stale() is True
+
+
+def test_stale_watchlist_skips_opening_new_position(monkeypatch):
+    buy_calls = []
+    logged = _patch_common(
+        monkeypatch,
+        buy_shares=lambda symbol, qty, **k: buy_calls.append((symbol, qty)),
+    )
+    monkeypatch.setattr(main, "_watchlist_is_stale", lambda: True)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" in result
+    assert "stale" in result.lower()
+    assert buy_calls == []
+    assert len(logged["errors"]) == 1
+
+
+def test_stale_watchlist_does_not_block_managing_existing_position(monkeypatch):
+    """Staleness only blocks OPENING a new position (State 1's buy) --
+    State 2 (shares already held, selling a call) must proceed normally."""
+    candidate = FakeCandidate(_far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.25)
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "_watchlist_is_stale", lambda: True)
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: candidate)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" not in result
+    assert "sold" in result
 
 
 # ── State 1: no shares ───────────────────────────────────────────────────────

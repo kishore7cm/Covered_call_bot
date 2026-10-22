@@ -272,7 +272,16 @@ def test_confirm_writes_active_file_matching_proposed(tmp_path):
     assert result.returncode == 0
     assert "Applied" in result.stdout
     assert active_path.exists()
-    assert json.loads(active_path.read_text()) == json.loads(proposed_path.read_text())
+
+    active = json.loads(active_path.read_text())
+    proposed = json.loads(proposed_path.read_text())
+    # active matches proposed except for the added confirmed_at stamp
+    # (Phase 3, Task 5) -- a human-approval timestamp, distinct from
+    # proposed's own generated_at (when the Oracle produced these numbers).
+    assert "confirmed_at" in active
+    assert active["confirmed_at"] != proposed.get("generated_at")
+    active_without_confirmed_at = {k: v for k, v in active.items() if k != "confirmed_at"}
+    assert active_without_confirmed_at == proposed
 
 
 # ── _empirical_summary: missing sibling fields show "n/a", never 0.0% ───────

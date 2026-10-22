@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import time
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import schedule
 
@@ -24,7 +24,7 @@ from config import (
     WATCHLIST, SHARES_PER_LOT, TARGET_DELTA,
     PROFIT_TAKE_PCT, ROLL_TRIGGER_DELTA, ROLL_MIN_DTE, RISK_FREE_RATE,
     CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET, MIN_IV_HISTORY_POINTS,
-    DTE_MIN, DTE_MAX, OTHER_BOTS_SYMBOLS,
+    DTE_MIN, DTE_MAX, OTHER_BOTS_SYMBOLS, WATCHLIST_MAX_AGE_DAYS,
 )
 from greeks import delta_from_quote
 from iv_rank import iv_rank, iv_percentile
@@ -67,6 +67,29 @@ def _load_watchlist() -> dict[str, int | None]:
             ACTIVE_WATCHLIST_PATH,
         )
     return {sym: None for sym in WATCHLIST}
+
+
+def _watchlist_is_stale() -> bool:
+    """
+    True if active_watchlist.json has no confirmed_at at all (predates
+    Task 5, or the pipeline has never been run so _load_watchlist() fell
+    back to config.WATCHLIST) or confirmed_at is older than
+    WATCHLIST_MAX_AGE_DAYS. A missing timestamp is treated as stale, not
+    as "assume it's fresh" -- re-running apply_watchlist.py --confirm is
+    what resets this, every time, deliberately.
+    """
+    if not os.path.exists(ACTIVE_WATCHLIST_PATH):
+        return True
+    with open(ACTIVE_WATCHLIST_PATH) as f:
+        payload = json.load(f)
+    confirmed_at_str = payload.get("confirmed_at")
+    if not confirmed_at_str:
+        return True
+    try:
+        confirmed_at = datetime.fromisoformat(confirmed_at_str)
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) - confirmed_at > timedelta(days=WATCHLIST_MAX_AGE_DAYS)
 
 
 def _dte_window(recommended_dte: int | None) -> tuple[int, int]:
@@ -239,6 +262,19 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
                 underlying_price=_get_spot_price(symbol),
             )
             _run_async(notifier.send_call_closed(symbol, last_occ_symbol, "assigned", 0.0))
+
+        # Watchlist expiry (Phase 3, Task 5) -- only blocks OPENING a new
+        # position (this buy). Managing an already-open one (States 2/3
+        # below) is unaffected by staleness entirely -- that isn't
+        # "trading on a stale approval," it's finishing what's already open.
+        if _watchlist_is_stale():
+            msg = (
+                f"{symbol}: active watchlist confirmation is stale or missing "
+                f"(older than WATCHLIST_MAX_AGE_DAYS={WATCHLIST_MAX_AGE_DAYS}d) — not opening a new position"
+            )
+            log_error("main.run_symbol_cycle", msg)
+            _run_async(notifier.send_error(symbol, msg))
+            return f"{symbol}: SKIPPED — stale watchlist confirmation, not opening new position"
 
         # A price estimate is required for the hard capital caps (Task 2)
         # to be enforceable at all -- buy_shares fails that check closed,

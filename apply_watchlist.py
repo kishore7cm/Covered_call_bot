@@ -39,7 +39,7 @@ Usage:
 import argparse
 import json
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 PROPOSED_PATH = "pipeline_state/proposed_watchlist.json"
 ACTIVE_PATH = "pipeline_state/active_watchlist.json"
@@ -353,6 +353,15 @@ if __name__ == "__main__":
         print("\n(dry run — pass --confirm to apply this to the live trader's watchlist)")
     else:
         os.makedirs(os.path.dirname(args.active), exist_ok=True)
+        # confirmed_at is a human-approval timestamp, stamped fresh HERE --
+        # deliberately distinct from proposed's own generated_at (when the
+        # Oracle produced these numbers, not when a human approved them).
+        # main.py's watchlist-expiry check (Phase 3, Task 5) reads this to
+        # decide whether its approval is still fresh enough to open NEW
+        # positions on; re-running --confirm always resets it to now.
+        payload = dict(proposed)
+        payload["confirmed_at"] = datetime.now(timezone.utc).isoformat()
         with open(args.active, "w") as f:
-            json.dump(proposed, f, indent=2)
-        print(f"\nApplied — {args.active} updated. main.py will pick this up on its next cycle.")
+            json.dump(payload, f, indent=2)
+        print(f"\nApplied — {args.active} updated (confirmed_at={payload['confirmed_at']}). "
+              "main.py will pick this up on its next cycle.")

@@ -300,3 +300,15 @@ MAX_ROLLS_PER_LOT = 4
 # symbol needs-attention (pipeline_state/needs_attention.json) rather than
 # leaving a silent uncovered position.
 ROLL_OPEN_LEG_MAX_RETRIES = 3
+
+# ── Watchlist expiry (Phase 3, Task 5) ───────────────────────────────────────
+# active_watchlist.json's confirmed_at (stamped by apply_watchlist.py
+# --confirm, distinct from proposed_watchlist.json's own generated_at --
+# see apply_watchlist.py) is checked against this every cycle. Older than
+# this -- or missing entirely, including the config.WATCHLIST fallback
+# when the pipeline has never been run at all -- main.py stops opening
+# NEW positions (buying fresh shares) for watchlist symbols. Managing an
+# already-open position (selling/rolling/closing a call on shares already
+# held) is unaffected -- that isn't "trading on a stale approval," it's
+# finishing what's already open. Re-running --confirm always resets this.
+WATCHLIST_MAX_AGE_DAYS = 10
