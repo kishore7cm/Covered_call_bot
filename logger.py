@@ -290,6 +290,41 @@ def get_expected_share_qty(symbol: str) -> int | None:
         return None
 
 
+def get_rolls_since_last_lot_open(symbol: str) -> int | None:
+    """
+    Count of ROLL rows logged for `symbol` since its most recent BUY
+    (share_trades) or ASSIGNED (option_trades) row -- i.e. since the
+    current lot was opened. Proxy for "rolls per lot" (Phase 3, Task 4's
+    MAX_ROLLS_PER_LOT) until Task 6's Lot Manager makes this lot-exact.
+    Returns None if DATABASE_URL isn't configured or the query fails --
+    callers must fail closed on that ("can't verify the cap"), not treat
+    it as "0 rolls so far."
+    """
+    if not DATABASE_URL:
+        return None
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH lot_open AS (
+                    SELECT MAX(occurred_at) AS opened_at FROM (
+                        SELECT occurred_at FROM share_trades WHERE symbol = %s AND side = 'BUY'
+                        UNION ALL
+                        SELECT occurred_at FROM option_trades WHERE symbol = %s AND action = 'ASSIGNED'
+                    ) t
+                )
+                SELECT COUNT(*) FROM option_trades, lot_open
+                WHERE option_trades.symbol = %s AND option_trades.action = 'ROLL'
+                  AND (lot_open.opened_at IS NULL OR option_trades.occurred_at > lot_open.opened_at)
+                """,
+                (symbol, symbol, symbol),
+            )
+            return cur.fetchone()[0]
+    except Exception as e:
+        logger.error("get_rolls_since_last_lot_open failed: %s", e)
+        return None
+
+
 def get_iv_history(symbol: str, lookback_days: int = 365) -> list[float]:
     """Return atm_iv values for `symbol` over the trailing `lookback_days`, oldest first."""
     if not DATABASE_URL:

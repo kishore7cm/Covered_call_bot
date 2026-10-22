@@ -27,5 +27,7 @@ class _ForbiddenBrokerClient:
 @pytest.fixture(autouse=True)
 def _block_real_broker(monkeypatch):
     monkeypatch.setattr(trader, "_client", _ForbiddenBrokerClient())
+    monkeypatch.setattr(trader, "_stock_data_client", _ForbiddenBrokerClient())
+    monkeypatch.setattr(trader, "_option_data_client", _ForbiddenBrokerClient())
     monkeypatch.setattr(options_data, "_trading_client", _ForbiddenBrokerClient())
     monkeypatch.setattr(options_data, "_data_client", _ForbiddenBrokerClient())

@@ -153,6 +153,16 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
         _run_async(notifier.send_error(symbol, msg))
         return f"{symbol}: SKIPPED — symbol overlap with another bot"
 
+    # Set by trader.roll_call when a roll's open leg never went through
+    # for real after the close leg already did (shares left genuinely
+    # uncovered) -- there is deliberately no automatic clear, a human must
+    # resolve it and remove the entry from pipeline_state/needs_attention.json.
+    needs_attention_reason = trader.check_needs_attention(symbol)
+    if needs_attention_reason:
+        log_error("main.run_symbol_cycle", f"{symbol}: flagged needs-attention — {needs_attention_reason}")
+        _run_async(notifier.send_error(symbol, f"needs-attention flag still set: {needs_attention_reason}"))
+        return f"{symbol}: SKIPPED — needs-attention flag set, needs manual review"
+
     dte_min, dte_max = _dte_window(recommended_dte)
 
     share_pos = trader.get_share_position(symbol)
@@ -362,9 +372,19 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
             log_error("main.run_symbol_cycle", f"{symbol}: roll triggered but no new candidate found")
             return f"{symbol}: roll triggered but FAILED to find new strike"
 
-        result = trader.roll_call(occ_symbol, new_candidate.occ_symbol, qty=1)
+        result = trader.roll_call(symbol, occ_symbol, new_candidate.occ_symbol, qty=1)
         if result is None:
-            log_error("main.run_symbol_cycle", f"{symbol}: roll_call failed")
+            # roll_call itself already marks needs-attention and logs
+            # loudly for the specific "shares are now uncovered" failure
+            # mode -- this alert is unconditional on any roll_call
+            # failure (cap refused, no net credit, close leg failed, or
+            # the uncovered-shares case) so a human is notified either way.
+            msg = f"{symbol}: roll_call failed for {occ_symbol} -> {new_candidate.occ_symbol}"
+            needs_attention_reason = trader.check_needs_attention(symbol)
+            if needs_attention_reason:
+                msg = f"{symbol}: {needs_attention_reason}"
+            log_error("main.run_symbol_cycle", msg)
+            _run_async(notifier.send_error(symbol, msg))
             return f"{symbol}: FAILED to roll {occ_symbol}"
         if not result["closed"].get("submitted", True):
             # Both legs share one DRY_RUN/kill-switch block reason here --

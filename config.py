@@ -241,6 +241,62 @@ SIZER_MAX_WEIGHT_PER_NAME = 0.20       # cap on capital (of SIZER_BUDGET, not ju
 SIZER_CASH_RESERVE_PCT = 0.10          # fraction of SIZER_BUDGET sizer.py never allocates
 
 # ── Schedule ──────────────────────────────────────────────────────────────────
-# Weekly cycle — covered calls don't need intraday polling.
+# Weekly cycle — covered calls don't need intraday polling. CYCLE_TIME_ET
+# must stay safely after MARKET_OPEN_BUFFER_MINUTES past the 9:30 ET open
+# (30 min -> 10:00) -- 10:15 leaves a margin rather than landing exactly on
+# the boundary. Moved from the original 09:45 specifically because the
+# market-hours gate below (Phase 3, Task 4) would otherwise block every
+# single scheduled run.
 CYCLE_DAY_OF_WEEK = "monday"
-CYCLE_TIME_ET     = "09:45"
+CYCLE_TIME_ET     = "10:15"
+
+# ── Market-hours gate (Phase 3, Task 4) ──────────────────────────────────────
+# Checked by trader.py's guard before every order -- no orders in the first
+# 30 min after open (opening-range volatility/wide spreads) or the last N
+# min before close (thin closing liquidity, no time to react to a bad
+# fill). Also blocks entirely outside market hours. Uses the broker's own
+# clock (TradingClient.get_clock(), live-verified to return is_open/
+# next_open/next_close) rather than a local guess at the trading calendar
+# (holidays, early closes).
+MARKET_OPEN_BUFFER_MINUTES = 30
+MARKET_CLOSE_BUFFER_MINUTES = 15
+
+# ── Limit order execution (Phase 3, Task 4) ──────────────────────────────────
+# Every order this bot submits is a LIMIT order, starting at the quote's
+# mid price and walking toward the "natural" price (ask for a buy, bid for
+# a sell) in LIMIT_ORDER_MAX_STEPS equal increments, pausing
+# LIMIT_ORDER_STEP_PAUSE_SECONDS between steps to give each price a chance
+# to fill before chasing. The last step prices AT the natural price --
+# the same price a market order would effectively cross at -- so "give up
+# after N steps" means "fail to fill even at the aggressive price," not
+# "give up before ever trying it."
+LIMIT_ORDER_MAX_STEPS = 5
+LIMIT_ORDER_STEP_PAUSE_SECONDS = 10
+
+# ── Order dedup (Phase 3, Task 4) ─────────────────────────────────────────────
+# A deterministic client_order_id (per symbol+action+cycle date) protects
+# against one specific failure mode: a network retry re-submitting the
+# SAME intended order while the original is still pending -- Alpaca
+# rejects a reused client_order_id only while the first order is still
+# ACTIVE (confirmed via Alpaca's own docs/community support threads, not a
+# live test -- submitting a real test order to find this out would violate
+# this phase's "never place a real order while developing/testing" rule).
+# Once the first order fills or is otherwise no longer active, Alpaca may
+# accept a resubmitted client_order_id as a brand new order -- so this is
+# NOT a general duplicate-order safety net on its own. The open-orders
+# check below (query the broker for an existing open order on this
+# symbol before submitting) is the actual primary guard against double-
+# submitting; client_order_id is a secondary, narrower protection.
+CLIENT_ORDER_ID_PREFIX = "ccbot"
+
+# ── Roll limits (Phase 3, Task 4) ────────────────────────────────────────────
+# Proxy for "rolls per lot" until Task 6's Lot Manager makes this lot-exact:
+# counts ROLL rows in the trade log since the symbol's last BUY/ASSIGNED
+# row (i.e., since the current lot was opened).
+MAX_ROLLS_PER_LOT = 4
+# If the open leg of a roll doesn't go through for real after the close
+# leg already did (shares now genuinely uncovered), retry the open leg
+# this many times before giving up, alerting loudly, and marking the
+# symbol needs-attention (pipeline_state/needs_attention.json) rather than
+# leaving a silent uncovered position.
+ROLL_OPEN_LEG_MAX_RETRIES = 3

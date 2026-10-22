@@ -19,28 +19,38 @@ None — None is reserved for a REAL API rejection. Callers must check
 result.get("submitted") before treating a result as a real fill, not just
 "is it None."
 """
+import json
 import logging
 import os
 import time
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from alpaca.common.exceptions import APIError
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestQuoteRequest
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import AssetClass, OrderSide, PositionIntent, PositionSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import AssetClass, OrderSide, PositionIntent, PositionSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
 
 from config import (
-    ALPACA_API_KEY, ALPACA_SECRET_KEY, DRY_RUN, KILL_SWITCH_ENABLED,
-    KILL_SWITCH_PATH, MAX_CAPITAL_PER_SYMBOL, MAX_CONCURRENT_POSITIONS,
-    MAX_ORDERS_PER_CYCLE, MAX_TOTAL_CAPITAL, MIN_ACCOUNT_BUYING_POWER,
-    PAPER, SHARES_PER_LOT,
+    ALPACA_API_KEY, ALPACA_SECRET_KEY, CLIENT_ORDER_ID_PREFIX, DRY_RUN,
+    KILL_SWITCH_ENABLED, KILL_SWITCH_PATH, LIMIT_ORDER_MAX_STEPS,
+    LIMIT_ORDER_STEP_PAUSE_SECONDS, MARKET_CLOSE_BUFFER_MINUTES,
+    MARKET_OPEN_BUFFER_MINUTES, MAX_CAPITAL_PER_SYMBOL, MAX_CONCURRENT_POSITIONS,
+    MAX_ORDERS_PER_CYCLE, MAX_ROLLS_PER_LOT, MAX_TOTAL_CAPITAL,
+    MIN_ACCOUNT_BUYING_POWER, PAPER, ROLL_OPEN_LEG_MAX_RETRIES, SHARES_PER_LOT,
 )
-from logger import get_own_symbols
+from logger import get_own_symbols, get_rolls_since_last_lot_open
 
 _log = logging.getLogger(__name__)
 
 _client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER)
+_option_data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+_stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+_NEEDS_ATTENTION_PATH = "pipeline_state/needs_attention.json"
 
 
 # ── Safety guard (Phase 3) ────────────────────────────────────────────────────
@@ -62,28 +72,77 @@ def reset_cycle_order_count() -> None:
     _orders_this_cycle = 0
 
 
+def _market_hours_block() -> str | None:
+    """
+    No orders outside market hours, in the first MARKET_OPEN_BUFFER_MINUTES
+    after the open (opening-range volatility/wide spreads), or in the last
+    MARKET_CLOSE_BUFFER_MINUTES before the close (thin closing liquidity,
+    no time left to react to a bad fill). Uses the broker's own clock
+    (live-verified to return is_open/next_open/next_close) rather than a
+    locally-maintained trading calendar, so holidays and early closes are
+    handled correctly for free.
+
+    The open-side buffer is computed from a hardcoded 9:30 ET, not derived
+    from the clock response -- when the market IS open, Alpaca's clock
+    gives next_open as TOMORROW's open and next_close as TODAY's close,
+    with no field for "when did today's session start." 9:30 ET is the
+    regular-session open on every NYSE/Nasdaq trading day (unlike the
+    close, which does vary on early-close days -- next_close already
+    reflects that correctly for the close-side buffer).
+    """
+    try:
+        clock = _client.get_clock()
+    except APIError as e:
+        _log.error("_market_hours_block: get_clock failed: %s — failing closed", e)
+        return "market_hours_check_unavailable"
+
+    if not clock.is_open:
+        return "market_closed"
+
+    now = clock.timestamp
+    today_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    if now < today_open + timedelta(minutes=MARKET_OPEN_BUFFER_MINUTES):
+        _log.warning("Within %d min of market open (%s) — blocking new orders", MARKET_OPEN_BUFFER_MINUTES, today_open)
+        return "market_open_buffer"
+    if now > clock.next_close - timedelta(minutes=MARKET_CLOSE_BUFFER_MINUTES):
+        _log.warning(
+            "Within %d min of market close (%s) — blocking new orders", MARKET_CLOSE_BUFFER_MINUTES, clock.next_close,
+        )
+        return "market_close_buffer"
+    return None
+
+
+def _check_open_orders(order_symbol: str) -> str | None:
+    """
+    Refuse to submit if `order_symbol` already has an open order -- the
+    PRIMARY duplicate-submission guard (client_order_id below is a
+    narrower, secondary protection -- see its config comment for why).
+    Any broker read failure here fails closed.
+    """
+    try:
+        open_orders = _client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[order_symbol]))
+    except APIError as e:
+        _log.error("_check_open_orders(%s) failed: %s — failing closed", order_symbol, e)
+        return "open_orders_check_unavailable"
+    if open_orders:
+        _log.warning("%s: already has %d open order(s) — refusing to submit another", order_symbol, len(open_orders))
+        return "open_order_exists"
+    return None
+
+
 def _check_hard_limits(symbol: str | None, estimated_dollars: float | None, opens_new_position: bool) -> str | None:
     """
-    Second gate, checked after the kill switch and before DRY_RUN (see
-    _guard). MAX_ORDERS_PER_CYCLE applies to every order unconditionally;
-    the capital/position caps only matter for opens_new_position=True
+    Capital/position caps, checked only for opens_new_position=True
     (currently just buy_shares -- selling, closing, or rolling an existing
     call doesn't deploy new capital or open a new symbol position).
 
-    The capital/position caps read live broker state (get_all_positions,
-    get_account) rather than trusting any cached/local number, consistent
-    with the rest of this module -- and they're scoped to
-    logger.get_own_symbols() because this Alpaca account is shared with
-    separate crypto and ORB stock bots. Any broker read failure here fails
-    closed (blocks) rather than silently proceeding as if nothing were
-    deployed.
+    Reads live broker state (get_all_positions, get_account) rather than
+    trusting any cached/local number, consistent with the rest of this
+    module -- and scoped to logger.get_own_symbols() because this Alpaca
+    account is shared with separate crypto and ORB stock bots. Any broker
+    read failure here fails closed (blocks) rather than silently
+    proceeding as if nothing were deployed.
     """
-    global _orders_this_cycle
-    _orders_this_cycle += 1
-    if _orders_this_cycle > MAX_ORDERS_PER_CYCLE:
-        _log.warning("MAX_ORDERS_PER_CYCLE (%s) exceeded this cycle", MAX_ORDERS_PER_CYCLE)
-        return "max_orders_per_cycle"
-
     if not opens_new_position:
         return None
 
@@ -127,8 +186,8 @@ def _check_hard_limits(symbol: str | None, estimated_dollars: float | None, open
     return None
 
 
-def _guard(description: str, symbol: str | None = None, estimated_dollars: float | None = None,
-           opens_new_position: bool = False) -> str | None:
+def _guard(description: str, order_symbol: str, symbol: str | None = None,
+           estimated_dollars: float | None = None, opens_new_position: bool = False) -> str | None:
     """
     Single pre-submission gate. Returns None if a real submission should
     proceed, or a short reason string if it must be blocked instead.
@@ -136,15 +195,40 @@ def _guard(description: str, symbol: str | None = None, estimated_dollars: float
     kill switch file can appear mid-cycle, and each order must see current
     state at the moment it's about to fire.
 
+    `order_symbol` is the exact symbol/occ_symbol about to be submitted
+    (used for the open-orders check); `symbol` is the underlying, used
+    only for the opens_new_position capital-cap scoping -- for buy_shares
+    these are the same value, for the option legs only order_symbol
+    applies.
+
     Order of checks matters: kill switch first (full stop, highest
-    priority), then the hard caps (structural safety rails that should be
-    visible in the logs even while DRY_RUN is True, so they can be
-    validated before DRY_RUN is ever turned off), then DRY_RUN last (the
-    default-safe, "softest" reason).
+    priority), then market hours and the open-orders/hard caps
+    (structural safety rails that should be visible in the logs even
+    while DRY_RUN is True, so they can be validated before DRY_RUN is
+    ever turned off), then DRY_RUN last (the default-safe, "softest"
+    reason). MAX_ORDERS_PER_CYCLE is counted here, first, unconditionally
+    — every call into this function is an order attempt, regardless of
+    which later check ends up blocking it.
     """
+    global _orders_this_cycle
+    _orders_this_cycle += 1
+    if _orders_this_cycle > MAX_ORDERS_PER_CYCLE:
+        _log.warning("MAX_ORDERS_PER_CYCLE (%s) exceeded this cycle", MAX_ORDERS_PER_CYCLE)
+        return "max_orders_per_cycle"
+
     if _kill_switch_engaged():
         _log.warning("KILL SWITCH ENGAGED — blocking order: %s", description)
         return "kill_switch"
+
+    market_reason = _market_hours_block()
+    if market_reason:
+        _log.warning("BLOCKED by market-hours gate (%s): %s", market_reason, description)
+        return market_reason
+
+    open_orders_reason = _check_open_orders(order_symbol)
+    if open_orders_reason:
+        _log.warning("BLOCKED by open-orders check (%s): %s", open_orders_reason, description)
+        return open_orders_reason
 
     cap_reason = _check_hard_limits(symbol, estimated_dollars, opens_new_position)
     if cap_reason:
@@ -171,6 +255,42 @@ def _not_submitted(block_reason: str, **fields) -> dict:
         "block_reason": block_reason,
         **fields,
     }
+
+
+def mark_needs_attention(symbol: str, reason: str) -> None:
+    """
+    Persist a "this symbol needs a human to look at it" flag to
+    pipeline_state/needs_attention.json. There is deliberately no
+    automatic clear -- the whole point of flagging roll_call's uncovered-
+    shares failure mode is that a human reviews and resolves it; main.py
+    checks this flag and skips the symbol every cycle until the entry is
+    removed by hand.
+    """
+    try:
+        os.makedirs(os.path.dirname(_NEEDS_ATTENTION_PATH), exist_ok=True)
+        flags = {}
+        if os.path.exists(_NEEDS_ATTENTION_PATH):
+            with open(_NEEDS_ATTENTION_PATH) as f:
+                flags = json.load(f)
+        flags[symbol] = {"reason": reason, "flagged_at": datetime.now(timezone.utc).isoformat()}
+        with open(_NEEDS_ATTENTION_PATH, "w") as f:
+            json.dump(flags, f, indent=2)
+    except Exception as e:
+        _log.error("mark_needs_attention(%s) failed to persist flag: %s", symbol, e)
+
+
+def check_needs_attention(symbol: str) -> str | None:
+    """Returns the flagged reason, or None if clear."""
+    try:
+        if not os.path.exists(_NEEDS_ATTENTION_PATH):
+            return None
+        with open(_NEEDS_ATTENTION_PATH) as f:
+            flags = json.load(f)
+        entry = flags.get(symbol)
+        return entry["reason"] if entry else None
+    except Exception as e:
+        _log.error("check_needs_attention(%s) failed to read flag file: %s", symbol, e)
+        return "needs_attention_check_unavailable"
 
 
 # ── Positions ─────────────────────────────────────────────────────────────────
@@ -275,116 +395,210 @@ def get_option_activities(underlying: str, lookback_days: int = 14) -> list[dict
     return matched
 
 
-# ── Shares ────────────────────────────────────────────────────────────────────
+# ── Quotes (for limit-order pricing) ─────────────────────────────────────────
 
-_FILL_POLL_ATTEMPTS = 5
-_FILL_POLL_SECONDS = 1.0
+def _get_stock_quote(symbol: str) -> tuple[float, float] | None:
+    """(bid, ask) for an equity, or None if unusable (missing/zero/crossed).
+    Used only to price buy_shares' limit-order walk."""
+    try:
+        resp = _stock_data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
+    except APIError as e:
+        _log.error("_get_stock_quote(%s) failed: %s", symbol, e)
+        return None
+    q = resp.get(symbol)
+    if q is None or q.bid_price is None or q.ask_price is None or q.bid_price <= 0 or q.ask_price <= 0:
+        return None
+    if q.bid_price > q.ask_price:
+        _log.warning("_get_stock_quote(%s): crossed quote (bid %.2f > ask %.2f) — rejecting", symbol, q.bid_price, q.ask_price)
+        return None
+    return (q.bid_price, q.ask_price)
 
 
-def _poll_fill_price(order_id) -> float | None:
-    """
-    submit_order's immediate response is often still 'new' with
-    filled_avg_price unset — market orders fill fast but asynchronously, not
-    synchronously within that call. Poll briefly rather than assume a price;
-    returns None (logged, not raised) if it never fills within the window,
-    same fail-soft contract as every other function here.
-    """
-    for _ in range(_FILL_POLL_ATTEMPTS):
+def _get_option_quote(occ_symbol: str) -> tuple[float, float] | None:
+    """(bid, ask) for an option contract, or None if unusable. Used to
+    price sell_to_open_call/buy_to_close_call's limit-order walk, and
+    roll_call's net-credit check."""
+    try:
+        resp = _option_data_client.get_option_latest_quote(OptionLatestQuoteRequest(symbol_or_symbols=occ_symbol))
+    except APIError as e:
+        _log.error("_get_option_quote(%s) failed: %s", occ_symbol, e)
+        return None
+    q = resp.get(occ_symbol)
+    if q is None or q.bid_price is None or q.ask_price is None or q.bid_price <= 0 or q.ask_price <= 0:
+        return None
+    if q.bid_price > q.ask_price:
+        _log.warning("_get_option_quote(%s): crossed quote (bid %.2f > ask %.2f) — rejecting", occ_symbol, q.bid_price, q.ask_price)
+        return None
+    return (q.bid_price, q.ask_price)
+
+
+# ── Limit-order execution ─────────────────────────────────────────────────────
+
+def _poll_until_filled(order_id, timeout_seconds: float):
+    """Poll an order until it fills or `timeout_seconds` elapses. Returns
+    the filled Order, or None (logged, not raised) on timeout/API error --
+    the caller is expected to cancel the still-resting order on a None."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
         try:
             order = _client.get_order_by_id(order_id)
         except APIError as e:
-            _log.error("_poll_fill_price(%s) failed: %s", order_id, e)
+            _log.error("_poll_until_filled(%s) failed: %s", order_id, e)
             return None
         if order.filled_avg_price is not None:
-            return float(order.filled_avg_price)
-        time.sleep(_FILL_POLL_SECONDS)
-
-    _log.warning("_poll_fill_price(%s): no fill price after %d attempts", order_id, _FILL_POLL_ATTEMPTS)
+            return order
+        time.sleep(1.0)
     return None
 
+
+def _walk_limit_order(order_symbol: str, side, qty: int, bid: float, ask: float,
+                       position_intent, client_order_id_base: str):
+    """
+    Submit a limit order starting at the quote's mid price, walking toward
+    the "natural" price (ask for a BUY, bid for a SELL) over
+    LIMIT_ORDER_MAX_STEPS equal increments, pausing
+    LIMIT_ORDER_STEP_PAUSE_SECONDS between steps for a chance to fill
+    before chasing. The final step prices exactly AT the natural price --
+    the same price a market order would effectively cross at -- so "give
+    up after N steps" means "didn't fill even at the aggressive price,"
+    not "gave up before trying it." Cancels and resubmits rather than
+    PATCH-replacing between steps -- simpler to reason about, and this
+    bot's order sizes (100 shares / 1 contract) never need partial-fill-
+    then-reprice handling. Returns the filled Order, or None.
+    """
+    mid = (bid + ask) / 2.0
+    natural = ask if side == OrderSide.BUY else bid
+    increment = (natural - mid) / LIMIT_ORDER_MAX_STEPS
+    current_price = mid
+
+    for step in range(LIMIT_ORDER_MAX_STEPS):
+        limit_price = natural if step == LIMIT_ORDER_MAX_STEPS - 1 else round(current_price, 2)
+
+        kwargs = dict(
+            symbol=order_symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
+            limit_price=round(limit_price, 2), client_order_id=f"{client_order_id_base}-s{step}",
+        )
+        if position_intent is not None:
+            kwargs["position_intent"] = position_intent
+
+        try:
+            order = _client.submit_order(LimitOrderRequest(**kwargs))
+        except APIError as e:
+            _log.error("_walk_limit_order(%s) step %d submit failed: %s", order_symbol, step, e)
+            return None
+
+        filled = _poll_until_filled(order.id, LIMIT_ORDER_STEP_PAUSE_SECONDS)
+        if filled is not None:
+            return filled
+
+        try:
+            _client.cancel_order_by_id(order.id)
+        except APIError as e:
+            _log.warning("_walk_limit_order(%s): cancel of unfilled step %d order failed: %s", order_symbol, step, e)
+
+        current_price += increment
+
+    _log.warning(
+        "_walk_limit_order(%s): did not fill within %d steps up to natural price %.2f — giving up",
+        order_symbol, LIMIT_ORDER_MAX_STEPS, natural,
+    )
+    return None
+
+
+# ── Shares ────────────────────────────────────────────────────────────────────
 
 def buy_shares(symbol: str, qty: int = SHARES_PER_LOT, estimated_price: float | None = None) -> dict | None:
     """
     estimated_price is required for the hard capital caps (Task 2) to be
-    enforceable at all -- a market buy's true fill price isn't known until
-    after submission, so the caller must supply a current quote/trade
-    price estimate. Omitting it doesn't skip the caps, it fails them
-    closed (see _check_hard_limits): "can't verify the cap" blocks the
-    same as "cap exceeded" would, it never defaults to "assume it's fine."
+    enforceable at all -- caller must supply a current quote/trade price
+    estimate. Omitting it doesn't skip the caps, it fails them closed (see
+    _check_hard_limits): "can't verify the cap" blocks the same as "cap
+    exceeded" would, it never defaults to "assume it's fine."
     """
     estimated_dollars = qty * estimated_price if estimated_price is not None else None
     block_reason = _guard(
-        f"BUY {qty} {symbol}", symbol=symbol, estimated_dollars=estimated_dollars, opens_new_position=True,
+        f"BUY {qty} {symbol}", order_symbol=symbol, symbol=symbol,
+        estimated_dollars=estimated_dollars, opens_new_position=True,
     )
     if block_reason:
         return _not_submitted(block_reason, symbol=symbol, qty=qty, price=None)
 
-    try:
-        order = _client.submit_order(MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-        ))
-    except APIError as e:
-        _log.error("buy_shares(%s, %s) rejected: %s", symbol, qty, e)
+    quote = _get_stock_quote(symbol)
+    if quote is None:
+        _log.error("buy_shares(%s): no usable stock quote — cannot place a limit order", symbol)
+        return None
+    bid, ask = quote
+
+    client_order_id_base = f"{CLIENT_ORDER_ID_PREFIX}-BUY-{symbol}-{date.today().isoformat()}"
+    order = _walk_limit_order(symbol, OrderSide.BUY, qty, bid, ask, None, client_order_id_base)
+    if order is None:
         return None
 
-    _log.info("BUY SHARES submitted %s | qty=%s | order_id=%s", symbol, qty, order.id)
-    fill_price = _poll_fill_price(order.id)
-    return {"order_id": str(order.id), "symbol": symbol, "qty": qty, "price": fill_price, "submitted": True}
+    _log.info("BUY SHARES filled %s | qty=%s | order_id=%s | price=%s", symbol, qty, order.id, order.filled_avg_price)
+    return {"order_id": str(order.id), "symbol": symbol, "qty": qty, "price": float(order.filled_avg_price), "submitted": True}
 
 
 # ── Options: single-leg covered call management ──────────────────────────────
 
 def sell_to_open_call(occ_symbol: str, qty: int = 1) -> dict | None:
-    block_reason = _guard(f"SELL_TO_OPEN {qty}x {occ_symbol}")
+    block_reason = _guard(f"SELL_TO_OPEN {qty}x {occ_symbol}", order_symbol=occ_symbol)
     if block_reason:
         return _not_submitted(block_reason, occ_symbol=occ_symbol, qty=qty)
 
-    try:
-        order = _client.submit_order(MarketOrderRequest(
-            symbol=occ_symbol,
-            qty=qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
-            position_intent=PositionIntent.SELL_TO_OPEN,
-        ))
-    except APIError as e:
-        _log.error("sell_to_open_call(%s, %s) rejected: %s", occ_symbol, qty, e)
+    quote = _get_option_quote(occ_symbol)
+    if quote is None:
+        _log.error("sell_to_open_call(%s): no usable option quote — cannot place a limit order", occ_symbol)
+        return None
+    bid, ask = quote
+
+    client_order_id_base = f"{CLIENT_ORDER_ID_PREFIX}-SELLOPEN-{occ_symbol}-{date.today().isoformat()}"
+    order = _walk_limit_order(
+        occ_symbol, OrderSide.SELL, qty, bid, ask, PositionIntent.SELL_TO_OPEN, client_order_id_base,
+    )
+    if order is None:
         return None
 
-    _log.info("SELL_TO_OPEN submitted %s | qty=%s | order_id=%s", occ_symbol, qty, order.id)
+    _log.info("SELL_TO_OPEN filled %s | qty=%s | order_id=%s | price=%s", occ_symbol, qty, order.id, order.filled_avg_price)
     return {"order_id": str(order.id), "occ_symbol": occ_symbol, "qty": qty, "submitted": True}
 
 
 def buy_to_close_call(occ_symbol: str, qty: int = 1) -> dict | None:
-    block_reason = _guard(f"BUY_TO_CLOSE {qty}x {occ_symbol}")
+    block_reason = _guard(f"BUY_TO_CLOSE {qty}x {occ_symbol}", order_symbol=occ_symbol)
     if block_reason:
         return _not_submitted(block_reason, occ_symbol=occ_symbol, qty=qty)
 
-    try:
-        order = _client.submit_order(MarketOrderRequest(
-            symbol=occ_symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            position_intent=PositionIntent.BUY_TO_CLOSE,
-        ))
-    except APIError as e:
-        _log.error("buy_to_close_call(%s, %s) rejected: %s", occ_symbol, qty, e)
+    quote = _get_option_quote(occ_symbol)
+    if quote is None:
+        _log.error("buy_to_close_call(%s): no usable option quote — cannot place a limit order", occ_symbol)
+        return None
+    bid, ask = quote
+
+    client_order_id_base = f"{CLIENT_ORDER_ID_PREFIX}-BUYCLOSE-{occ_symbol}-{date.today().isoformat()}"
+    order = _walk_limit_order(
+        occ_symbol, OrderSide.BUY, qty, bid, ask, PositionIntent.BUY_TO_CLOSE, client_order_id_base,
+    )
+    if order is None:
         return None
 
-    _log.info("BUY_TO_CLOSE submitted %s | qty=%s | order_id=%s", occ_symbol, qty, order.id)
+    _log.info("BUY_TO_CLOSE filled %s | qty=%s | order_id=%s | price=%s", occ_symbol, qty, order.id, order.filled_avg_price)
     return {"order_id": str(order.id), "occ_symbol": occ_symbol, "qty": qty, "submitted": True}
 
 
-def roll_call(old_occ_symbol: str, new_occ_symbol: str, qty: int = 1) -> dict | None:
+def roll_call(symbol: str, old_occ_symbol: str, new_occ_symbol: str, qty: int = 1) -> dict | None:
     """
     Close the existing short call and open the new one. Logged by the caller
     as a single roll event (two order legs, not a native multi-leg order —
     Alpaca does support multi-leg for options, but splitting these keeps the
     failure mode simple: if the close fails, we never attempt the open).
+
+    Two checks run BEFORE either leg is attempted, both fail-closed:
+      1. Roll cap: refuses once MAX_ROLLS_PER_LOT rolls have already
+         happened on this lot (logger.get_rolls_since_last_lot_open -- a
+         proxy until Task 6's Lot Manager makes this lot-exact).
+      2. Net-credit: fetches live quotes for BOTH legs and refuses unless
+         the WORST case (sell the new call at its bid, buy back the old
+         one at its ask) is still a net credit -- this bot never rolls
+         for a net debit.
 
     Both legs independently pass through buy_to_close_call/sell_to_open_call,
     so each respects the guard on its own — but a DRY_RUN/kill-switch block
@@ -394,11 +608,39 @@ def roll_call(old_occ_symbol: str, new_occ_symbol: str, qty: int = 1) -> dict | 
     for real either, and we short-circuit to a matching synthetic "not
     submitted" result instead of calling sell_to_open_call. But once the
     close leg IS real, the shares are genuinely uncovered until the open
-    leg is ALSO real — so a block on the open leg at that point (e.g. the
-    kill switch engaging in between the two calls) is exactly as dangerous
-    as a real API failure and must hit the same "needs manual attention"
-    path, not be allowed through as a quiet non-error.
+    leg is ALSO real -- so the open leg gets up to ROLL_OPEN_LEG_MAX_RETRIES
+    attempts, and if all of them fail to go through for real, this marks
+    the symbol needs-attention (trader.mark_needs_attention) and alerts
+    loudly rather than leaving a silent, un-flagged uncovered position.
     """
+    rolls_so_far = get_rolls_since_last_lot_open(symbol)
+    if rolls_so_far is None:
+        _log.error("roll_call: could not verify the roll cap for %s — failing closed, not rolling", symbol)
+        return None
+    if rolls_so_far >= MAX_ROLLS_PER_LOT:
+        _log.warning(
+            "roll_call: %s has already rolled %d time(s) this lot (cap %d) — refusing to roll again",
+            symbol, rolls_so_far, MAX_ROLLS_PER_LOT,
+        )
+        return None
+
+    old_quote = _get_option_quote(old_occ_symbol)
+    new_quote = _get_option_quote(new_occ_symbol)
+    if old_quote is None or new_quote is None:
+        _log.error("roll_call: could not get a live quote for both legs (%s, %s) — failing closed, not rolling",
+                    old_occ_symbol, new_occ_symbol)
+        return None
+    old_bid, old_ask = old_quote
+    new_bid, new_ask = new_quote
+    worst_case_net_credit = new_bid - old_ask
+    if worst_case_net_credit <= 0:
+        _log.warning(
+            "roll_call: %s -> %s would not be a net credit even in the worst case "
+            "(new bid %.2f - old ask %.2f = %.2f) — refusing to roll",
+            old_occ_symbol, new_occ_symbol, new_bid, old_ask, worst_case_net_credit,
+        )
+        return None
+
     close = buy_to_close_call(old_occ_symbol, qty)
     if close is None:
         _log.error("roll_call: close leg failed for %s — aborting roll, NOT opening new leg", old_occ_symbol)
@@ -408,13 +650,35 @@ def roll_call(old_occ_symbol: str, new_occ_symbol: str, qty: int = 1) -> dict | 
         _log.info("roll_call: close leg blocked (%s) — not attempting the open leg", close["block_reason"])
         return {"closed": close, "opened": _not_submitted(close["block_reason"], occ_symbol=new_occ_symbol, qty=qty)}
 
-    open_ = sell_to_open_call(new_occ_symbol, qty)
+    open_ = None
+    for attempt in range(1, ROLL_OPEN_LEG_MAX_RETRIES + 1):
+        open_ = sell_to_open_call(new_occ_symbol, qty)
+        if open_ is not None and open_.get("submitted", True):
+            break
+        if open_ is not None and not open_.get("submitted", True):
+            # Blocked (DRY_RUN/kill switch/etc), not a transient API
+            # failure -- retrying won't help, and the shares are still
+            # uncovered for real, so treat this the same as exhausting
+            # every retry rather than looping pointlessly.
+            break
+        _log.warning(
+            "roll_call: open leg attempt %d/%d failed for %s (shares uncovered) — retrying",
+            attempt, ROLL_OPEN_LEG_MAX_RETRIES, new_occ_symbol,
+        )
+        if attempt < ROLL_OPEN_LEG_MAX_RETRIES:
+            time.sleep(LIMIT_ORDER_STEP_PAUSE_SECONDS)
+
     if open_ is None or not open_.get("submitted", True):
-        reason = "API rejection" if open_ is None else open_.get("block_reason")
+        reason = "API rejection after retries" if open_ is None else open_.get("block_reason")
+        mark_needs_attention(
+            symbol,
+            f"roll open leg for {new_occ_symbol} did not go through ({reason}) after closing {old_occ_symbol} — "
+            "shares are UNCOVERED, no short call open",
+        )
         _log.error(
             "roll_call: close leg succeeded for %s but open leg did NOT go through (%s) for %s — "
-            "position is now UNCOVERED SHARES, no short call. Needs manual attention.",
-            old_occ_symbol, reason, new_occ_symbol,
+            "position is now UNCOVERED SHARES, no short call. %s marked needs-attention.",
+            old_occ_symbol, reason, new_occ_symbol, symbol,
         )
         return None
 

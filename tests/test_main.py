@@ -55,11 +55,12 @@ def _patch_common(monkeypatch, **overrides):
         buy_to_close_call=lambda occ, qty=1: {
             "order_id": "o-close", "occ_symbol": occ, "qty": qty, "submitted": True,
         },
-        roll_call=lambda old, new, qty=1: {
+        roll_call=lambda symbol, old, new, qty=1: {
             "closed": {"order_id": "o-rc", "submitted": True},
             "opened": {"order_id": "o-ro", "submitted": True},
         },
         get_option_activities=lambda symbol, lookback_days=14: [],
+        check_needs_attention=lambda symbol: None,
     )
     defaults.update(overrides)
     for name, fn in defaults.items():
@@ -171,6 +172,33 @@ def test_assignment_activities_lookup_failure_fails_closed(monkeypatch):
 
     assert "SKIPPED" in result
     assert logged["option_trades"] == []
+
+
+# ── Needs-attention flag (Task 4) ────────────────────────────────────────────
+
+def test_needs_attention_flag_skips_symbol_before_any_broker_read(monkeypatch):
+    share_pos_calls = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: share_pos_calls.append(symbol),
+        check_needs_attention=lambda symbol: "roll left shares uncovered",
+    )
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" in result
+    assert "needs-attention" in result.lower() or "needs manual review" in result.lower()
+    assert share_pos_calls == []
+    assert len(logged["errors"]) == 1
+
+
+def test_no_needs_attention_flag_proceeds_normally(monkeypatch):
+    logged = _patch_common(monkeypatch, check_needs_attention=lambda symbol: None)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" not in result
+    assert logged["errors"] == []
 
 
 # ── Overlap detection (Task 2) ───────────────────────────────────────────────
@@ -376,7 +404,7 @@ def test_roll_blocked_is_not_logged_as_real_trade(monkeypatch):
         monkeypatch,
         get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
         find_short_call=lambda symbol: short_call,
-        roll_call=lambda old, new, qty=1: {
+        roll_call=lambda symbol, old, new, qty=1: {
             "closed": {"order_id": "NOT_SUBMITTED-x", "submitted": False, "block_reason": "dry_run"},
             "opened": {"order_id": "NOT_SUBMITTED-y", "submitted": False, "block_reason": "dry_run"},
         },
