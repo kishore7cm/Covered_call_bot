@@ -3,6 +3,7 @@ Env vars, watchlist, and strategy constants for the covered call bot.
 Fails fast on import if required Alpaca credentials are missing.
 """
 import os
+import sys
 
 from dotenv import load_dotenv
 
@@ -18,15 +19,56 @@ def _require(name: str) -> str:
 
 ALPACA_API_KEY    = _require("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = _require("ALPACA_SECRET_KEY")
-ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-PAPER             = "paper" in ALPACA_BASE_URL
-# Second, independent confirmation main.py's startup check requires before
-# it will run against a non-paper ALPACA_BASE_URL -- PAPER alone is just a
-# substring check on one env var, easy to flip by accident (a typo'd or
-# copy-pasted ALPACA_BASE_URL). Deliberately NOT consulted anywhere else
-# (trader.py/options_data.py's own TradingClient construction is unchanged)
-# -- this is main.py's entrypoint gate only, see main._check_paper_mode().
+# The ONLY paper host this ever matches against -- PAPER below is an EXACT
+# comparison (modulo a trailing slash), not a substring check. A substring
+# check ("paper" in ALPACA_BASE_URL) would treat any host that merely
+# CONTAINS "paper" as safe -- e.g. a typo'd or spoofed hostname like
+# "https://api.alpaca-paper.markets.evil.example" -- which defeats the
+# entire point of this check.
+ALPACA_PAPER_HOST = "https://paper-api.alpaca.markets"
+ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL", ALPACA_PAPER_HOST)
+PAPER             = ALPACA_BASE_URL.rstrip("/") == ALPACA_PAPER_HOST
+# Second, independent confirmation assert_paper_mode() (below) requires
+# before this bot will run against a non-paper ALPACA_BASE_URL -- PAPER
+# alone is just one env var, easy to get wrong by accident (a typo'd or
+# copy-pasted ALPACA_BASE_URL).
 ALLOW_LIVE = os.getenv("ALLOW_LIVE", "false").lower() in ("true", "1", "yes")
+
+_printed_alpaca_mode = False
+
+
+def assert_paper_mode() -> None:
+    """
+    Hard refusal to proceed against a non-paper ALPACA_BASE_URL unless
+    ALLOW_LIVE is explicitly set. Called from trader.py and options_data.py
+    at the exact point each constructs its TradingClient -- the real
+    chokepoint -- not just from main.py's entrypoint, so ANY script that
+    imports either module (main.py, screener.py, backtest.py,
+    clear_attention.py via trader, a one-off REPL import, etc.) enforces
+    this the moment it's loaded, before any client object exists to call
+    an order method on. Raises SystemExit so an uncaught refusal (e.g.
+    triggered deep inside an import chain) exits the whole process
+    cleanly with no traceback, the same as a CLI script calling
+    sys.exit() directly would.
+
+    Prints the active mode exactly once per process (not once per module
+    that imports trader.py AND options_data.py) so startup output isn't
+    doubled.
+    """
+    global _printed_alpaca_mode
+    mode = "PAPER" if PAPER else "LIVE"
+    if not PAPER and not ALLOW_LIVE:
+        print(
+            f"REFUSING TO START: ALPACA_BASE_URL ({ALPACA_BASE_URL}) is not the paper host "
+            f"({ALPACA_PAPER_HOST}), and ALLOW_LIVE is not set. Set ALLOW_LIVE=true explicitly "
+            "if you really mean to run against a live account.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if not _printed_alpaca_mode:
+        suffix = " [ALLOW_LIVE override]" if not PAPER else ""
+        print(f"ALPACA mode: {mode} ({ALPACA_BASE_URL}){suffix}")
+        _printed_alpaca_mode = True
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")

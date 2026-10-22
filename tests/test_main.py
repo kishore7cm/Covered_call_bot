@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+import config
 import main
 import trader
 from config import PROFIT_TAKE_PCT, SHARES_PER_LOT, WATCHLIST_MAX_AGE_DAYS
@@ -1045,26 +1046,28 @@ def test_print_open_needs_attention_silent_when_none(monkeypatch, capsys):
 # ── Paper/live startup guard ──────────────────────────────────────────────────
 
 def test_check_paper_mode_allows_paper(monkeypatch, capsys):
-    monkeypatch.setattr(main, "PAPER", True)
-    monkeypatch.setattr(main, "ALLOW_LIVE", False)
-    monkeypatch.setattr(main, "ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    monkeypatch.setattr(config, "PAPER", True)
+    monkeypatch.setattr(config, "ALLOW_LIVE", False)
+    monkeypatch.setattr(config, "ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    monkeypatch.setattr(config, "_printed_alpaca_mode", False)
     main._check_paper_mode()  # must not raise
     out = capsys.readouterr().out
     assert "PAPER" in out
 
 
 def test_check_paper_mode_refuses_live_url_without_allow_live(monkeypatch):
-    monkeypatch.setattr(main, "PAPER", False)
-    monkeypatch.setattr(main, "ALLOW_LIVE", False)
-    monkeypatch.setattr(main, "ALPACA_BASE_URL", "https://api.alpaca.markets")
+    monkeypatch.setattr(config, "PAPER", False)
+    monkeypatch.setattr(config, "ALLOW_LIVE", False)
+    monkeypatch.setattr(config, "ALPACA_BASE_URL", "https://api.alpaca.markets")
     with pytest.raises(SystemExit):
         main._check_paper_mode()
 
 
 def test_check_paper_mode_allows_live_url_when_allow_live_is_set(monkeypatch, capsys):
-    monkeypatch.setattr(main, "PAPER", False)
-    monkeypatch.setattr(main, "ALLOW_LIVE", True)
-    monkeypatch.setattr(main, "ALPACA_BASE_URL", "https://api.alpaca.markets")
+    monkeypatch.setattr(config, "PAPER", False)
+    monkeypatch.setattr(config, "ALLOW_LIVE", True)
+    monkeypatch.setattr(config, "ALPACA_BASE_URL", "https://api.alpaca.markets")
+    monkeypatch.setattr(config, "_printed_alpaca_mode", False)
     main._check_paper_mode()  # must not raise
     out = capsys.readouterr().out
     assert "LIVE" in out

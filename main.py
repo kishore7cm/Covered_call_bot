@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import schedule
 
+import config
 import notifier
 import trader
 from config import (
@@ -28,7 +29,6 @@ from config import (
     CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET, MIN_IV_HISTORY_POINTS,
     DTE_MIN, DTE_MAX, OTHER_BOTS_SYMBOLS, WATCHLIST_MAX_AGE_DAYS,
     STALE_LOT_WEEKS, RECOVERY_EXIT_ENABLED_SYMBOLS, RECOVERY_EXIT_MIN_MARGIN_PCT,
-    ALLOW_LIVE, ALPACA_BASE_URL, PAPER,
 )
 from greeks import delta_from_quote
 from iv_rank import iv_rank, iv_percentile
@@ -54,25 +54,17 @@ LOCK_PATH = "pipeline_state/main.lock"
 
 def _check_paper_mode() -> None:
     """
-    Second, independent confirmation before this bot will run against a
-    non-paper ALPACA_BASE_URL -- config.PAPER alone is a substring check
-    on one env var (see config.py), easy to get wrong by accident (a
-    typo'd or copy-pasted ALPACA_BASE_URL). Runs first, before the
-    lockfile or anything else, so a misconfigured live endpoint never
-    even gets as far as touching pipeline_state/.
+    Thin wrapper around config.assert_paper_mode() -- the actual
+    enforcement now lives there, called at the exact point trader.py and
+    options_data.py construct their TradingClient (so it's already run,
+    successfully, by the time this module even finishes importing those
+    two -- no entry point that imports either can bypass it). This call
+    is a second, redundant-but-harmless confirmation kept here so _main()
+    still has a clean, testable seam and exits with SystemExit(1) rather
+    than whatever exception type happened to surface from deep in an
+    import chain.
     """
-    mode = "PAPER" if PAPER else "LIVE"
-    if not PAPER and not ALLOW_LIVE:
-        print(
-            f"REFUSING TO START: ALPACA_BASE_URL ({ALPACA_BASE_URL}) is not the paper host, and "
-            "ALLOW_LIVE is not set. Set ALLOW_LIVE=true explicitly if you really mean to run "
-            "against a live account.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-    suffix = " [ALLOW_LIVE override]" if not PAPER else ""
-    print(f"ALPACA mode: {mode} ({ALPACA_BASE_URL}){suffix}")
-    logger.info("ALPACA mode: %s (%s)%s", mode, ALPACA_BASE_URL, suffix)
+    config.assert_paper_mode()
 
 
 def _acquire_lock() -> None:

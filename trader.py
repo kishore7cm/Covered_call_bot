@@ -44,9 +44,17 @@ from config import (
     MAX_ORDERS_PER_CYCLE, MAX_ROLLS_PER_LOT, MAX_SLIPPAGE_FROM_MID_PCT, MAX_TOTAL_CAPITAL,
     MIN_ACCOUNT_BUYING_POWER, PAPER, ROLL_OPEN_LEG_MAX_RETRIES, SHARES_PER_LOT,
 )
+import config
 from logger import get_own_symbols, get_rolls_since_last_lot_open
 
 _log = logging.getLogger(__name__)
+
+# Enforced HERE, at the exact point this module's TradingClient is built --
+# not just at main.py's entrypoint -- so any script that imports trader.py
+# (main.py, clear_attention.py, a one-off REPL import, etc.) refuses a
+# non-paper ALPACA_BASE_URL before a single client object exists to call an
+# order method on. See config.assert_paper_mode()'s docstring.
+config.assert_paper_mode()
 
 _client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER)
 _option_data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)

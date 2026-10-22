@@ -19,10 +19,15 @@ from config import (
     MIN_OPEN_INTEREST, MAX_SPREAD_PCT, REQUIRE_EXPIRY_BEFORE_EARNINGS,
     QUOTE_MAX_AGE_MINUTES,
 )
+import config
 from calendar_data import get_earnings_status
 from greeks import implied_vol, bs_call_delta, bs_call_theta_per_day
 
 _log = logging.getLogger(__name__)
+
+# Enforced HERE, at the exact point this module's TradingClient is built --
+# see trader.py's identical call and config.assert_paper_mode()'s docstring.
+config.assert_paper_mode()
 
 _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER)
 _data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
