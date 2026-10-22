@@ -109,6 +109,24 @@ def _risk_adjusted_summary(stats: dict) -> str:
     return summary
 
 
+def _score_used_summary(stats: dict) -> str:
+    """
+    Which objective actually picked this symbol's (DTE, delta) -- for
+    exit-intent symbols this is turnover_score, NOT risk_adjusted_return,
+    even though _risk_adjusted_summary above always shows the latter. A
+    reviewer needs to know which number was the deciding criterion, not
+    just see both and guess. "" for watchlist entries that predate Task 4.
+    """
+    score_used = stats.get("score_used")
+    if score_used is None:
+        return ""
+    if score_used == "turnover_score":
+        turnover = stats.get("turnover_score")
+        turnover_str = f"{turnover:.4f}/day" if turnover is not None else "n/a"
+        return f"score used: turnover_score ({turnover_str})"
+    return f"score used: {score_used}"
+
+
 def _intent_summary(stats: dict) -> str:
     """
     intent + whether it came from an explicit pipeline_state/intents.json
@@ -182,6 +200,9 @@ def _diff(active: dict, proposed: dict) -> None:
             stats = proposed_symbols[s]
             print(f"  + {s}: DTE={stats['dte']} (avg annualized yield {stats['avg_annualized_yield'] * 100:.1f}%)")
             print(f"      {_intent_summary(stats)}")
+            score_summary = _score_used_summary(stats)
+            if score_summary:
+                print(f"      {score_summary}")
             print(f"      {_is_oos_summary(stats)}")
             ra_summary = _risk_adjusted_summary(stats)
             if ra_summary:
@@ -192,6 +213,9 @@ def _diff(active: dict, proposed: dict) -> None:
         for s in removed:
             print(f"  - {s}")
             print(f"      {_intent_summary(active_symbols[s])}")
+            score_summary = _score_used_summary(active_symbols[s])
+            if score_summary:
+                print(f"      {score_summary}")
             print(f"      {_is_oos_summary(active_symbols[s])}")
             ra_summary = _risk_adjusted_summary(active_symbols[s])
             if ra_summary:
@@ -208,6 +232,9 @@ def _diff(active: dict, proposed: dict) -> None:
                 parts.append(f"intent {old.get('intent', '?')} -> {new.get('intent', '?')}")
             print(f"  ~ {s}: {', '.join(parts)}")
             print(f"      {_intent_summary(new)}")
+            score_summary = _score_used_summary(new)
+            if score_summary:
+                print(f"      {score_summary}")
             print(f"      {_is_oos_summary(new)}")
             ra_summary = _risk_adjusted_summary(new)
             if ra_summary:

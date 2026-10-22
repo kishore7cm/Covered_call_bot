@@ -67,6 +67,29 @@ TASK 2 ADDITIONS (on top of the original yield-sweep above):
     shrunk DTE finds no valid cycles, this logs a warning and keeps the
     symbol's original (unshrunk) DTE rather than silently dropping it.
 
+TURNOVER SCORE (exit-intent selection only; hold-intent symbols still rank
+by risk-adjusted total return, unchanged):
+
+    turnover_score = (net_premium_dollars + realized_stock_gain_dollars)
+                      / (entry_capital_dollars * expected_days_to_exit)
+
+    expected_days_to_exit = dte / p_called_away
+
+  realized_stock_gain_dollars is the ASSIGNED-LOTS-ONLY stock gain (see
+  CycleStats' field comment) -- deliberately excludes a still-open final
+  lot's unrealized mark, since this score is about completed turnover
+  velocity, not an open position's risk. p_called_away (Task 3's
+  empirical stat, TRAIN window -- selection never sees OOS) stands in for
+  DTE alone when estimating how long capital is actually tied up: a
+  symbol that only gets assigned 1 cycle in 10 takes far longer than one
+  DTE window to really turn over, and a naive dte-only estimate would
+  hide that entirely. A combo needs p_called_away > 0 and a trustworthy
+  empirical_effective_n, PLUS acceptable OOS max_drawdown and OOS
+  open-tail loss (see backtest_symbol_total_return's docstring and
+  _check_exit_eligibility) to even be ELIGIBLE for this ranking -- the
+  score itself has no risk term, so without those hard ceilings it could
+  win purely by ignoring downside.
+
 KNOWN LIMITATIONS (read before trusting a number out of this):
   - No real historical options quotes exist for this account (no OPRA
     history, Polygon options/financials dead on this plan). Premiums here
@@ -116,9 +139,11 @@ import yfinance as yf
 
 from config import (
     DEFAULT_ASSUMED_SPREAD_PCT, DEFAULT_INTENT, DELTA_SWEEP_BUCKETS,
-    EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT, FILL_HAIRCUT_FRACTION,
-    INTENT_BAND_SWEEP_POINTS, INTENT_DELTA_BANDS, MIN_CYCLES_FOR_SELECTION,
-    MIN_DRAWDOWN_FLOOR_PCT, RISK_FREE_RATE, SHRINKAGE_MIN_CYCLES,
+    EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT, EXIT_MAX_OOS_DRAWDOWN_PCT,
+    EXIT_MAX_OPEN_TAIL_LOSS_PCT, FILL_HAIRCUT_FRACTION,
+    INTENT_BAND_SWEEP_POINTS, INTENT_DELTA_BANDS,
+    MIN_CYCLES_FOR_SELECTION, MIN_DRAWDOWN_FLOOR_PCT,
+    MIN_EFFECTIVE_N_FOR_P_CALLED_AWAY, RISK_FREE_RATE, SHRINKAGE_MIN_CYCLES,
     TARGET_DELTA, WALK_FORWARD_TRAIN_FRACTION,
 )
 from greeks import bs_call_price, strike_from_delta
@@ -205,6 +230,20 @@ class CycleStats:
     oos_median_move_pct: float | None = None
     oos_empirical_window_count: int | None = None
     oos_empirical_effective_n: int | None = None
+
+    # Turnover score (exit-intent selection, see module docstring for the
+    # formula). entry_capital_dollars was already computed as a local var
+    # for total_return_pct/risk_adjusted_return -- persisted here too since
+    # the turnover score needs it as its own denominator component outside
+    # backtest_dte. realized_stock_gain_dollars is the REALIZED-ONLY
+    # (assigned lots only) stock gain, deliberately excluding the still-
+    # open final lot's mark-to-market that stock_pnl_dollars includes --
+    # "capped stock gain IF assigned" is about completed turnover, not an
+    # open position's unrealized risk.
+    entry_capital_dollars: float | None = None
+    realized_stock_gain_dollars: float | None = None
+    turnover_score: float | None = None
+    score_used: str | None = None  # "risk_adjusted_return" (hold) or "turnover_score" (exit)
 
 
 def _load_intents(path: str = INTENTS_PATH) -> dict[str, str]:
@@ -436,6 +475,8 @@ def backtest_dte(
     cash = 0.0
     holding = False
     equity_curve = []
+    lot_entry_price = None
+    realized_stock_gain_dollars = 0.0
 
     for i, ev in enumerate(events):
         spot, strike, premium, spot_t, assigned = (
@@ -445,6 +486,7 @@ def backtest_dte(
         if not holding:
             cash -= spot  # BUY -- mirrors trader.buy_shares, only when no shares held
             holding = True
+            lot_entry_price = spot
 
         cash += premium  # SELL_TO_OPEN/ROLL premium banked immediately
 
@@ -467,6 +509,11 @@ def backtest_dte(
         if assigned:
             cash += strike  # shares called away -- mirrors check_assignment() -> "assigned"
             holding = False
+            # Realized-ONLY stock gain (Task 4): excludes any still-open
+            # final lot's mark-to-market, which stock_pnl_dollars below
+            # does include -- "capped stock gain IF assigned" is about
+            # completed turnover, not an open position's unrealized risk.
+            realized_stock_gain_dollars += (strike - lot_entry_price) * 100
             option_rows.append({"action": "ASSIGNED", "premium": None, "qty": 1})
 
         equity_curve.append(cash + (spot_t if holding else 0.0))
@@ -532,6 +579,8 @@ def backtest_dte(
         empirical_window_count=empirical["empirical_window_count"] if empirical else None,
         empirical_effective_n=empirical["empirical_effective_n"] if empirical else None,
         move_threshold_pct_used=empirical["move_threshold_pct_used"] if empirical else None,
+        entry_capital_dollars=entry_capital_dollars,
+        realized_stock_gain_dollars=realized_stock_gain_dollars,
     )
 
 
@@ -564,6 +613,72 @@ def recommend_expiration(symbol: str, dte_buckets: tuple[int, ...] = DEFAULT_DTE
     return max(results.values(), key=lambda s: s.avg_annualized_yield)
 
 
+def _turnover_score(stats: CycleStats, dte: int) -> float:
+    """
+    (net premium after haircut + realized/capped stock gain if assigned)
+    / (capital x expected days to exit). expected days to exit comes from
+    the empirical assignment frequency (p_called_away), not just the raw
+    DTE -- a symbol that rarely actually gets assigned within one dte
+    window takes many MORE than `dte` days to really turn over, and a
+    naive dte-only estimate would make it look just as fast as a symbol
+    that reliably gets assigned every cycle. Caller must have already
+    confirmed stats.p_called_away is a valid, nonzero, well-evidenced
+    number (see _check_exit_eligibility) -- this function doesn't re-check.
+    """
+    expected_days_to_exit = dte / stats.p_called_away
+    numerator = stats.net_premium_dollars + stats.realized_stock_gain_dollars
+    denominator = stats.entry_capital_dollars * expected_days_to_exit
+    return numerator / denominator
+
+
+def _check_exit_eligibility(
+    train_stats: CycleStats,
+    test_closes: pd.Series, test_vol: pd.Series, dte: int, delta: float, rate: float,
+    spread_pct: float, haircut_fraction: float, move_threshold_pct: float,
+    min_effective_n: int, max_oos_drawdown_pct: float, max_open_tail_loss_pct: float,
+) -> tuple[bool, str, CycleStats | None]:
+    """
+    Exit-intent-only eligibility, layered ON TOP of (not instead of)
+    min_cycles_for_selection -- the turnover score only measures $/day
+    efficiency, nothing about risk, so without these a combo could win
+    purely by having a great numerator and a terrible, ignored downside.
+    Returns (eligible, reason_if_not, oos_candidate_or_None) -- the OOS
+    CycleStats is returned so the caller can reuse it as the FINAL pick's
+    OOS validation without a second backtest_dte call, if this combo wins.
+    """
+    if not train_stats.p_called_away:  # None or exactly 0.0
+        return False, "p_called_away is 0 (or unavailable) -- never gets assigned within one window", None
+
+    if (train_stats.empirical_effective_n or 0) < min_effective_n:
+        return False, (
+            f"empirical_effective_n={train_stats.empirical_effective_n} < {min_effective_n} -- "
+            f"not enough independent windows to trust p_called_away"
+        ), None
+
+    oos_candidate = backtest_dte(test_closes, test_vol, dte, delta, rate, spread_pct, haircut_fraction, move_threshold_pct)
+    if oos_candidate is None:
+        return False, "no OOS cycles at all to validate against", None
+
+    if oos_candidate.max_drawdown_pct > max_oos_drawdown_pct:
+        return False, (
+            f"OOS max_drawdown {oos_candidate.max_drawdown_pct:.1%} exceeds the "
+            f"EXIT_MAX_OOS_DRAWDOWN_PCT ceiling of {max_oos_drawdown_pct:.1%}"
+        ), None
+
+    # Open-tail loss: whatever's left of stock_pnl_dollars after removing
+    # the realized (assigned-lot-only) portion -- the still-open final
+    # lot's unrealized mark. Positive open_tail_loss_pct means a LOSS.
+    open_tail_pnl = oos_candidate.stock_pnl_dollars - oos_candidate.realized_stock_gain_dollars
+    open_tail_loss_pct = -open_tail_pnl / oos_candidate.entry_capital_dollars
+    if open_tail_loss_pct > max_open_tail_loss_pct:
+        return False, (
+            f"OOS open-tail loss {open_tail_loss_pct:.1%} exceeds the EXIT_MAX_OPEN_TAIL_LOSS_PCT "
+            f"ceiling of {max_open_tail_loss_pct:.1%}"
+        ), None
+
+    return True, "", oos_candidate
+
+
 def backtest_symbol_total_return(
     symbol: str,
     dte_buckets: tuple[int, ...] = DEFAULT_DTE_BUCKETS,
@@ -578,22 +693,42 @@ def backtest_symbol_total_return(
     intent: str = DEFAULT_INTENT,
     intent_is_default: bool = False,
     move_threshold_pct: float = EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT,
+    min_effective_n_for_p_called_away: int = MIN_EFFECTIVE_N_FOR_P_CALLED_AWAY,
+    exit_max_oos_drawdown_pct: float = EXIT_MAX_OOS_DRAWDOWN_PCT,
+    exit_max_open_tail_loss_pct: float = EXIT_MAX_OPEN_TAIL_LOSS_PCT,
 ) -> CycleStats | None:
     """
     Task 2's main entry point. Sweeps dte_buckets x delta_buckets on the
-    TRAIN slice only (selection never sees the validation window), picking
-    the combo with the best risk-adjusted total return. That exact combo is
-    then validated out-of-sample on the untouched remainder.
+    TRAIN slice only (selection never sees the validation window).
 
-    ELIGIBILITY: a combo with fewer than min_cycles_for_selection in-sample
-    cycles is excluded from the comparison entirely, not just scored
-    conservatively. MIN_DRAWDOWN_FLOOR_PCT (in backtest_dte) stops a
-    near-zero-drawdown combo's ratio from being unboundedly generous, but it
-    doesn't stop a 1-2 cycle fluke from competing -- and winning -- against
-    a well-evidenced combo in the first place. This does. Excluded combos
-    are logged (not printed -- routine, can be frequent); if NOTHING is
-    eligible for this symbol, it's dropped entirely and the caller (CLI
-    __main__) prints why.
+    SCORING BY INTENT (Task 4):
+      - intent="hold": ranks by risk-adjusted total return, as before --
+        long-horizon income, drawdown-aware.
+      - intent="exit": ranks by _turnover_score() (see its docstring) --
+        $ realized per $ of capital per day, using the empirical assignment
+        frequency (not raw DTE) for how long capital is actually tied up.
+        A combo is eligible for THIS ranking only if, in addition to
+        min_cycles_for_selection: (1) p_called_away > 0 and well-evidenced
+        (empirical_effective_n >= min_effective_n_for_p_called_away), (2)
+        its OOS max_drawdown doesn't exceed exit_max_oos_drawdown_pct, and
+        (3) its OOS open-tail (still-held) loss doesn't exceed
+        exit_max_open_tail_loss_pct -- the turnover score itself has no
+        risk term, so these hard ceilings are what stop it from winning by
+        simply ignoring downside. For exit-intent, OOS stats are computed
+        PER CANDIDATE during the sweep (not just for the final pick) since
+        the ceiling check needs them -- the winning candidate's already-
+        computed OOS result is reused for the final out-of-sample fields
+        below, not recomputed.
+
+    ELIGIBILITY (both intents): a combo with fewer than
+    min_cycles_for_selection in-sample cycles is excluded from the
+    comparison entirely, not just scored conservatively. MIN_DRAWDOWN_
+    FLOOR_PCT (in backtest_dte) stops a near-zero-drawdown combo's ratio
+    from being unboundedly generous, but it doesn't stop a 1-2 cycle fluke
+    from competing -- and winning -- against a well-evidenced combo in the
+    first place. This does. Excluded combos are logged (not printed --
+    routine, can be frequent); if NOTHING is eligible for this symbol,
+    it's dropped entirely and the caller (CLI __main__) prints why.
     """
     closes = _price_history(symbol, lookback)
     vol = _realized_vol(closes)
@@ -604,7 +739,7 @@ def backtest_symbol_total_return(
     test_closes, test_vol = closes.iloc[split_idx:], vol.iloc[split_idx:]
 
     found_any_valid_combo = False
-    best, best_score = None, None
+    best, best_score, best_oos = None, None, None
     for delta in delta_buckets:
         for dte in dte_buckets:
             stats = backtest_dte(
@@ -621,24 +756,42 @@ def backtest_symbol_total_return(
                 )
                 continue
 
-            score = stats.risk_adjusted_return if stats.risk_adjusted_return is not None else stats.avg_annualized_yield
+            if intent == "exit":
+                eligible, reason, oos_candidate = _check_exit_eligibility(
+                    stats, test_closes, test_vol, dte, delta, rate, spread_pct, haircut_fraction, move_threshold_pct,
+                    min_effective_n_for_p_called_away, exit_max_oos_drawdown_pct, exit_max_open_tail_loss_pct,
+                )
+                if not eligible:
+                    _log.info("%s: DTE=%d delta=%.2f ineligible for exit-intent selection -- %s",
+                               symbol, dte, delta, reason)
+                    continue
+                score = _turnover_score(stats, dte)
+            else:
+                oos_candidate = None
+                score = stats.risk_adjusted_return if stats.risk_adjusted_return is not None else stats.avg_annualized_yield
+
             if best is None or score > best_score:
-                best, best_score = stats, score
+                best, best_score, best_oos = stats, score, oos_candidate
 
     if best is None:
         if found_any_valid_combo:
             _log.warning(
-                "%s: every (DTE, delta) combo had fewer than %d in-sample cycles -- "
-                "dropping from the proposal (nothing eligible for selection)",
-                symbol, min_cycles_for_selection,
+                "%s: every (DTE, delta) combo had fewer than %d in-sample cycles, or none passed intent=%s's "
+                "eligibility checks -- dropping from the proposal (nothing eligible for selection)",
+                symbol, min_cycles_for_selection, intent,
             )
         else:
             _log.warning("%s: no (DTE, delta) combo produced any in-sample cycles at all -- dropping", symbol)
         return None
 
-    oos_stats = backtest_dte(
-        test_closes, test_vol, best.dte, best.target_delta, rate, spread_pct, haircut_fraction, move_threshold_pct,
-    )
+    # Exit-intent already computed this candidate's OOS stats during
+    # eligibility checking -- reuse it rather than re-running backtest_dte.
+    if intent == "exit" and best_oos is not None:
+        oos_stats = best_oos
+    else:
+        oos_stats = backtest_dte(
+            test_closes, test_vol, best.dte, best.target_delta, rate, spread_pct, haircut_fraction, move_threshold_pct,
+        )
     in_sample_yield = best.avg_annualized_yield
     out_of_sample_yield = oos_stats.avg_annualized_yield if oos_stats is not None else None
     gap_pp = (in_sample_yield - out_of_sample_yield) * 100 if out_of_sample_yield is not None else None
@@ -661,6 +814,8 @@ def backtest_symbol_total_return(
         oos_median_move_pct=oos_stats.median_move_pct if oos_stats is not None else None,
         oos_empirical_window_count=oos_stats.empirical_window_count if oos_stats is not None else None,
         oos_empirical_effective_n=oos_stats.empirical_effective_n if oos_stats is not None else None,
+        turnover_score=best_score if intent == "exit" else None,
+        score_used="turnover_score" if intent == "exit" else "risk_adjusted_return",
     )
 
 
@@ -673,6 +828,9 @@ def apply_dte_shrinkage(
     train_fraction: float = WALK_FORWARD_TRAIN_FRACTION,
     min_cycles_for_selection: int = MIN_CYCLES_FOR_SELECTION,
     move_threshold_pct: float = EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT,
+    min_effective_n_for_p_called_away: int = MIN_EFFECTIVE_N_FOR_P_CALLED_AWAY,
+    exit_max_oos_drawdown_pct: float = EXIT_MAX_OOS_DRAWDOWN_PCT,
+    exit_max_open_tail_loss_pct: float = EXIT_MAX_OPEN_TAIL_LOSS_PCT,
 ) -> dict[str, CycleStats]:
     """
     Pull a symbol's recommended DTE toward a consensus when its own
@@ -736,6 +894,9 @@ def apply_dte_shrinkage(
                 min_cycles_for_selection=min_cycles_for_selection,
                 intent=intent, intent_is_default=stats.intent_is_default or False,
                 move_threshold_pct=move_threshold_pct,
+                min_effective_n_for_p_called_away=min_effective_n_for_p_called_away,
+                exit_max_oos_drawdown_pct=exit_max_oos_drawdown_pct,
+                exit_max_open_tail_loss_pct=exit_max_open_tail_loss_pct,
             )
             if refreshed is None:
                 _log.warning(
@@ -833,6 +994,12 @@ if __name__ == "__main__":
                               "symbol's own intent-derived delta band")
     parser.add_argument("--move-threshold-pct", type=float, default=EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT,
                          help="X in P(|move| < X%% over one DTE window) for the empirical outcome stats")
+    parser.add_argument("--min-effective-n-for-p-called-away", type=int, default=MIN_EFFECTIVE_N_FOR_P_CALLED_AWAY,
+                         help="exit-intent only: minimum empirical_effective_n to trust p_called_away for selection")
+    parser.add_argument("--exit-max-oos-drawdown-pct", type=float, default=EXIT_MAX_OOS_DRAWDOWN_PCT,
+                         help="exit-intent only: OOS max_drawdown eligibility ceiling")
+    parser.add_argument("--exit-max-open-tail-loss-pct", type=float, default=EXIT_MAX_OPEN_TAIL_LOSS_PCT,
+                         help="exit-intent only: OOS still-open-lot unrealized loss eligibility ceiling")
     parser.add_argument("--out", default=None,
                          help=f"write {{symbol: recommended_dte+stats}} JSON for apply_watchlist.py to consume "
                               f"(default when --from-screener is used: {DEFAULT_PROPOSED_OUT_PATH})")
@@ -878,6 +1045,9 @@ if __name__ == "__main__":
                 min_cycles_for_selection=args.min_cycles_for_selection,
                 intent=intent, intent_is_default=intent_is_default,
                 move_threshold_pct=args.move_threshold_pct,
+                min_effective_n_for_p_called_away=args.min_effective_n_for_p_called_away,
+                exit_max_oos_drawdown_pct=args.exit_max_oos_drawdown_pct,
+                exit_max_open_tail_loss_pct=args.exit_max_open_tail_loss_pct,
             )
             if stats is None:
                 print(f"{symbol}: FAILED — no (DTE, delta) combo had >= {args.min_cycles_for_selection} "
@@ -892,10 +1062,12 @@ if __name__ == "__main__":
                 f"{symbol}: intent={intent_str} | best DTE={stats.dte} delta={stats.target_delta:.2f} | "
                 f"IS yield={stats.in_sample_yield * 100:.1f}% OOS yield={oos_str} (gap={gap_str})"
             )
+            turnover_str = f" turnover_score={stats.turnover_score:.4f}" if stats.turnover_score is not None else ""
             print(
                 f"    total_return={stats.total_return_pct * 100:.1f}% "
                 f"max_drawdown={stats.max_drawdown_pct * 100:.1f}% "
-                f"risk_adjusted={stats.risk_adjusted_return:.2f} | "
+                f"risk_adjusted={stats.risk_adjusted_return:.2f}{turnover_str} "
+                f"(score used: {stats.score_used}) | "
                 f"spread={stats.spread_pct_used * 100:.1f}% (source: {stats.spread_source})"
             )
             oos_return_str = f"{stats.oos_total_return_pct * 100:.1f}%" if stats.oos_total_return_pct is not None else "n/a"
@@ -930,6 +1102,9 @@ if __name__ == "__main__":
             recommendations, lookback=args.lookback, haircut_fraction=args.haircut_fraction,
             train_fraction=args.train_fraction, min_cycles_for_selection=args.min_cycles_for_selection,
             move_threshold_pct=args.move_threshold_pct,
+            min_effective_n_for_p_called_away=args.min_effective_n_for_p_called_away,
+            exit_max_oos_drawdown_pct=args.exit_max_oos_drawdown_pct,
+            exit_max_open_tail_loss_pct=args.exit_max_open_tail_loss_pct,
         )
         for symbol, stats in recommendations.items():
             if stats.shrunk_from_dte is not None:

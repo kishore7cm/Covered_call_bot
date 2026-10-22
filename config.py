@@ -119,6 +119,19 @@ SHRINKAGE_MIN_CYCLES = 8
 # correction this overlap necessitates.
 EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT = 0.05
 
+# ── Turnover score (exit-intent selection, backtest.py) ──────────────────────
+# Below this effective sample size (Task 3's empirical_effective_n),
+# p_called_away isn't trustworthy enough to drive an exit-intent ranking
+# decision -- the combo is ineligible, not scored conservatively.
+MIN_EFFECTIVE_N_FOR_P_CALLED_AWAY = 20
+# Hard eligibility ceilings so the turnover score -- which only measures
+# $/day efficiency, nothing about risk -- can't win purely by ignoring
+# downside. Checked against the OOS window (walk-forward discipline: a
+# combo that looked safe in-sample but blew through either ceiling out of
+# sample is exactly the case these exist to catch).
+EXIT_MAX_OOS_DRAWDOWN_PCT = 0.25
+EXIT_MAX_OPEN_TAIL_LOSS_PCT = 0.15
+
 # ── Intent (pipeline_state/intents.json) ─────────────────────────────────────
 # Human-curated per-symbol intent, read by backtest.py. Any symbol NOT
 # listed in intents.json gets DEFAULT_INTENT -- backtest.py tracks (and

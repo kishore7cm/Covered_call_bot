@@ -351,12 +351,12 @@ def test_oos_metrics_none_when_test_slice_has_no_cycles(monkeypatch):
 
 # ── DTE shrinkage toward the cross-symbol consensus ──────────────────────────
 
-def _stats(dte, num_cycles, target_delta=0.25, intent=None, intent_is_default=None):
+def _stats(dte, num_cycles, target_delta=0.25, intent=None, intent_is_default=None, **extra):
     return backtest.CycleStats(
         dte=dte, num_cycles=num_cycles, total_premium_pct=0.1, avg_annualized_yield=0.1,
         assignment_rate=0.2, strategy_total_return=0.1, buy_and_hold_return=0.1,
         target_delta=target_delta, spread_pct_used=0.05, spread_source="default",
-        intent=intent, intent_is_default=intent_is_default,
+        intent=intent, intent_is_default=intent_is_default, **extra,
     )
 
 
@@ -610,3 +610,163 @@ def test_backtest_symbol_total_return_populates_oos_empirical_fields(monkeypatch
     assert result.oos_p_called_away == pytest.approx(1.0)    # OOS -- same deterministic series
     assert result.oos_empirical_window_count is not None
     assert result.oos_empirical_effective_n is not None
+
+
+# ── Turnover score (exit-intent selection) ───────────────────────────────────
+
+def test_realized_stock_gain_dollars_excludes_open_tail(monkeypatch):
+    """Same 3-event scenario as the trader-state-machine test: lot 1 is
+    assigned (realized), lot 2 is still open at the end (unrealized).
+    realized_stock_gain_dollars must count ONLY lot 1 -- stock_pnl_dollars
+    (already tested elsewhere) counts both and must differ from it."""
+    events = [
+        {"pos": 0, "exit_pos": 1, "spot": 100.0, "strike": 110.0, "premium": 2.0, "spot_t": 120.0, "assigned": True},
+        {"pos": 1, "exit_pos": 2, "spot": 120.0, "strike": 130.0, "premium": 3.0, "spot_t": 125.0, "assigned": False},
+        {"pos": 2, "exit_pos": 3, "spot": 125.0, "strike": 135.0, "premium": 1.0, "spot_t": 90.0, "assigned": False},
+    ]
+    monkeypatch.setattr(backtest, "_simulate_cycles", lambda *a, **k: events)
+
+    stats = backtest.backtest_dte(pd.Series(dtype=float), pd.Series(dtype=float), dte=30, target_delta=0.25)
+
+    assert stats.realized_stock_gain_dollars == pytest.approx((110.0 - 100.0) * 100)
+    assert stats.entry_capital_dollars == pytest.approx(100.0 * 100)
+    assert stats.stock_pnl_dollars != pytest.approx(stats.realized_stock_gain_dollars)
+
+
+def test_turnover_score_formula():
+    stats = _stats(
+        dte=30, num_cycles=20, p_called_away=0.5,
+        net_premium_dollars=500.0, realized_stock_gain_dollars=100.0, entry_capital_dollars=10000.0,
+    )
+    score = backtest._turnover_score(stats, dte=30)
+    # expected_days_to_exit = 30/0.5 = 60; numerator = 600; denom = 600,000
+    assert score == pytest.approx(600.0 / 600_000.0)
+
+
+_EXIT_ARGS_TAIL = (30, 0.40, 0.045, 0.05, 0.5, 0.05, 20, 0.25, 0.15)  # dte, delta, rate, spread, haircut, move_thr, min_n, max_dd, max_tail
+
+
+def test_check_exit_eligibility_rejects_zero_p_called_away():
+    train_stats = _stats(dte=30, num_cycles=20, p_called_away=0.0, empirical_effective_n=50)
+    eligible, reason, oos = backtest._check_exit_eligibility(
+        train_stats, pd.Series(dtype=float), pd.Series(dtype=float), *_EXIT_ARGS_TAIL,
+    )
+    assert eligible is False
+    assert "p_called_away is 0" in reason
+    assert oos is None
+
+
+def test_check_exit_eligibility_rejects_low_effective_n():
+    train_stats = _stats(dte=30, num_cycles=20, p_called_away=0.3, empirical_effective_n=5)
+    eligible, reason, oos = backtest._check_exit_eligibility(
+        train_stats, pd.Series(dtype=float), pd.Series(dtype=float), *_EXIT_ARGS_TAIL,
+    )
+    assert eligible is False
+    assert "empirical_effective_n=5 < 20" in reason
+
+
+def test_check_exit_eligibility_rejects_high_oos_drawdown(monkeypatch):
+    train_stats = _stats(dte=30, num_cycles=20, p_called_away=0.3, empirical_effective_n=50)
+    oos_stats = _stats(
+        dte=30, num_cycles=10, max_drawdown_pct=0.40, stock_pnl_dollars=0.0,
+        realized_stock_gain_dollars=0.0, entry_capital_dollars=10000.0,
+    )
+    monkeypatch.setattr(backtest, "backtest_dte", lambda *a, **k: oos_stats)
+
+    eligible, reason, oos = backtest._check_exit_eligibility(
+        train_stats, pd.Series(dtype=float), pd.Series(dtype=float), *_EXIT_ARGS_TAIL,
+    )
+    assert eligible is False
+    assert "OOS max_drawdown" in reason
+    assert oos is None
+
+
+def test_check_exit_eligibility_rejects_high_open_tail_loss(monkeypatch):
+    train_stats = _stats(dte=30, num_cycles=20, p_called_away=0.3, empirical_effective_n=50)
+    # max_drawdown passes (0.05 < 0.25 ceiling); open-tail loss doesn't:
+    # all of stock_pnl_dollars (-$2000) is unrealized (realized gain=0) on
+    # $10,000 capital -> 20% loss, above the 15% ceiling.
+    oos_stats = _stats(
+        dte=30, num_cycles=10, max_drawdown_pct=0.05, stock_pnl_dollars=-2000.0,
+        realized_stock_gain_dollars=0.0, entry_capital_dollars=10000.0,
+    )
+    monkeypatch.setattr(backtest, "backtest_dte", lambda *a, **k: oos_stats)
+
+    eligible, reason, oos = backtest._check_exit_eligibility(
+        train_stats, pd.Series(dtype=float), pd.Series(dtype=float), *_EXIT_ARGS_TAIL,
+    )
+    assert eligible is False
+    assert "open-tail loss" in reason
+    assert oos is None
+
+
+def test_check_exit_eligibility_passes_and_returns_oos_candidate(monkeypatch):
+    train_stats = _stats(dte=30, num_cycles=20, p_called_away=0.3, empirical_effective_n=50)
+    oos_stats = _stats(
+        dte=30, num_cycles=10, max_drawdown_pct=0.05, stock_pnl_dollars=200.0,
+        realized_stock_gain_dollars=200.0, entry_capital_dollars=10000.0,
+    )
+    monkeypatch.setattr(backtest, "backtest_dte", lambda *a, **k: oos_stats)
+
+    eligible, reason, oos = backtest._check_exit_eligibility(
+        train_stats, pd.Series(dtype=float), pd.Series(dtype=float), *_EXIT_ARGS_TAIL,
+    )
+    assert eligible is True
+    assert reason == ""
+    assert oos is oos_stats
+
+
+def test_exit_intent_selection_uses_turnover_score_not_risk_adjusted(monkeypatch):
+    monkeypatch.setattr(backtest, "_price_history", lambda symbol, lookback=None: _synthetic_closes(n=500))
+
+    def fake_backtest_dte(closes, vol, dte, target_delta, *a, **k):
+        base = dict(
+            total_premium_pct=0.1, avg_annualized_yield=0.3, assignment_rate=0.3,
+            strategy_total_return=0.1, buy_and_hold_return=0.05, target_delta=target_delta,
+            total_return_pct=0.1, max_drawdown_pct=0.05, risk_adjusted_return=2.0,
+            p_called_away=0.5, empirical_effective_n=40, empirical_window_count=100,
+            entry_capital_dollars=10000.0, stock_pnl_dollars=0.0, realized_stock_gain_dollars=0.0,
+        )
+        # dte=7: turnover = 500/(10000*(7/0.5)) ~= 0.00357
+        # dte=30: turnover = 100/(10000*(30/0.5)) ~= 0.000167 -- dte=7 wins
+        premium = 500.0 if dte == 7 else 100.0
+        return backtest.CycleStats(dte=dte, num_cycles=20, net_premium_dollars=premium, **base)
+
+    monkeypatch.setattr(backtest, "backtest_dte", fake_backtest_dte)
+
+    result = backtest.backtest_symbol_total_return(
+        "FAKE", dte_buckets=(7, 30), delta_buckets=(0.40,), intent="exit",
+    )
+
+    assert result is not None
+    assert result.dte == 7
+    assert result.score_used == "turnover_score"
+    assert result.turnover_score == pytest.approx(500.0 / (10000.0 * (7 / 0.5)))
+
+
+def test_hold_intent_selection_still_uses_risk_adjusted_return(monkeypatch):
+    monkeypatch.setattr(backtest, "_price_history", lambda symbol, lookback=None: _synthetic_closes(n=500))
+    stats = _stats(dte=30, num_cycles=20, risk_adjusted_return=1.5)
+    monkeypatch.setattr(backtest, "backtest_dte", lambda *a, **k: stats)
+
+    result = backtest.backtest_symbol_total_return(
+        "FAKE", dte_buckets=(30,), delta_buckets=(0.25,), intent="hold",
+    )
+
+    assert result.score_used == "risk_adjusted_return"
+    assert result.turnover_score is None
+
+
+def test_exit_intent_drops_symbol_when_nothing_passes_eligibility(monkeypatch, caplog):
+    monkeypatch.setattr(backtest, "_price_history", lambda symbol, lookback=None: _synthetic_closes(n=500))
+    # Every combo has p_called_away == 0 -- universally ineligible for exit.
+    stats = _stats(dte=30, num_cycles=20, p_called_away=0.0, empirical_effective_n=50)
+    monkeypatch.setattr(backtest, "backtest_dte", lambda *a, **k: stats)
+
+    with caplog.at_level(logging.WARNING, logger="backtest"):
+        result = backtest.backtest_symbol_total_return(
+            "FAKE", dte_buckets=(30,), delta_buckets=(0.40,), intent="exit",
+        )
+
+    assert result is None
+    assert any("dropping from the proposal" in rec.message for rec in caplog.records)
