@@ -26,6 +26,21 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
+# ── Closer safety (Phase 3) ───────────────────────────────────────────────────
+# Checked by trader.py's shared _guard() before EVERY order this bot submits
+# (buy_shares, sell_to_open_call, buy_to_close_call -- roll_call composes the
+# latter two, so both legs are covered automatically). DRY_RUN defaults to
+# True deliberately: a fresh checkout of this repo must never place a real
+# order just because it was run. Only set DRY_RUN=False yourself, deliberately,
+# once you're ready for the Closer to actually submit orders.
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() not in ("false", "0", "no")
+# Belt-and-suspenders kill switch: EITHER this flag OR the presence of the
+# KILL_SWITCH_PATH file blocks every order, independent of DRY_RUN. The file
+# form means you can engage it by hand (touch the file) without touching code
+# or env vars, and it survives a restart since it's just a file on disk.
+KILL_SWITCH_ENABLED = os.getenv("KILL_SWITCH_ENABLED", "false").lower() in ("true", "1", "yes")
+KILL_SWITCH_PATH = "pipeline_state/kill_switch"
+
 # ── Watchlist ─────────────────────────────────────────────────────────────────
 # Small fixed list of symbols you're comfortable holding 100-share lots of
 # long-term (assignment is a normal outcome, not a failure). Fill this in.

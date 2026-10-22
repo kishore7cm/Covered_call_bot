@@ -7,20 +7,75 @@ failure rather than raising, so a single bad order never kills the weekly
 loop the way an unhandled exception killed the ORB stock bot. Callers must
 still check for None and notify/log accordingly — this module does not
 swallow failures silently, it just contains them.
+
+PHASE 3 SAFETY GUARD: every function that would otherwise call
+_client.submit_order checks _guard() first. DRY_RUN (default True) and the
+kill switch (config.KILL_SWITCH_ENABLED or the presence of
+config.KILL_SWITCH_PATH) are two different REASONS for the identical
+outcome — nothing gets sent to the broker — so they share this one gate
+rather than being checked separately, ad hoc, at each call site. A blocked
+order returns a dict with "submitted": False (see _not_submitted), NEVER
+None — None is reserved for a REAL API rejection. Callers must check
+result.get("submitted") before treating a result as a real fill, not just
+"is it None."
 """
 import logging
+import os
 import time
+import uuid
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, OrderSide, PositionIntent, PositionSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, PAPER, SHARES_PER_LOT
+from config import (
+    ALPACA_API_KEY, ALPACA_SECRET_KEY, DRY_RUN, KILL_SWITCH_ENABLED,
+    KILL_SWITCH_PATH, PAPER, SHARES_PER_LOT,
+)
 
 _log = logging.getLogger(__name__)
 
 _client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER)
+
+
+# ── Safety guard (Phase 3) ────────────────────────────────────────────────────
+
+def _kill_switch_engaged() -> bool:
+    return KILL_SWITCH_ENABLED or os.path.exists(KILL_SWITCH_PATH)
+
+
+def _guard(description: str) -> str | None:
+    """
+    Single pre-submission gate. Returns None if a real submission should
+    proceed, or a short reason string ("kill_switch" / "dry_run") if it
+    must be blocked instead. Checked before EVERY order, not cached or
+    checked once per cycle — the kill switch file can appear mid-cycle,
+    and each order must see current state at the moment it's about to fire.
+    """
+    if _kill_switch_engaged():
+        _log.warning("KILL SWITCH ENGAGED — blocking order: %s", description)
+        return "kill_switch"
+    if DRY_RUN:
+        _log.info("DRY RUN — would submit: %s", description)
+        return "dry_run"
+    return None
+
+
+def _not_submitted(block_reason: str, **fields) -> dict:
+    """
+    Synthetic result for a blocked order — ALWAYS a truthy dict, never
+    None, so callers can tell "intentionally not submitted" (DRY_RUN/kill
+    switch) apart from "the broker rejected this" (which still returns
+    None) without extra plumbing. "submitted" is the one field every
+    caller should check before treating ANY result as a real fill.
+    """
+    return {
+        "order_id": f"NOT_SUBMITTED-{uuid.uuid4().hex[:12]}",
+        "submitted": False,
+        "block_reason": block_reason,
+        **fields,
+    }
 
 
 # ── Positions ─────────────────────────────────────────────────────────────────
@@ -104,6 +159,10 @@ def _poll_fill_price(order_id) -> float | None:
 
 
 def buy_shares(symbol: str, qty: int = SHARES_PER_LOT) -> dict | None:
+    block_reason = _guard(f"BUY {qty} {symbol}")
+    if block_reason:
+        return _not_submitted(block_reason, symbol=symbol, qty=qty, price=None)
+
     try:
         order = _client.submit_order(MarketOrderRequest(
             symbol=symbol,
@@ -117,12 +176,16 @@ def buy_shares(symbol: str, qty: int = SHARES_PER_LOT) -> dict | None:
 
     _log.info("BUY SHARES submitted %s | qty=%s | order_id=%s", symbol, qty, order.id)
     fill_price = _poll_fill_price(order.id)
-    return {"order_id": str(order.id), "symbol": symbol, "qty": qty, "price": fill_price}
+    return {"order_id": str(order.id), "symbol": symbol, "qty": qty, "price": fill_price, "submitted": True}
 
 
 # ── Options: single-leg covered call management ──────────────────────────────
 
 def sell_to_open_call(occ_symbol: str, qty: int = 1) -> dict | None:
+    block_reason = _guard(f"SELL_TO_OPEN {qty}x {occ_symbol}")
+    if block_reason:
+        return _not_submitted(block_reason, occ_symbol=occ_symbol, qty=qty)
+
     try:
         order = _client.submit_order(MarketOrderRequest(
             symbol=occ_symbol,
@@ -136,10 +199,14 @@ def sell_to_open_call(occ_symbol: str, qty: int = 1) -> dict | None:
         return None
 
     _log.info("SELL_TO_OPEN submitted %s | qty=%s | order_id=%s", occ_symbol, qty, order.id)
-    return {"order_id": str(order.id), "occ_symbol": occ_symbol, "qty": qty}
+    return {"order_id": str(order.id), "occ_symbol": occ_symbol, "qty": qty, "submitted": True}
 
 
 def buy_to_close_call(occ_symbol: str, qty: int = 1) -> dict | None:
+    block_reason = _guard(f"BUY_TO_CLOSE {qty}x {occ_symbol}")
+    if block_reason:
+        return _not_submitted(block_reason, occ_symbol=occ_symbol, qty=qty)
+
     try:
         order = _client.submit_order(MarketOrderRequest(
             symbol=occ_symbol,
@@ -153,7 +220,7 @@ def buy_to_close_call(occ_symbol: str, qty: int = 1) -> dict | None:
         return None
 
     _log.info("BUY_TO_CLOSE submitted %s | qty=%s | order_id=%s", occ_symbol, qty, order.id)
-    return {"order_id": str(order.id), "occ_symbol": occ_symbol, "qty": qty}
+    return {"order_id": str(order.id), "occ_symbol": occ_symbol, "qty": qty, "submitted": True}
 
 
 def roll_call(old_occ_symbol: str, new_occ_symbol: str, qty: int = 1) -> dict | None:
@@ -162,18 +229,36 @@ def roll_call(old_occ_symbol: str, new_occ_symbol: str, qty: int = 1) -> dict | 
     as a single roll event (two order legs, not a native multi-leg order —
     Alpaca does support multi-leg for options, but splitting these keeps the
     failure mode simple: if the close fails, we never attempt the open).
+
+    Both legs independently pass through buy_to_close_call/sell_to_open_call,
+    so each respects the guard on its own — but a DRY_RUN/kill-switch block
+    on the close leg must NOT be treated the same as a block on the open
+    leg: if close never happened for real, there's nothing uncovered yet
+    (the old call is still in place), so the open leg must not be attempted
+    for real either, and we short-circuit to a matching synthetic "not
+    submitted" result instead of calling sell_to_open_call. But once the
+    close leg IS real, the shares are genuinely uncovered until the open
+    leg is ALSO real — so a block on the open leg at that point (e.g. the
+    kill switch engaging in between the two calls) is exactly as dangerous
+    as a real API failure and must hit the same "needs manual attention"
+    path, not be allowed through as a quiet non-error.
     """
     close = buy_to_close_call(old_occ_symbol, qty)
     if close is None:
         _log.error("roll_call: close leg failed for %s — aborting roll, NOT opening new leg", old_occ_symbol)
         return None
 
+    if not close.get("submitted", True):
+        _log.info("roll_call: close leg blocked (%s) — not attempting the open leg", close["block_reason"])
+        return {"closed": close, "opened": _not_submitted(close["block_reason"], occ_symbol=new_occ_symbol, qty=qty)}
+
     open_ = sell_to_open_call(new_occ_symbol, qty)
-    if open_ is None:
+    if open_ is None or not open_.get("submitted", True):
+        reason = "API rejection" if open_ is None else open_.get("block_reason")
         _log.error(
-            "roll_call: close leg succeeded for %s but open leg failed for %s — "
+            "roll_call: close leg succeeded for %s but open leg did NOT go through (%s) for %s — "
             "position is now UNCOVERED SHARES, no short call. Needs manual attention.",
-            old_occ_symbol, new_occ_symbol,
+            old_occ_symbol, reason, new_occ_symbol,
         )
         return None
 
