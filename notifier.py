@@ -39,8 +39,8 @@ async def send_shares_bought(symbol: str, qty: int, order_id: str) -> None:
 
 
 async def send_call_sold(symbol: str, occ_symbol: str, strike: float, expiration: date,
-                          premium: float, delta: float) -> None:
-    await _send(
+                          premium: float, delta: float, ex_div_warning: str | None = None) -> None:
+    text = (
         f"🟢 <b>CALL SOLD — {symbol}</b>\n"
         f"Contract:  {occ_symbol}\n"
         f"Strike:    ${strike:.2f}\n"
@@ -48,6 +48,9 @@ async def send_call_sold(symbol: str, occ_symbol: str, strike: float, expiration
         f"Premium:   ${premium:.2f}/share (${premium * 100:.2f}/contract)\n"
         f"Delta:     {delta:.2f}"
     )
+    if ex_div_warning:
+        text += f"\n{ex_div_warning}"
+    await _send(text)
 
 
 async def send_call_closed(symbol: str, occ_symbol: str, reason: str, pnl: float) -> None:
@@ -59,13 +62,17 @@ async def send_call_closed(symbol: str, occ_symbol: str, reason: str, pnl: float
     )
 
 
-async def send_call_rolled(symbol: str, old_occ: str, new_occ: str, net_credit: float) -> None:
-    await _send(
+async def send_call_rolled(symbol: str, old_occ: str, new_occ: str, net_credit: float,
+                            ex_div_warning: str | None = None) -> None:
+    text = (
         f"🔄 <b>CALL ROLLED — {symbol}</b>\n"
         f"From: {old_occ}\n"
         f"To:   {new_occ}\n"
         f"Net:  {'credit' if net_credit >= 0 else 'debit'} ${abs(net_credit):.2f}"
     )
+    if ex_div_warning:
+        text += f"\n{ex_div_warning}"
+    await _send(text)
 
 
 async def send_assigned(symbol: str, shares: int) -> None:

@@ -82,10 +82,11 @@ def test_insufficient_history_path_has_no_spot_price_lookup(monkeypatch):
 
 def test_ivr_and_earnings_thread_through_every_return_path(monkeypatch):
     """Even the earliest return path (insufficient history) must carry the
-    IVR/earnings fields -- they're computed up front, not bolted on only
-    for symbols that make it further."""
+    IVR/earnings/ex-div fields -- they're computed up front, not bolted on
+    only for symbols that make it further."""
     monkeypatch.setattr(screener, "_resolve_ivr", lambda symbol, csv_ivr_by_symbol: (62.0, "iv_logger"))
     monkeypatch.setattr(screener, "_check_earnings_in_window", lambda symbol: (True, "2026-11-05"))
+    monkeypatch.setattr(screener, "_ex_dividend_date", lambda symbol: "2026-11-10")
     monkeypatch.setattr(screener, "_years_of_price_history", lambda symbol: 0.5)
 
     result = screener.screen_symbol("NEWCO")
@@ -94,6 +95,7 @@ def test_ivr_and_earnings_thread_through_every_return_path(monkeypatch):
     assert result.ivr_source == "iv_logger"
     assert result.earnings_in_window is True
     assert result.earnings_date == "2026-11-05"
+    assert result.ex_dividend_date == "2026-11-10"
 
 
 # ── _load_ivr_csv ─────────────────────────────────────────────────────────────
@@ -174,3 +176,17 @@ def test_no_earnings_date_is_not_flagged(monkeypatch):
     in_window, earnings_date = screener._check_earnings_in_window("AAPL")
     assert in_window is False
     assert earnings_date is None
+
+
+# ── _ex_dividend_date ──────────────────────────────────────────────────────────
+
+def test_ex_dividend_date_returns_iso_string_when_known(monkeypatch):
+    from datetime import date, timedelta
+    ex_div = date.today() + timedelta(days=5)
+    monkeypatch.setattr(screener, "get_calendar_dates", lambda symbol: (None, ex_div))
+    assert screener._ex_dividend_date("AAPL") == ex_div.isoformat()
+
+
+def test_ex_dividend_date_none_when_unavailable(monkeypatch):
+    monkeypatch.setattr(screener, "get_calendar_dates", lambda symbol: (None, None))
+    assert screener._ex_dividend_date("AAPL") is None

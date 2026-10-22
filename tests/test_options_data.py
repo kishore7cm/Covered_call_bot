@@ -245,3 +245,82 @@ def test_pick_strike_min_strike_none_is_unaffected(monkeypatch):
 
     assert result is not None
     assert result.occ_symbol == "LOW"
+
+
+# ── _build_candidate: ex-dividend flag date window (Phase 3, Stage 4.3) ─────
+
+def _ex_div_test_candidate(today, expiration_date, ex_dividend_date):
+    """Builds a real CallCandidate via _build_candidate (not a fake) so
+    the actual ex_div_flag computation runs -- a realistic near-the-money,
+    30ish-DTE contract with a fresh, narrow quote so implied_vol/delta
+    solve cleanly and the only thing varying between tests is the
+    ex-dividend date."""
+    contract = FakeCallContract("AAPL_TEST", 100.0, expiration_date)
+    snap = FakeSnapshot(latest_quote=FakeQuote(bid_price=4.9, ask_price=5.1, timestamp=_fresh_timestamp()))
+    return options_data._build_candidate(contract, snap, spot_price=100.0, today=today, ex_dividend_date=ex_dividend_date)
+
+
+def test_ex_div_past_date_is_not_flagged():
+    today = date.today()
+    expiration = today + timedelta(days=30)
+    past_ex_div = today - timedelta(days=10)
+
+    candidate = _ex_div_test_candidate(today, expiration, past_ex_div)
+
+    assert candidate is not None
+    assert candidate.ex_div_before_expiration is False
+
+
+def test_ex_div_date_after_expiration_is_not_flagged():
+    today = date.today()
+    expiration = today + timedelta(days=30)
+    ex_div_after_expiration = expiration + timedelta(days=5)
+
+    candidate = _ex_div_test_candidate(today, expiration, ex_div_after_expiration)
+
+    assert candidate is not None
+    assert candidate.ex_div_before_expiration is False
+
+
+def test_ex_div_date_inside_window_is_flagged():
+    today = date.today()
+    expiration = today + timedelta(days=30)
+    ex_div_inside_window = today + timedelta(days=15)
+
+    candidate = _ex_div_test_candidate(today, expiration, ex_div_inside_window)
+
+    assert candidate is not None
+    assert candidate.ex_div_before_expiration is True
+
+
+def test_ex_div_missing_date_is_not_flagged():
+    today = date.today()
+    expiration = today + timedelta(days=30)
+
+    candidate = _ex_div_test_candidate(today, expiration, None)
+
+    assert candidate is not None
+    assert candidate.ex_div_before_expiration is False
+
+
+def test_ex_div_date_exactly_today_is_flagged():
+    """Boundary: today counts as 'today or later' per the approved spec."""
+    today = date.today()
+    expiration = today + timedelta(days=30)
+
+    candidate = _ex_div_test_candidate(today, expiration, today)
+
+    assert candidate is not None
+    assert candidate.ex_div_before_expiration is True
+
+
+def test_ex_div_date_exactly_on_expiration_is_flagged():
+    """Boundary: 'on or before expiration' per the approved spec --
+    exactly on expiration counts as flagged, not excluded."""
+    today = date.today()
+    expiration = today + timedelta(days=30)
+
+    candidate = _ex_div_test_candidate(today, expiration, expiration)
+
+    assert candidate is not None
+    assert candidate.ex_div_before_expiration is True

@@ -424,3 +424,126 @@ def test_diff_without_earnings_by_symbol_arg_is_backward_compatible(capsys):
     out = capsys.readouterr().out
     assert "+ AAPL" in out
     assert "earnings on" not in out
+
+
+# ── _load_ex_div_by_symbol / _ex_div_warning ─────────────────────────────────
+
+def test_load_ex_div_by_symbol_parses_known_dates():
+    screened = _screened([
+        {"symbol": "AAPL", "ex_dividend_date": "2026-11-05"},
+        {"symbol": "MSFT", "ex_dividend_date": None},
+        {"symbol": "KO"},  # no ex_dividend_date key at all
+    ])
+    result = aw._load_ex_div_by_symbol(screened)
+    assert result == {"AAPL": date(2026, 11, 5)}
+
+
+def test_load_ex_div_by_symbol_skips_malformed_date():
+    screened = _screened([{"symbol": "AAPL", "ex_dividend_date": "not-a-date"}])
+    assert aw._load_ex_div_by_symbol(screened) == {}
+
+
+def test_load_ex_div_by_symbol_missing_results_key_returns_empty():
+    assert aw._load_ex_div_by_symbol({}) == {}
+
+
+def test_ex_div_warning_fires_when_inside_implied_window():
+    ex_div_date = date.today() + timedelta(days=10)
+    warning = aw._ex_div_warning("AAPL", proposed_dte=14, ex_div_by_symbol={"AAPL": ex_div_date})
+    assert "ex-dividend on" in warning
+    assert ex_div_date.isoformat() in warning
+
+
+def test_ex_div_warning_empty_when_outside_implied_window():
+    ex_div_date = date.today() + timedelta(days=30)
+    warning = aw._ex_div_warning("AAPL", proposed_dte=14, ex_div_by_symbol={"AAPL": ex_div_date})
+    assert warning == ""
+
+
+def test_ex_div_warning_empty_when_no_known_ex_div_date():
+    assert aw._ex_div_warning("AAPL", proposed_dte=14, ex_div_by_symbol={}) == ""
+
+
+def test_ex_div_warning_boundary_exactly_at_implied_expiration():
+    ex_div_date = date.today() + timedelta(days=14)
+    warning = aw._ex_div_warning("AAPL", proposed_dte=14, ex_div_by_symbol={"AAPL": ex_div_date})
+    assert warning != ""  # inclusive of the implied expiration date itself
+
+
+def test_ex_div_warning_fires_when_ex_div_is_today():
+    # Unlike earnings (strictly after today), the approved ex-div window is
+    # today <= ex-div <= implied expiration -- today itself DOES flag.
+    warning = aw._ex_div_warning("AAPL", proposed_dte=14, ex_div_by_symbol={"AAPL": date.today()})
+    assert warning != ""
+
+
+def test_ex_div_warning_empty_when_date_is_in_the_past():
+    ex_div_date = date.today() - timedelta(days=1)
+    warning = aw._ex_div_warning("AAPL", proposed_dte=14, ex_div_by_symbol={"AAPL": ex_div_date})
+    assert warning == ""
+
+
+# ── _diff() wires the ex-div warning into ADD/CHANGE, not REMOVE ────────────
+
+def test_diff_add_shows_ex_div_warning(capsys):
+    ex_div_date = date.today() + timedelta(days=5)
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed, ex_div_by_symbol={"AAPL": ex_div_date})
+    out = capsys.readouterr().out
+    assert "ex-dividend on" in out
+    assert ex_div_date.isoformat() in out
+
+
+def test_diff_add_no_ex_div_warning_when_outside_window(capsys):
+    ex_div_date = date.today() + timedelta(days=90)
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed, ex_div_by_symbol={"AAPL": ex_div_date})
+    out = capsys.readouterr().out
+    assert "ex-dividend on" not in out
+
+
+def test_diff_change_uses_proposed_dte_for_ex_div_check(capsys):
+    # Active's old DTE (60) would put the ex-div date outside the window;
+    # the PROPOSED dte (14) is what must actually be used for the check.
+    ex_div_date = date.today() + timedelta(days=10)
+    active = _watchlist({"AAPL": {"dte": 60, "avg_annualized_yield": 0.10}})
+    proposed = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed, ex_div_by_symbol={"AAPL": ex_div_date})
+    out = capsys.readouterr().out
+    assert "ex-dividend on" in out
+
+
+def test_diff_remove_never_shows_ex_div_warning(capsys):
+    ex_div_date = date.today() + timedelta(days=5)
+    active = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    proposed = _watchlist({})
+    aw._diff(active, proposed, ex_div_by_symbol={"AAPL": ex_div_date})
+    out = capsys.readouterr().out
+    assert "REMOVE:" in out
+    assert "ex-dividend on" not in out
+
+
+def test_diff_without_ex_div_by_symbol_arg_is_backward_compatible(capsys):
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed)  # no ex_div_by_symbol at all
+    out = capsys.readouterr().out
+    assert "+ AAPL" in out
+    assert "ex-dividend on" not in out
+
+
+def test_diff_shows_both_earnings_and_ex_div_warning_when_both_present(capsys):
+    earnings_date = date.today() + timedelta(days=5)
+    ex_div_date = date.today() + timedelta(days=8)
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    aw._diff(
+        active, proposed,
+        earnings_by_symbol={"AAPL": earnings_date},
+        ex_div_by_symbol={"AAPL": ex_div_date},
+    )
+    out = capsys.readouterr().out
+    assert "earnings on" in out
+    assert "ex-dividend on" in out

@@ -137,6 +137,21 @@ def _check_earnings_in_window(symbol: str) -> tuple[bool, str | None]:
     return DTE_MIN <= days_out <= DTE_MAX, earnings_date.isoformat()
 
 
+def _ex_dividend_date(symbol: str) -> str | None:
+    """
+    This symbol's next known ex-dividend date (ISO string), or None if
+    unavailable. Purely informational, like earnings_date above -- no
+    window/flag logic here. get_calendar_dates is cache-backed (see
+    calendar_data.py), so this second call within the same screen_symbol()
+    cycle is cheap, not a second live yfinance fetch. apply_watchlist.py
+    applies the actual flagging window (today <= ex-div <= implied
+    expiration) at review time, the same approved window options_data.py's
+    _build_candidate uses for ex_div_before_expiration.
+    """
+    _earnings, ex_div = get_calendar_dates(symbol)
+    return ex_div.isoformat() if ex_div is not None else None
+
+
 MIN_YEARS_HISTORY = 2.0
 # How many of the near-target-delta candidates need to pass the liquidity
 # gates for the symbol as a whole to pass — one lucky liquid contract isn't
@@ -167,6 +182,9 @@ class ScreenResult:
     ivr_source: str = "unavailable"
     earnings_in_window: bool = False
     earnings_date: str | None = None
+    # Informational only -- see _ex_dividend_date's docstring. Never used to
+    # exclude a symbol or change screen_symbol's pass/fail outcome.
+    ex_dividend_date: str | None = None
 
 
 def _years_of_price_history(symbol: str) -> float | None:
@@ -191,6 +209,7 @@ def screen_symbol(
     # uses so sizer.py/this symbol's reviewer see them regardless of pass/fail.
     ivr, ivr_source = _resolve_ivr(symbol, csv_ivr_by_symbol)
     earnings_in_window, earnings_date = _check_earnings_in_window(symbol)
+    ex_dividend_date = _ex_dividend_date(symbol)
 
     years = _years_of_price_history(symbol)
     if years is None or years < MIN_YEARS_HISTORY:
@@ -200,19 +219,22 @@ def screen_symbol(
             if years is not None else "no price history available",
             years_of_history=years, ivr=ivr, ivr_source=ivr_source,
             earnings_in_window=earnings_in_window, earnings_date=earnings_date,
+            ex_dividend_date=ex_dividend_date,
         )
 
     spot = _get_spot_price(symbol)
     if spot is None:
         return ScreenResult(symbol=symbol, passed=False, reason="no live spot price available",
                              years_of_history=years, ivr=ivr, ivr_source=ivr_source,
-                             earnings_in_window=earnings_in_window, earnings_date=earnings_date)
+                             earnings_in_window=earnings_in_window, earnings_date=earnings_date,
+                             ex_dividend_date=ex_dividend_date)
 
     contracts = list_call_contracts(symbol, spot_price=spot)
     if not contracts:
         return ScreenResult(symbol=symbol, passed=False, reason="no call contracts in DTE window",
                              years_of_history=years, spot_price=spot, ivr=ivr, ivr_source=ivr_source,
-                             earnings_in_window=earnings_in_window, earnings_date=earnings_date)
+                             earnings_in_window=earnings_in_window, earnings_date=earnings_date,
+                             ex_dividend_date=ex_dividend_date)
 
     snapshots = get_chain_snapshot(symbol)
     today = date.today()
@@ -229,7 +251,8 @@ def screen_symbol(
     if not candidates:
         return ScreenResult(symbol=symbol, passed=False, reason="no solvable-delta candidates (thin/stale quotes)",
                              years_of_history=years, spot_price=spot, ivr=ivr, ivr_source=ivr_source,
-                             earnings_in_window=earnings_in_window, earnings_date=earnings_date)
+                             earnings_in_window=earnings_in_window, earnings_date=earnings_date,
+                             ex_dividend_date=ex_dividend_date)
 
     near_delta = [c for c in candidates if abs(c.delta - target_delta) <= NEAR_DELTA_WINDOW]
     liquid_near_delta = [
@@ -248,6 +271,7 @@ def screen_symbol(
             open_interest=best.open_interest, bid_ask_spread_pct=best.bid_ask_spread_pct,
             years_of_history=years, liquid_near_delta_count=len(liquid_near_delta), spot_price=spot,
             ivr=ivr, ivr_source=ivr_source, earnings_in_window=earnings_in_window, earnings_date=earnings_date,
+            ex_dividend_date=ex_dividend_date,
         )
 
     # Report stats from the best LIQUID near-delta candidate, not just the
@@ -261,6 +285,7 @@ def screen_symbol(
         open_interest=best_liquid.open_interest, bid_ask_spread_pct=best_liquid.bid_ask_spread_pct,
         years_of_history=years, liquid_near_delta_count=len(liquid_near_delta), spot_price=spot,
         ivr=ivr, ivr_source=ivr_source, earnings_in_window=earnings_in_window, earnings_date=earnings_date,
+        ex_dividend_date=ex_dividend_date,
     )
 
 

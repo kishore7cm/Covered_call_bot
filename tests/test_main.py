@@ -38,6 +38,8 @@ class FakeCandidate:
     mid_price: float
     delta: float
     iv: float = 0.3
+    ex_div_before_expiration: bool = False
+    ex_dividend_date: date | None = None
 
 
 def _far_occ_symbol(underlying: str, dte: int = 35, strike: float = 200.0) -> str:
@@ -817,3 +819,99 @@ def test_roll_logs_iv_metadata(monkeypatch):
     kwargs = logged["option_trades"][0][1]
     assert kwargs["iv_at_entry"] == 0.55
     assert kwargs["iv_rank_at_entry"] == 30.0
+
+
+# ── Ex-dividend flag surfacing (Phase 3, Stage 4.3 Part B) ───────────────────
+
+def _capture_async_call(sink):
+    """Returns a fake replacing an async notifier function: captures the
+    call's kwargs SYNCHRONOUSLY (so it works even though _patch_common's
+    default _run_async only closes the coroutine without running its
+    body), then returns a real no-op coroutine for _run_async to close."""
+    def fake(*args, **kwargs):
+        sink.append({"args": args, "kwargs": kwargs})
+        async def _noop():
+            return None
+        return _noop()
+    return fake
+
+
+def test_sell_to_open_surfaces_ex_div_warning_in_result_and_notification(monkeypatch):
+    ex_div_date = date.today() + timedelta(days=10)
+    candidate = FakeCandidate(
+        _far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.25,
+        ex_div_before_expiration=True, ex_dividend_date=ex_div_date,
+    )
+    sent = []
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: candidate)
+    monkeypatch.setattr(main.notifier, "send_call_sold", _capture_async_call(sent))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "Ex-dividend" in result
+    assert ex_div_date.isoformat() in result
+    assert len(sent) == 1
+    assert sent[0]["kwargs"]["ex_div_warning"] is not None
+    assert ex_div_date.isoformat() in sent[0]["kwargs"]["ex_div_warning"]
+
+
+def test_sell_to_open_no_warning_when_not_flagged(monkeypatch):
+    candidate = FakeCandidate(_far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.25)
+    sent = []
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: candidate)
+    monkeypatch.setattr(main.notifier, "send_call_sold", _capture_async_call(sent))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "Ex-dividend" not in result
+    assert sent[0]["kwargs"]["ex_div_warning"] is None
+
+
+def test_roll_surfaces_ex_div_warning_in_result_and_notification(monkeypatch):
+    old_occ = _far_occ_symbol("AAPL", dte=3)
+    ex_div_date = date.today() + timedelta(days=20)
+    new_candidate = FakeCandidate(
+        _far_occ_symbol("AAPL", dte=35), 200.0, date.today() + timedelta(days=35), 2.5, 0.25,
+        ex_div_before_expiration=True, ex_dividend_date=ex_div_date,
+    )
+    short_call = FakeShortCallPosition(symbol=old_occ, cost_basis="-250.0", market_value="-240.0")
+    sent = []
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+        find_short_call=lambda symbol: short_call,
+    )
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: new_candidate)
+    monkeypatch.setattr(main.notifier, "send_call_rolled", _capture_async_call(sent))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "Ex-dividend" in result
+    assert len(sent) == 1
+    assert sent[0]["kwargs"]["ex_div_warning"] is not None
+
+
+def test_ex_div_warning_reports_itm_when_spot_above_strike(monkeypatch):
+    ex_div_date = date.today() + timedelta(days=10)
+    candidate = FakeCandidate(
+        _far_occ_symbol("AAPL"), 90.0, date.today() + timedelta(days=35), 2.5, 0.25,
+        ex_div_before_expiration=True, ex_dividend_date=ex_div_date,
+    )
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "_get_spot_price", lambda symbol: 100.0)  # spot (100) > strike (90) -> ITM
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: candidate)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "ITM" in result

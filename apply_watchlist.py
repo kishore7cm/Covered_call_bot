@@ -32,6 +32,12 @@ at trade time) -- a clean pass here does not guarantee the live gate
 sees no conflict either, and vice versa; see _earnings_warning's
 docstring.
 
+EX-DIVIDEND vs. PROPOSED DTE: same approach, mirrored for Scout's recorded
+ex-dividend date (early-assignment risk on an ITM call near ex-div),
+using the same informational-only window approved for options_data.py's
+ex_div_before_expiration flag (today <= ex-div date <= implied
+expiration, both ends inclusive). See _ex_div_warning's docstring.
+
 Usage:
     python apply_watchlist.py                 # show the diff, change nothing
     python apply_watchlist.py --confirm       # show the diff, then apply it
@@ -88,6 +94,48 @@ def _load_earnings_by_symbol(screened: dict) -> dict[str, date]:
         except ValueError:
             continue
     return earnings_by_symbol
+
+
+def _load_ex_div_by_symbol(screened: dict) -> dict[str, date]:
+    """
+    {symbol: ex_dividend_date} from screener.py's screened_symbols.json --
+    mirrors _load_earnings_by_symbol above. Only symbols with a KNOWN
+    ex-dividend date (screener._ex_dividend_date already returns None when
+    yfinance has nothing to offer).
+    """
+    ex_div_by_symbol = {}
+    for r in screened.get("results", []):
+        ex_div_date_str = r.get("ex_dividend_date")
+        if not ex_div_date_str:
+            continue
+        try:
+            ex_div_by_symbol[r["symbol"]] = date.fromisoformat(ex_div_date_str)
+        except ValueError:
+            continue
+    return ex_div_by_symbol
+
+
+def _ex_div_warning(symbol: str, proposed_dte: int, ex_div_by_symbol: dict[str, date]) -> str:
+    """
+    Informational only -- mirrors _earnings_warning's approach, but uses the
+    approved ex-dividend window (today <= ex-div date <= implied
+    expiration), the same inclusive-both-ends window options_data.py's
+    _build_candidate uses for ex_div_before_expiration. Never excludes a
+    symbol or changes order behavior -- a flag only, same as Part A.
+    """
+    ex_div_date = ex_div_by_symbol.get(symbol)
+    if ex_div_date is None:
+        return ""
+
+    today = date.today()
+    implied_expiration = today + timedelta(days=proposed_dte)
+    if today <= ex_div_date <= implied_expiration:
+        return (
+            f"!! ex-dividend on {ex_div_date.isoformat()} falls within the ~{proposed_dte}-day proposed "
+            f"expiration window (today -> ~{implied_expiration.isoformat()}) -- early-assignment risk on "
+            f"an ITM call; informational only, does not change strike selection or order behavior"
+        )
+    return ""
 
 
 def _earnings_warning(symbol: str, proposed_dte: int, earnings_by_symbol: dict[str, date]) -> str:
@@ -258,8 +306,13 @@ def _print_empirical_summaries(stats: dict) -> None:
         print(f"      {oos_line}")
 
 
-def _diff(active: dict, proposed: dict, earnings_by_symbol: dict[str, date] | None = None) -> None:
+def _diff(
+    active: dict, proposed: dict,
+    earnings_by_symbol: dict[str, date] | None = None,
+    ex_div_by_symbol: dict[str, date] | None = None,
+) -> None:
     earnings_by_symbol = earnings_by_symbol or {}
+    ex_div_by_symbol = ex_div_by_symbol or {}
     active_symbols = active.get("symbols", {})
     proposed_symbols = proposed.get("symbols", {})
 
@@ -292,6 +345,9 @@ def _diff(active: dict, proposed: dict, earnings_by_symbol: dict[str, date] | No
             earnings_warning = _earnings_warning(s, stats["dte"], earnings_by_symbol)
             if earnings_warning:
                 print(f"      {earnings_warning}")
+            ex_div_warning = _ex_div_warning(s, stats["dte"], ex_div_by_symbol)
+            if ex_div_warning:
+                print(f"      {ex_div_warning}")
     if removed:
         print("REMOVE:")
         for s in removed:
@@ -327,6 +383,9 @@ def _diff(active: dict, proposed: dict, earnings_by_symbol: dict[str, date] | No
             earnings_warning = _earnings_warning(s, new["dte"], earnings_by_symbol)
             if earnings_warning:
                 print(f"      {earnings_warning}")
+            ex_div_warning = _ex_div_warning(s, new["dte"], ex_div_by_symbol)
+            if ex_div_warning:
+                print(f"      {ex_div_warning}")
     if not (added or removed or changed):
         print("No differences — active watchlist already matches the proposed one.")
 
@@ -346,8 +405,10 @@ if __name__ == "__main__":
 
     active = _load(args.active)
     proposed = _load(args.proposed)
-    earnings_by_symbol = _load_earnings_by_symbol(_load(args.screened))
-    _diff(active, proposed, earnings_by_symbol)
+    screened = _load(args.screened)
+    earnings_by_symbol = _load_earnings_by_symbol(screened)
+    ex_div_by_symbol = _load_ex_div_by_symbol(screened)
+    _diff(active, proposed, earnings_by_symbol, ex_div_by_symbol)
 
     if not args.confirm:
         print("\n(dry run — pass --confirm to apply this to the live trader's watchlist)")

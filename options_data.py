@@ -57,11 +57,15 @@ class CallCandidate:
     # Filter 2 liquidity/timing fields.
     open_interest: int | None = None
     bid_ask_spread_pct: float | None = None
-    # True if a known ex-dividend date falls before this contract's expiration
-    # — early-assignment risk on an ITM short call. This is a FLAG, not an
+    # True if a known ex-dividend date falls within [today, expiration] --
+    # early-assignment risk on an ITM short call. This is a FLAG, not an
     # exclusion: pick_strike does not drop candidates for this alone, the
-    # caller (main.py) should surface it and let the human/strategy decide.
+    # caller (main.py) surfaces it (Telegram/logs) and lets the human
+    # decide. ex_dividend_date is carried alongside it (not just the bool)
+    # so a caller can report the actual date/days-until without having to
+    # re-derive it from calendar_data a second time.
     ex_div_before_expiration: bool = False
+    ex_dividend_date: date | None = None
 
 
 @dataclass
@@ -240,7 +244,14 @@ def _build_candidate(
     # than storing a string in a field declared `int | None`.
     oi = int(contract.open_interest) if contract.open_interest is not None else None
 
-    ex_div_flag = ex_dividend_date is not None and ex_dividend_date < exp
+    # A past ex-div date (yfinance returns the MOST RECENT one when the
+    # next hasn't been officially scheduled yet -- live-confirmed for
+    # AAPL, whose Ex-Dividend Date comes back months in the past) is not
+    # upcoming risk at all; comparing it against a future expiration with
+    # no lower bound used to flag every single candidate as a false
+    # positive. Informational only either way -- never excludes a
+    # candidate, never affects which strike gets picked.
+    ex_div_flag = ex_dividend_date is not None and today <= ex_dividend_date <= exp
 
     return CallCandidate(
         occ_symbol=contract.symbol,
@@ -259,6 +270,7 @@ def _build_candidate(
         open_interest=oi,
         bid_ask_spread_pct=spread_pct,
         ex_div_before_expiration=ex_div_flag,
+        ex_dividend_date=ex_dividend_date,
     )
 
 

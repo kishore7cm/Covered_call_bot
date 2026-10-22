@@ -184,6 +184,25 @@ def _log_and_alert_failure(symbol: str, default_msg: str) -> None:
     _run_async(notifier.send_error(symbol, msg))
 
 
+def _ex_div_warning_text(candidate, spot: float | None) -> str | None:
+    """
+    Surfaces options_data.CallCandidate.ex_div_before_expiration (Phase 3,
+    Stage 4.3 Part B) -- informational only, never changes which strike
+    was picked or whether the order goes through. None if the candidate
+    wasn't flagged at all. "In the money" here means right now, at the
+    time this message is built -- the true unknown is the spot price AT
+    the ex-dividend date itself, which hasn't happened yet.
+    """
+    if not candidate.ex_div_before_expiration or candidate.ex_dividend_date is None:
+        return None
+    days_until = (candidate.ex_dividend_date - date.today()).days
+    moneyness = "moneyness unknown (no spot price)" if spot is None else ("ITM" if spot > candidate.strike else "OTM")
+    return (
+        f"⚠️ Ex-dividend {candidate.ex_dividend_date.isoformat()} ({days_until}d) — "
+        f"{moneyness} — early-assignment risk"
+    )
+
+
 def run_symbol_cycle(
     symbol: str, recommended_dte: int | None = None,
     atm_iv: float | None = None, atm_iv_rank: float | None = None,
@@ -409,11 +428,17 @@ def run_symbol_cycle(
                       "against the weekly iv_history series (a different, nearest-the-money "
                       "contract, not necessarily this one)",
         )
+        ex_div_warning = _ex_div_warning_text(candidate, spot)
+        if ex_div_warning:
+            logger.warning("%s: %s (%s)", symbol, ex_div_warning, candidate.occ_symbol)
         _run_async(notifier.send_call_sold(
             symbol, candidate.occ_symbol, candidate.strike, candidate.expiration,
-            candidate.mid_price, candidate.delta,
+            candidate.mid_price, candidate.delta, ex_div_warning=ex_div_warning,
         ))
-        return f"{symbol}: sold {candidate.occ_symbol} @ ${candidate.mid_price:.2f} (delta {candidate.delta:.2f})"
+        result_str = f"{symbol}: sold {candidate.occ_symbol} @ ${candidate.mid_price:.2f} (delta {candidate.delta:.2f})"
+        if ex_div_warning:
+            result_str += f" [{ex_div_warning}]"
+        return result_str
 
     # ── State 3: shares + short call open — check close/roll rules ──────────
     occ_symbol = short_call.symbol
@@ -553,8 +578,16 @@ def run_symbol_cycle(
                           iv_source="iv_at_entry: Black-Scholes implied vol solved for the new "
                                     "contract (options_data.pick_strike); iv_rank_at_entry: this "
                                     "cycle's ATM IV rank against the weekly iv_history series")
-        _run_async(notifier.send_call_rolled(symbol, occ_symbol, new_candidate.occ_symbol, 0.0))
-        return f"{symbol}: rolled {occ_symbol} -> {new_candidate.occ_symbol}"
+        ex_div_warning = _ex_div_warning_text(new_candidate, spot)
+        if ex_div_warning:
+            logger.warning("%s: %s (%s)", symbol, ex_div_warning, new_candidate.occ_symbol)
+        _run_async(notifier.send_call_rolled(
+            symbol, occ_symbol, new_candidate.occ_symbol, 0.0, ex_div_warning=ex_div_warning,
+        ))
+        result_str = f"{symbol}: rolled {occ_symbol} -> {new_candidate.occ_symbol}"
+        if ex_div_warning:
+            result_str += f" [{ex_div_warning}]"
+        return result_str
 
     if profit_captured_pct is None:
         return f"{symbol}: holding {occ_symbol} (profit captured unavailable — cost_basis/market_value looked inconsistent)"
