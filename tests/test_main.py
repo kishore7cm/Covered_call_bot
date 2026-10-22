@@ -10,8 +10,11 @@ the real broker by accident.
 """
 import asyncio
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+
+import pytest
 
 import main
 import trader
@@ -915,3 +918,70 @@ def test_ex_div_warning_reports_itm_when_spot_above_strike(monkeypatch):
     result = main.run_symbol_cycle("AAPL")
 
     assert "ITM" in result
+
+
+# ── Lockfile ──────────────────────────────────────────────────────────────────
+
+def test_acquire_lock_writes_pid_and_release_removes_it(monkeypatch, tmp_path):
+    lock_path = tmp_path / "main.lock"
+    monkeypatch.setattr(main, "LOCK_PATH", str(lock_path))
+
+    main._acquire_lock()
+    assert lock_path.exists()
+    assert lock_path.read_text().strip() == str(os.getpid())
+
+    main._release_lock()
+    assert not lock_path.exists()
+
+
+def test_acquire_lock_refuses_a_second_instance(monkeypatch, tmp_path):
+    lock_path = tmp_path / "main.lock"
+    monkeypatch.setattr(main, "LOCK_PATH", str(lock_path))
+
+    main._acquire_lock()
+    with pytest.raises(SystemExit):
+        main._acquire_lock()
+
+    main._release_lock()
+
+
+def test_release_lock_with_no_lock_present_is_a_no_op(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "LOCK_PATH", str(tmp_path / "main.lock"))
+    main._release_lock()  # must not raise
+
+
+# ── --once: init_schema, exactly one cycle, exit ─────────────────────────────
+
+def test_main_once_runs_init_schema_and_exactly_one_cycle_then_returns(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "_acquire_lock", lambda: calls.append("acquire"))
+    monkeypatch.setattr(main, "_release_lock", lambda: calls.append("release"))
+    monkeypatch.setattr(main, "init_schema", lambda: calls.append("init_schema"))
+    monkeypatch.setattr(main, "run_cycle", lambda: calls.append("run_cycle"))
+    monkeypatch.setattr(main, "_load_watchlist", lambda: {"AAPL": None})
+
+    rc = main._main(["--once"])
+
+    # If --once ever fell through into the scheduler's `while True` loop,
+    # this call would simply never return and the test would hang/time out
+    # rather than fail cleanly -- reaching this assert at all is part of
+    # what's being proven here.
+    assert rc == 0
+    assert calls == ["acquire", "init_schema", "run_cycle", "release"]
+
+
+def test_main_once_releases_lock_even_if_the_cycle_raises(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "_acquire_lock", lambda: calls.append("acquire"))
+    monkeypatch.setattr(main, "_release_lock", lambda: calls.append("release"))
+    monkeypatch.setattr(main, "init_schema", lambda: None)
+
+    def boom():
+        raise RuntimeError("boom")
+    monkeypatch.setattr(main, "run_cycle", boom)
+    monkeypatch.setattr(main, "_load_watchlist", lambda: {"AAPL": None})
+
+    with pytest.raises(RuntimeError):
+        main._main(["--once"])
+
+    assert calls == ["acquire", "release"]

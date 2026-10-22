@@ -9,10 +9,12 @@ died: an unhandled exception in a tight loop with no guard, silent for
 weeks before anyone noticed. Here the cadence is weekly, so a silent death
 would be even easier to miss — the guard matters more, not less.
 """
+import argparse
 import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -45,6 +47,48 @@ ACTIVE_WATCHLIST_PATH = "pipeline_state/active_watchlist.json"
 # is allowed to range — real expirations don't land on the exact day the
 # backtest assumed, so an exact match would too often find nothing.
 DTE_TOLERANCE_DAYS = 5
+
+LOCK_PATH = "pipeline_state/main.lock"
+
+
+def _acquire_lock() -> None:
+    """
+    Refuses to start if another instance's lockfile is already present --
+    this bot places real orders (once DRY_RUN/kill switch allow it), and
+    two instances racing the same watchlist/MAX_ORDERS_PER_CYCLE counter
+    at once is exactly the kind of double-submission risk a single
+    always-running worker is supposed to avoid. O_CREAT|O_EXCL makes the
+    check-and-create atomic rather than a separate exists-then-write race.
+    There is deliberately no automatic staleness timeout -- same policy as
+    needs_attention.json: a lockfile left behind by a crash (not a clean
+    exit) must be removed by a human who has confirmed no other instance
+    is actually running, not auto-expired after a guessed timeout.
+    """
+    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+    try:
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        existing_pid = ""
+        try:
+            with open(LOCK_PATH) as f:
+                existing_pid = f.read().strip()
+        except OSError:
+            pass
+        print(
+            f"REFUSING TO START: {LOCK_PATH} already exists (pid {existing_pid or '?'}). "
+            "If no other instance of main.py is actually running, remove the lockfile and retry.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    with os.fdopen(fd, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def _release_lock() -> None:
+    try:
+        os.remove(LOCK_PATH)
+    except FileNotFoundError:
+        pass
 
 
 def _load_watchlist() -> dict[str, int | None]:
@@ -650,23 +694,51 @@ def scheduled_run() -> None:
 
 getattr(schedule.every(), CYCLE_DAY_OF_WEEK).at(CYCLE_TIME_ET).do(scheduled_run)
 
-if __name__ == "__main__":
-    startup_watchlist = _load_watchlist()
-    if not startup_watchlist:
-        logger.warning(
-            "No symbols in %s or config.WATCHLIST — add some before this bot can do anything.",
-            ACTIVE_WATCHLIST_PATH,
-        )
 
-    init_schema()
-    logger.info(
-        "Covered call bot started | %d symbols | target_delta=%.2f | %s %s ET",
-        len(startup_watchlist), TARGET_DELTA, CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET,
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Covered call bot")
+    parser.add_argument(
+        "--once", action="store_true",
+        help="run exactly one cycle (init_schema + run_cycle) and exit, instead of the weekly scheduler loop",
     )
-    while True:
-        try:
-            schedule.run_pending()
-        except Exception as e:
-            logger.exception("Unhandled error in schedule.run_pending()")
-            log_error("main.loop", str(e))
-        time.sleep(30)
+    return parser.parse_args(argv)
+
+
+def _main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    _acquire_lock()
+    try:
+        startup_watchlist = _load_watchlist()
+        if not startup_watchlist:
+            logger.warning(
+                "No symbols in %s or config.WATCHLIST — add some before this bot can do anything.",
+                ACTIVE_WATCHLIST_PATH,
+            )
+
+        init_schema()
+
+        if args.once:
+            logger.info(
+                "Covered call bot started | --once | %d symbols | target_delta=%.2f",
+                len(startup_watchlist), TARGET_DELTA,
+            )
+            run_cycle()
+            return 0
+
+        logger.info(
+            "Covered call bot started | %d symbols | target_delta=%.2f | %s %s ET",
+            len(startup_watchlist), TARGET_DELTA, CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET,
+        )
+        while True:
+            try:
+                schedule.run_pending()
+            except Exception as e:
+                logger.exception("Unhandled error in schedule.run_pending()")
+                log_error("main.loop", str(e))
+            time.sleep(30)
+    finally:
+        _release_lock()
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
