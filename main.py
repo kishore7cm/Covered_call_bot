@@ -28,6 +28,7 @@ from config import (
     CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET, MIN_IV_HISTORY_POINTS,
     DTE_MIN, DTE_MAX, OTHER_BOTS_SYMBOLS, WATCHLIST_MAX_AGE_DAYS,
     STALE_LOT_WEEKS, RECOVERY_EXIT_ENABLED_SYMBOLS, RECOVERY_EXIT_MIN_MARGIN_PCT,
+    ALLOW_LIVE, ALPACA_BASE_URL, PAPER,
 )
 from greeks import delta_from_quote
 from iv_rank import iv_rank, iv_percentile
@@ -49,6 +50,29 @@ ACTIVE_WATCHLIST_PATH = "pipeline_state/active_watchlist.json"
 DTE_TOLERANCE_DAYS = 5
 
 LOCK_PATH = "pipeline_state/main.lock"
+
+
+def _check_paper_mode() -> None:
+    """
+    Second, independent confirmation before this bot will run against a
+    non-paper ALPACA_BASE_URL -- config.PAPER alone is a substring check
+    on one env var (see config.py), easy to get wrong by accident (a
+    typo'd or copy-pasted ALPACA_BASE_URL). Runs first, before the
+    lockfile or anything else, so a misconfigured live endpoint never
+    even gets as far as touching pipeline_state/.
+    """
+    mode = "PAPER" if PAPER else "LIVE"
+    if not PAPER and not ALLOW_LIVE:
+        print(
+            f"REFUSING TO START: ALPACA_BASE_URL ({ALPACA_BASE_URL}) is not the paper host, and "
+            "ALLOW_LIVE is not set. Set ALLOW_LIVE=true explicitly if you really mean to run "
+            "against a live account.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    suffix = " [ALLOW_LIVE override]" if not PAPER else ""
+    print(f"ALPACA mode: {mode} ({ALPACA_BASE_URL}){suffix}")
+    logger.info("ALPACA mode: %s (%s)%s", mode, ALPACA_BASE_URL, suffix)
 
 
 def _acquire_lock() -> None:
@@ -706,6 +730,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    _check_paper_mode()
     _acquire_lock()
     try:
         startup_watchlist = _load_watchlist()

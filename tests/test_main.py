@@ -920,6 +920,34 @@ def test_ex_div_warning_reports_itm_when_spot_above_strike(monkeypatch):
     assert "ITM" in result
 
 
+# ── Paper/live startup guard ──────────────────────────────────────────────────
+
+def test_check_paper_mode_allows_paper(monkeypatch, capsys):
+    monkeypatch.setattr(main, "PAPER", True)
+    monkeypatch.setattr(main, "ALLOW_LIVE", False)
+    monkeypatch.setattr(main, "ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    main._check_paper_mode()  # must not raise
+    out = capsys.readouterr().out
+    assert "PAPER" in out
+
+
+def test_check_paper_mode_refuses_live_url_without_allow_live(monkeypatch):
+    monkeypatch.setattr(main, "PAPER", False)
+    monkeypatch.setattr(main, "ALLOW_LIVE", False)
+    monkeypatch.setattr(main, "ALPACA_BASE_URL", "https://api.alpaca.markets")
+    with pytest.raises(SystemExit):
+        main._check_paper_mode()
+
+
+def test_check_paper_mode_allows_live_url_when_allow_live_is_set(monkeypatch, capsys):
+    monkeypatch.setattr(main, "PAPER", False)
+    monkeypatch.setattr(main, "ALLOW_LIVE", True)
+    monkeypatch.setattr(main, "ALPACA_BASE_URL", "https://api.alpaca.markets")
+    main._check_paper_mode()  # must not raise
+    out = capsys.readouterr().out
+    assert "LIVE" in out
+
+
 # ── Lockfile ──────────────────────────────────────────────────────────────────
 
 def test_acquire_lock_writes_pid_and_release_removes_it(monkeypatch, tmp_path):
@@ -954,6 +982,7 @@ def test_release_lock_with_no_lock_present_is_a_no_op(monkeypatch, tmp_path):
 
 def test_main_once_runs_init_schema_and_exactly_one_cycle_then_returns(monkeypatch):
     calls = []
+    monkeypatch.setattr(main, "_check_paper_mode", lambda: None)
     monkeypatch.setattr(main, "_acquire_lock", lambda: calls.append("acquire"))
     monkeypatch.setattr(main, "_release_lock", lambda: calls.append("release"))
     monkeypatch.setattr(main, "init_schema", lambda: calls.append("init_schema"))
@@ -972,6 +1001,7 @@ def test_main_once_runs_init_schema_and_exactly_one_cycle_then_returns(monkeypat
 
 def test_main_once_releases_lock_even_if_the_cycle_raises(monkeypatch):
     calls = []
+    monkeypatch.setattr(main, "_check_paper_mode", lambda: None)
     monkeypatch.setattr(main, "_acquire_lock", lambda: calls.append("acquire"))
     monkeypatch.setattr(main, "_release_lock", lambda: calls.append("release"))
     monkeypatch.setattr(main, "init_schema", lambda: None)
@@ -985,3 +1015,17 @@ def test_main_once_releases_lock_even_if_the_cycle_raises(monkeypatch):
         main._main(["--once"])
 
     assert calls == ["acquire", "release"]
+
+
+def test_main_refuses_before_touching_the_lock_when_paper_check_fails(monkeypatch):
+    calls = []
+
+    def refuse():
+        raise SystemExit(1)
+    monkeypatch.setattr(main, "_check_paper_mode", refuse)
+    monkeypatch.setattr(main, "_acquire_lock", lambda: calls.append("acquire"))
+
+    with pytest.raises(SystemExit):
+        main._main(["--once"])
+
+    assert calls == []

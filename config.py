@@ -20,6 +20,13 @@ ALPACA_API_KEY    = _require("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = _require("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 PAPER             = "paper" in ALPACA_BASE_URL
+# Second, independent confirmation main.py's startup check requires before
+# it will run against a non-paper ALPACA_BASE_URL -- PAPER alone is just a
+# substring check on one env var, easy to flip by accident (a typo'd or
+# copy-pasted ALPACA_BASE_URL). Deliberately NOT consulted anywhere else
+# (trader.py/options_data.py's own TradingClient construction is unchanged)
+# -- this is main.py's entrypoint gate only, see main._check_paper_mode().
+ALLOW_LIVE = os.getenv("ALLOW_LIVE", "false").lower() in ("true", "1", "yes")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
