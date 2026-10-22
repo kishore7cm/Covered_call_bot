@@ -853,3 +853,125 @@ def test_max_orders_per_cycle_applies_to_sell_and_close_without_estimated_price(
     result = trader.buy_to_close_call("AAPL261113C00200000", qty=1)
 
     assert result["block_reason"] == "max_orders_per_cycle"
+
+
+# ── sell_shares / attempt_recovery_exit (Task 6) ─────────────────────────────
+
+def test_sell_shares_blocked_by_dry_run(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    monkeypatch.setattr(trader, "DRY_RUN", True)
+
+    result = trader.sell_shares("AAPL", qty=100)
+
+    assert fake.submitted_orders == []
+    assert result["submitted"] is False
+    assert result["block_reason"] == "dry_run"
+
+
+def test_sell_shares_proceeds_when_unblocked(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    monkeypatch.setattr(trader, "_stock_data_client", FakeQuoteDataClient(bid=99.0, ask=101.0))
+    _unblocked(monkeypatch)
+
+    result = trader.sell_shares("AAPL", qty=100)
+
+    assert len(fake.submitted_orders) == 1
+    assert result["submitted"] is True
+    assert fake.submitted_orders[0].side == trader.OrderSide.SELL
+
+
+def test_recovery_exit_refuses_when_margin_not_cleared(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    # stock bid 10, call ask 2 -> worst-case net 8/share, well below a 150 basis.
+    monkeypatch.setattr(trader, "_stock_data_client", FakeQuoteDataClient(bid=10.0, ask=11.0))
+    monkeypatch.setattr(trader, "_option_data_client", FakeQuoteDataClient(bid=1.0, ask=2.0))
+    _unblocked(monkeypatch)
+
+    result = trader.attempt_recovery_exit("AAPL", "AAPL261113C00200000", 100, 150.0, 0.0)
+
+    assert result is None
+    assert fake.submitted_orders == []
+
+
+def test_recovery_exit_proceeds_when_margin_cleared(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    # stock bid 160, call ask 2 -> worst-case net 158/share, clears a 150 basis.
+    monkeypatch.setattr(trader, "_stock_data_client", FakeQuoteDataClient(bid=160.0, ask=161.0))
+    monkeypatch.setattr(trader, "_option_data_client", FakeQuoteDataClient(bid=1.0, ask=2.0))
+    _unblocked(monkeypatch)
+
+    result = trader.attempt_recovery_exit("AAPL", "AAPL261113C00200000", 100, 150.0, 0.0)
+
+    assert result is not None
+    assert result["closed"]["submitted"] is True
+    assert result["sold"]["submitted"] is True
+    assert len(fake.submitted_orders) == 2
+
+
+def test_recovery_exit_requires_margin_above_breakeven(monkeypatch):
+    """A configured margin above 0 must be enforced, not just breakeven."""
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    # worst-case net exactly 150/share -- breakeven at margin=0, but refused at margin=0.1 (needs 165).
+    monkeypatch.setattr(trader, "_stock_data_client", FakeQuoteDataClient(bid=152.0, ask=153.0))
+    monkeypatch.setattr(trader, "_option_data_client", FakeQuoteDataClient(bid=1.0, ask=2.0))
+    _unblocked(monkeypatch)
+
+    result = trader.attempt_recovery_exit("AAPL", "AAPL261113C00200000", 100, 150.0, 0.1)
+
+    assert result is None
+    assert fake.submitted_orders == []
+
+
+def test_recovery_exit_missing_quote_fails_closed(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    monkeypatch.setattr(trader, "_stock_data_client", FakeQuoteDataClient(raise_error=True))
+    _unblocked(monkeypatch)
+
+    result = trader.attempt_recovery_exit("AAPL", "AAPL261113C00200000", 100, 150.0, 0.0)
+
+    assert result is None
+    assert fake.submitted_orders == []
+
+
+def test_recovery_exit_close_leg_blocked_short_circuits(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    monkeypatch.setattr(trader, "_stock_data_client", FakeQuoteDataClient(bid=160.0, ask=161.0))
+    monkeypatch.setattr(trader, "_option_data_client", FakeQuoteDataClient(bid=1.0, ask=2.0))
+    monkeypatch.setattr(trader, "DRY_RUN", True)
+
+    result = trader.attempt_recovery_exit("AAPL", "AAPL261113C00200000", 100, 150.0, 0.0)
+
+    assert fake.submitted_orders == []
+    assert result["closed"]["submitted"] is False
+    assert result["sold"]["submitted"] is False
+
+
+def test_recovery_exit_sell_leg_failure_marks_needs_attention(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    monkeypatch.setattr(trader, "_stock_data_client", FakeQuoteDataClient(bid=160.0, ask=161.0))
+    monkeypatch.setattr(trader, "_option_data_client", FakeQuoteDataClient(bid=1.0, ask=2.0))
+    _unblocked(monkeypatch)
+
+    real_sell_shares = trader.sell_shares
+
+    def sell_shares_then_fail(symbol, qty):
+        fake._fail_steps = 999
+        return real_sell_shares(symbol, qty)
+
+    monkeypatch.setattr(trader, "sell_shares", sell_shares_then_fail)
+
+    result = trader.attempt_recovery_exit("AAPL", "AAPL261113C00200000", 100, 150.0, 0.0)
+
+    assert result is None
+    assert len(fake.submitted_orders) == 1  # only the close leg actually fired
+    reason = trader.check_needs_attention("AAPL")
+    assert reason is not None
+    assert "UNCOVERED" in reason and "UNSOLD" in reason

@@ -277,6 +277,7 @@ def pick_strike(
     tolerance: float = DELTA_TOLERANCE,
     dte_min: int = DTE_MIN,
     dte_max: int = DTE_MAX,
+    min_strike: float | None = None,
 ) -> CallCandidate | None:
     """
     Screen call contracts for `underlying`, apply Filter 2 (liquidity +
@@ -288,6 +289,12 @@ def pick_strike(
     dte_min/dte_max default to the global config window but can be
     overridden per call — main.py passes a per-symbol window derived from
     backtest.py's recommended DTE once the research pipeline has run.
+
+    min_strike (Phase 3, Task 6): when given, drops any candidate with
+    strike < min_strike before delta-matching -- main.py passes the open
+    lot's own cost basis here, so a covered call is never sold below what
+    the shares actually cost (selling below basis locks in a loss on
+    assignment even if the premium looked attractive).
 
     Earnings risk is resolved via calendar_data.get_earnings_status(),
     which fails CLOSED: "no earnings expected" (a known ETF) and "a
@@ -342,6 +349,16 @@ def pick_strike(
             underlying, len(candidates), MIN_OPEN_INTEREST, MAX_SPREAD_PCT * 100,
         )
         return None
+
+    if min_strike is not None:
+        before = len(liquid)
+        liquid = [c for c in liquid if c.strike >= min_strike]
+        if not liquid:
+            _log.warning(
+                "%s: no qualifying call at or above basis $%.2f (%d candidate(s) were all below it)",
+                underlying, min_strike, before,
+            )
+            return None
 
     best = min(liquid, key=lambda x: abs(x.delta - target_delta))
 

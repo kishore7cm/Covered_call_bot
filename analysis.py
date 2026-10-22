@@ -34,7 +34,7 @@ import argparse
 import json
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import backtest
 import iv_logger
@@ -308,6 +308,88 @@ def analyze_symbol(symbol: str, predicted: dict | None) -> dict:
     return result
 
 
+# ── Wash-sale risk reporting (Phase 3, Task 6) ───────────────────────────────
+# REPORT ONLY -- per this project's hard rule, the Auditor never acts on
+# this, retriggers anything, or alters a trade. It exists purely so a loss
+# sale that might trip the IRS wash-sale rule is visible in the same place
+# everything else about that symbol's performance is reviewed.
+WASH_SALE_WINDOW_DAYS = 30
+
+
+def report_wash_sale_risk(symbols: list[str] | None = None, rows: list[dict] | None = None) -> list[dict]:
+    """
+    For every realized SELL in share_trades (currently only produced by
+    trader.sell_shares, via Task 6's recovery-exit) that was a loss
+    relative to its matched entry BUY, flags whether any BUY of the same
+    symbol falls within WASH_SALE_WINDOW_DAYS before or after the sale --
+    the IRS wash-sale window. symbols=None scans every symbol with any
+    share_trades history. rows=None reads live via get_share_trades();
+    pass rows directly in tests to avoid needing a real database, same
+    convention as _ivr_tier_breakdown. Returns [] if there's nothing to
+    flag; never raises on a single symbol's bad data (skips it, same
+    fail-soft contract as the rest of this module).
+    """
+    all_trades = get_share_trades() if rows is None else rows
+    if symbols is None:
+        symbols = sorted({r["symbol"] for r in all_trades})
+
+    flags = []
+    for symbol in symbols:
+        try:
+            symbol_rows = [r for r in all_trades if r["symbol"] == symbol]
+            buys = sorted(
+                (r for r in symbol_rows if r["side"] == "BUY" and r["price"] is not None),
+                key=lambda r: _parse_ts(r["occurred_at"]),
+            )
+            sells = sorted(
+                (r for r in symbol_rows if r["side"] == "SELL" and r["price"] is not None),
+                key=lambda r: _parse_ts(r["occurred_at"]),
+            )
+
+            for sell in sells:
+                sell_ts = _parse_ts(sell["occurred_at"])
+                prior_buys = [b for b in buys if _parse_ts(b["occurred_at"]) <= sell_ts]
+                if not prior_buys:
+                    continue
+                entry = max(prior_buys, key=lambda b: _parse_ts(b["occurred_at"]))
+                entry_price = float(entry["price"])
+                sell_price = float(sell["price"])
+                if sell_price >= entry_price:
+                    continue  # not a loss sale
+
+                window_start = sell_ts - timedelta(days=WASH_SALE_WINDOW_DAYS)
+                window_end = sell_ts + timedelta(days=WASH_SALE_WINDOW_DAYS)
+                conflicting_buys = [
+                    b for b in buys
+                    if b is not entry and window_start <= _parse_ts(b["occurred_at"]) <= window_end
+                ]
+                if conflicting_buys:
+                    flags.append({
+                        "symbol": symbol,
+                        "sale_date": sell_ts.date().isoformat(),
+                        "loss_amount": (sell_price - entry_price) * 100,
+                        "conflicting_buy_dates": sorted(
+                            _parse_ts(b["occurred_at"]).date().isoformat() for b in conflicting_buys
+                        ),
+                    })
+        except Exception as e:
+            _log.warning("report_wash_sale_risk failed for %s: %s", symbol, e)
+
+    return flags
+
+
+def _print_wash_sale_report(flags: list[dict]) -> None:
+    print("\n--- Wash-sale risk (report only -- never auto-acted on) ---")
+    if not flags:
+        print("  No loss sales with a same-symbol buy inside the 30-day window.")
+        return
+    for f in flags:
+        print(
+            f"  !! {f['symbol']}: loss sale on {f['sale_date']} (${f['loss_amount']:.2f}) -- "
+            f"buy(s) within {WASH_SALE_WINDOW_DAYS} days: {', '.join(f['conflicting_buy_dates'])}"
+        )
+
+
 def run_analysis(watchlist_path: str = ACTIVE_PATH) -> list[dict]:
     predicted_by_symbol = _load_predicted(watchlist_path)
 
@@ -488,6 +570,9 @@ if __name__ == "__main__":
     bias_pp = _overall_bias_pp(results, predicted_by_symbol)
     _print_tier_and_bias(tier_breakdown, bias_pp)
 
+    wash_sale_flags = report_wash_sale_risk()
+    _print_wash_sale_report(wash_sale_flags)
+
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump({
@@ -495,5 +580,6 @@ if __name__ == "__main__":
             "results": results,
             "ivr_tier_breakdown": tier_breakdown,
             "overall_bias_pp": bias_pp,
+            "wash_sale_flags": wash_sale_flags,
         }, f, indent=2)
     print(f"\nWrote report to {args.out}")

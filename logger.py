@@ -53,6 +53,23 @@ CREATE TABLE IF NOT EXISTS iv_history (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (symbol, date)
 );
+
+-- Phase 3, Task 6 (Lot Manager). This bot only ever holds one open lot
+-- per symbol at a time (see main.py's state machine), but lots are
+-- logged as independent rows (closed_at IS NULL = currently open) so the
+-- history of every past lot -- and its basis -- survives assignment/
+-- recovery-exit/re-buy cycles, rather than being overwritten in place.
+CREATE TABLE IF NOT EXISTS lots (
+  id SERIAL PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  qty INTEGER NOT NULL,
+  cost_basis_per_share NUMERIC NOT NULL,
+  opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at TIMESTAMPTZ,
+  close_reason TEXT,               -- 'ASSIGNED', 'RECOVERY_EXIT'
+  close_price_per_share NUMERIC,
+  no_qualifying_call_flagged_at TIMESTAMPTZ
+);
 """
 
 
@@ -323,6 +340,120 @@ def get_rolls_since_last_lot_open(symbol: str) -> int | None:
     except Exception as e:
         logger.error("get_rolls_since_last_lot_open failed: %s", e)
         return None
+
+
+# ── Lot Manager (Phase 3, Task 6) ────────────────────────────────────────────
+# Alpaca's standard Trading API does NOT expose per-lot cost-basis data --
+# confirmed live (GET /positions/{symbol}/lots -> 404, and alpaca-py's
+# TradingClient has no tax-lot method at all; the Position model only
+# carries an aggregate cost_basis/avg_entry_price for the whole position).
+# This table is therefore the SOLE source of truth for per-lot basis --
+# there is nothing on the broker side to reconcile it against beyond the
+# aggregate share count (trader.get_share_position), which Task 1/2's
+# overlap checks already cross-check.
+
+def open_lot(symbol: str, qty: int, cost_basis_per_share: float) -> int | None:
+    """Log a newly-opened lot. Returns the new lot's id, or None if
+    DATABASE_URL isn't configured or the insert fails."""
+    if not DATABASE_URL:
+        return None
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO lots (symbol, qty, cost_basis_per_share) VALUES (%s, %s, %s) RETURNING id",
+                (symbol, qty, cost_basis_per_share),
+            )
+            lot_id = cur.fetchone()[0]
+            conn.commit()
+            return lot_id
+    except Exception as e:
+        logger.error("open_lot failed: %s", e)
+        return None
+
+
+_LOT_COLS = ("id", "symbol", "qty", "cost_basis_per_share", "opened_at", "no_qualifying_call_flagged_at")
+
+
+def get_open_lot(symbol: str) -> dict | None:
+    """The currently-open lot for `symbol` (closed_at IS NULL), or None if
+    there isn't one or DATABASE_URL isn't configured. This bot only ever
+    holds one open lot per symbol at a time -- LIMIT 1 ORDER BY opened_at
+    DESC is defensive, not expected to ever need to actually pick among
+    multiple."""
+    if not DATABASE_URL:
+        return None
+    cols_sql = ", ".join(_LOT_COLS)
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {cols_sql} FROM lots WHERE symbol = %s AND closed_at IS NULL "
+                "ORDER BY opened_at DESC LIMIT 1",
+                (symbol,),
+            )
+            row = cur.fetchone()
+            return dict(zip(_LOT_COLS, row)) if row else None
+    except Exception as e:
+        logger.error("get_open_lot failed: %s", e)
+        return None
+
+
+def close_lot(symbol: str, reason: str, price_per_share: float) -> None:
+    """Close the most recent open lot for `symbol`. No-op (logged) if
+    there isn't one -- a caller closing a lot that doesn't exist is a
+    bug worth seeing in the logs, not a silent pass."""
+    if not DATABASE_URL:
+        return
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE lots SET closed_at = now(), close_reason = %s, close_price_per_share = %s
+                WHERE id = (
+                    SELECT id FROM lots WHERE symbol = %s AND closed_at IS NULL
+                    ORDER BY opened_at DESC LIMIT 1
+                )
+                """,
+                (reason, price_per_share, symbol),
+            )
+            if cur.rowcount == 0:
+                logger.error("close_lot(%s): no open lot found to close", symbol)
+            conn.commit()
+    except Exception as e:
+        logger.error("close_lot failed: %s", e)
+
+
+def flag_lot_no_qualifying_call(symbol: str) -> None:
+    """Mark the open lot as currently unable to find a call at or above
+    its own basis -- informational (main.py still just skips selling a
+    call that cycle), not a trading block on its own."""
+    if not DATABASE_URL:
+        return
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE lots SET no_qualifying_call_flagged_at = now() "
+                "WHERE symbol = %s AND closed_at IS NULL",
+                (symbol,),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error("flag_lot_no_qualifying_call failed: %s", e)
+
+
+def clear_lot_no_qualifying_call_flag(symbol: str) -> None:
+    """Clear the flag once a qualifying call IS found and sold again."""
+    if not DATABASE_URL:
+        return
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE lots SET no_qualifying_call_flagged_at = NULL "
+                "WHERE symbol = %s AND closed_at IS NULL",
+                (symbol,),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error("clear_lot_no_qualifying_call_flag failed: %s", e)
 
 
 def get_iv_history(symbol: str, lookback_days: int = 365) -> list[float]:

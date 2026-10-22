@@ -312,3 +312,21 @@ ROLL_OPEN_LEG_MAX_RETRIES = 3
 # held) is unaffected -- that isn't "trading on a stale approval," it's
 # finishing what's already open. Re-running --confirm always resets this.
 WATCHLIST_MAX_AGE_DAYS = 10
+
+# ── Lot Manager (Phase 3, Task 6) ─────────────────────────────────────────────
+# A lot open this long without being assigned or exited gets flagged in
+# the logs/Telegram every cycle -- informational only, this bot NEVER
+# auto-liquidates a lot just because it's old or sitting at a loss.
+STALE_LOT_WEEKS = 8
+# Recovery-exit (buy back the short call, then sell the shares) is opt-in
+# per symbol -- empty by default, meaning no symbol can trigger it until
+# explicitly listed here. Only used when pick_strike can't find a call at
+# or above the lot's own cost basis (main.py's "no qualifying call" path).
+RECOVERY_EXIT_ENABLED_SYMBOLS: list[str] = [
+    # "AAPL",
+]
+# Net proceeds after buying back the call (worst case: at its ask) and
+# selling the shares (worst case: at their bid) must clear the lot's
+# basis by at least this fraction before a recovery-exit is allowed to
+# proceed -- 0.0 means "break even or better," not "any sale is fine."
+RECOVERY_EXIT_MIN_MARGIN_PCT = 0.0

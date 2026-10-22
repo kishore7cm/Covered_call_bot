@@ -25,13 +25,15 @@ from config import (
     PROFIT_TAKE_PCT, ROLL_TRIGGER_DELTA, ROLL_MIN_DTE, RISK_FREE_RATE,
     CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET, MIN_IV_HISTORY_POINTS,
     DTE_MIN, DTE_MAX, OTHER_BOTS_SYMBOLS, WATCHLIST_MAX_AGE_DAYS,
+    STALE_LOT_WEEKS, RECOVERY_EXIT_ENABLED_SYMBOLS, RECOVERY_EXIT_MIN_MARGIN_PCT,
 )
 from greeks import delta_from_quote
 from iv_rank import iv_rank, iv_percentile
 from logger import (
     init_schema, log_option_trade, log_share_trade, log_error,
     record_iv_snapshot, get_iv_history, get_last_open_occ_symbol,
-    get_expected_share_qty,
+    get_expected_share_qty, open_lot, get_open_lot, close_lot,
+    flag_lot_no_qualifying_call, clear_lot_no_qualifying_call_flag,
 )
 from options_data import pick_strike, get_chain_snapshot, parse_occ_symbol, get_atm_iv
 
@@ -261,6 +263,9 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
                 strike=parsed.strike, expiration=parsed.expiration,
                 underlying_price=_get_spot_price(symbol),
             )
+            # Assignment delivers/removes the shares AT the strike price --
+            # that's the lot's real close price, not the current spot.
+            close_lot(symbol, "ASSIGNED", parsed.strike)
             _run_async(notifier.send_call_closed(symbol, last_occ_symbol, "assigned", 0.0))
 
         # Watchlist expiry (Phase 3, Task 5) -- only blocks OPENING a new
@@ -295,8 +300,27 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
             logger.info("%s: buy_shares blocked (%s) — not logging as a real trade", symbol, result["block_reason"])
             return f"{symbol}: would buy {SHARES_PER_LOT} shares ({result['block_reason']} — not submitted)"
         log_share_trade(symbol, "BUY", SHARES_PER_LOT, price=result.get("price"), order_id=result["order_id"])
+        if result.get("price") is not None:
+            open_lot(symbol, SHARES_PER_LOT, result["price"])
+        else:
+            log_error("main.run_symbol_cycle", f"{symbol}: bought shares but no fill price — lot opened without a basis")
         _run_async(notifier.send_shares_bought(symbol, SHARES_PER_LOT, result["order_id"]))
         return f"{symbol}: bought {SHARES_PER_LOT} shares"
+
+    # Lot Manager (Phase 3, Task 6) -- read once, used by both States 2 and
+    # 3 below. A symbol with no tracked lot (predates Task 6, or a legacy
+    # position) just means min_strike stays None and nothing here changes
+    # behavior for it.
+    lot = get_open_lot(symbol)
+    if lot is not None:
+        lot_age = datetime.now(timezone.utc) - lot["opened_at"]
+        if lot_age > timedelta(weeks=STALE_LOT_WEEKS):
+            msg = (
+                f"{symbol}: lot opened {lot_age.days}d ago (over STALE_LOT_WEEKS={STALE_LOT_WEEKS}w) — "
+                "still just an alert, never auto-liquidated"
+            )
+            logger.warning(msg)
+            _run_async(notifier.send_error(symbol, msg))
 
     # ── State 2: shares held, no short call — sell one ──────────────────────
     if short_call is None:
@@ -305,9 +329,18 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
             log_error("main.run_symbol_cycle", f"{symbol}: no spot price available")
             return f"{symbol}: FAILED to get spot price"
 
-        candidate = pick_strike(symbol, spot, TARGET_DELTA, dte_min=dte_min, dte_max=dte_max)
+        min_strike = float(lot["cost_basis_per_share"]) if lot is not None else None
+        candidate = pick_strike(symbol, spot, TARGET_DELTA, dte_min=dte_min, dte_max=dte_max, min_strike=min_strike)
         if candidate is None:
+            if lot is not None and min_strike is not None:
+                flag_lot_no_qualifying_call(symbol)
+                msg = f"{symbol}: no call found at or above lot basis ${min_strike:.2f} this cycle"
+                log_error("main.run_symbol_cycle", msg)
+                _run_async(notifier.send_error(symbol, msg))
+                return f"{symbol}: SKIPPED — no qualifying call above basis ${min_strike:.2f}"
             return f"{symbol}: no suitable strike found this cycle (held)"
+        if lot is not None:
+            clear_lot_no_qualifying_call_flag(symbol)
 
         result = trader.sell_to_open_call(candidate.occ_symbol, qty=1)
         status = _order_status(result)
@@ -403,10 +436,39 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
 
     if needs_roll_dte or needs_roll_delta:
         spot = spot or _get_spot_price(symbol)
-        new_candidate = pick_strike(symbol, spot, TARGET_DELTA, dte_min=dte_min, dte_max=dte_max) if spot else None
+        min_strike = float(lot["cost_basis_per_share"]) if lot is not None else None
+        new_candidate = (
+            pick_strike(symbol, spot, TARGET_DELTA, dte_min=dte_min, dte_max=dte_max, min_strike=min_strike)
+            if spot else None
+        )
         if new_candidate is None:
-            log_error("main.run_symbol_cycle", f"{symbol}: roll triggered but no new candidate found")
+            if lot is not None and min_strike is not None:
+                flag_lot_no_qualifying_call(symbol)
+            msg = f"{symbol}: roll triggered but no new candidate found"
+            if min_strike is not None:
+                msg += f" at or above lot basis ${min_strike:.2f}"
+            log_error("main.run_symbol_cycle", msg)
+
+            if lot is not None and symbol in RECOVERY_EXIT_ENABLED_SYMBOLS:
+                exit_result = trader.attempt_recovery_exit(
+                    symbol, occ_symbol, int(lot["qty"]), float(lot["cost_basis_per_share"]), RECOVERY_EXIT_MIN_MARGIN_PCT,
+                )
+                if exit_result is not None and exit_result["sold"].get("submitted", True):
+                    log_option_trade(symbol, occ_symbol, "BUY_TO_CLOSE", order_id=exit_result["closed"]["order_id"])
+                    log_share_trade(
+                        symbol, "SELL", int(lot["qty"]),
+                        price=exit_result["sold"]["price"], order_id=exit_result["sold"]["order_id"],
+                    )
+                    close_lot(symbol, "RECOVERY_EXIT", exit_result["sold"]["price"])
+                    _run_async(notifier.send_error(symbol, f"recovery-exit completed for {symbol} — lot closed"))
+                    return f"{symbol}: recovery-exit completed, lot closed"
+                _run_async(notifier.send_error(symbol, msg + " — recovery-exit did not complete, see logs"))
+                return f"{symbol}: FAILED to find new strike, recovery-exit did not complete"
+
+            _run_async(notifier.send_error(symbol, msg))
             return f"{symbol}: roll triggered but FAILED to find new strike"
+        if lot is not None:
+            clear_lot_no_qualifying_call_flag(symbol)
 
         result = trader.roll_call(symbol, occ_symbol, new_candidate.occ_symbol, qty=1)
         if result is None:

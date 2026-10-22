@@ -211,3 +211,37 @@ def test_pick_strike_drops_contracts_expiring_after_confirmed_earnings(monkeypat
 
     assert result is not None
     assert result.occ_symbol == "BEFORE"
+
+
+# ── pick_strike: min_strike / basis floor (Phase 3, Task 6) ──────────────────
+
+def test_pick_strike_drops_candidates_below_min_strike(monkeypatch):
+    contracts = [
+        FakeCallContract("LOW", 90.0, date.today() + timedelta(days=30)),
+        FakeCallContract("HIGH", 110.0, date.today() + timedelta(days=30)),
+    ]
+    _patch_pick_strike_common(monkeypatch, contracts, ("no_earnings_expected", None, None))
+
+    result = options_data.pick_strike("AAPL", spot_price=100.0, target_delta=0.25, min_strike=100.0)
+
+    assert result is not None
+    assert result.occ_symbol == "HIGH"
+
+
+def test_pick_strike_returns_none_when_all_candidates_below_min_strike(monkeypatch):
+    contracts = [FakeCallContract("LOW", 90.0, date.today() + timedelta(days=30))]
+    _patch_pick_strike_common(monkeypatch, contracts, ("no_earnings_expected", None, None))
+
+    result = options_data.pick_strike("AAPL", spot_price=100.0, target_delta=0.25, min_strike=100.0)
+
+    assert result is None
+
+
+def test_pick_strike_min_strike_none_is_unaffected(monkeypatch):
+    contracts = [FakeCallContract("LOW", 90.0, date.today() + timedelta(days=30))]
+    _patch_pick_strike_common(monkeypatch, contracts, ("no_earnings_expected", None, None))
+
+    result = options_data.pick_strike("AAPL", spot_price=100.0, target_delta=0.25, min_strike=None)
+
+    assert result is not None
+    assert result.occ_symbol == "LOW"

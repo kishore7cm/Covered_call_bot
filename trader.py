@@ -683,3 +683,92 @@ def roll_call(symbol: str, old_occ_symbol: str, new_occ_symbol: str, qty: int = 
         return None
 
     return {"closed": close, "opened": open_}
+
+
+def sell_shares(symbol: str, qty: int) -> dict | None:
+    """
+    Sell shares outright -- used only by attempt_recovery_exit (Phase 3,
+    Task 6). Doesn't deploy new capital or open a new position, so
+    opens_new_position stays False, same as the option-closing functions
+    -- the hard capital/position caps don't apply to closing a position.
+    """
+    block_reason = _guard(f"SELL {qty} {symbol}", order_symbol=symbol)
+    if block_reason:
+        return _not_submitted(block_reason, symbol=symbol, qty=qty, price=None)
+
+    quote = _get_stock_quote(symbol)
+    if quote is None:
+        _log.error("sell_shares(%s): no usable stock quote — cannot place a limit order", symbol)
+        return None
+    bid, ask = quote
+
+    client_order_id_base = f"{CLIENT_ORDER_ID_PREFIX}-SELLSHARES-{symbol}-{date.today().isoformat()}"
+    order = _walk_limit_order(symbol, OrderSide.SELL, qty, bid, ask, None, client_order_id_base)
+    if order is None:
+        return None
+
+    _log.info("SELL SHARES filled %s | qty=%s | order_id=%s | price=%s", symbol, qty, order.id, order.filled_avg_price)
+    return {"order_id": str(order.id), "symbol": symbol, "qty": qty, "price": float(order.filled_avg_price), "submitted": True}
+
+
+def attempt_recovery_exit(
+    symbol: str, occ_symbol: str, qty: int, lot_basis_per_share: float, min_margin_pct: float,
+) -> dict | None:
+    """
+    Buy back the short call FIRST, then sell the shares -- order matters,
+    shares with an open short call can't be sold. Only proceeds if the
+    WORST case (buy back the call at its ask, sell the shares at their
+    bid) still clears the lot's basis by min_margin_pct; otherwise fails
+    closed without attempting either leg. If the close leg succeeds for
+    real but the sell leg doesn't, shares are left UNCOVERED and UNSOLD --
+    the same emergency shape as roll_call's open-leg failure -- so this
+    marks the symbol needs-attention too, no retry loop (unlike roll_call,
+    a failed sell here doesn't have an equivalent "the position is still
+    manageable some other way" framing to retry toward).
+    """
+    call_quote = _get_option_quote(occ_symbol)
+    stock_quote = _get_stock_quote(symbol)
+    if call_quote is None or stock_quote is None:
+        _log.error(
+            "attempt_recovery_exit(%s): missing a quote (call=%s, stock=%s) — failing closed, not attempting",
+            symbol, call_quote is not None, stock_quote is not None,
+        )
+        return None
+    _call_bid, call_ask = call_quote
+    stock_bid, _stock_ask = stock_quote
+
+    worst_case_net_per_share = stock_bid - call_ask
+    required_per_share = lot_basis_per_share * (1 + min_margin_pct)
+    if worst_case_net_per_share < required_per_share:
+        _log.warning(
+            "attempt_recovery_exit(%s): worst-case net $%.2f/share would not clear basis $%.2f "
+            "(required $%.2f with margin) — refusing",
+            symbol, worst_case_net_per_share, lot_basis_per_share, required_per_share,
+        )
+        return None
+
+    close = buy_to_close_call(occ_symbol, 1)
+    if close is None:
+        _log.error("attempt_recovery_exit(%s): close leg failed for %s — aborting, shares still covered", symbol, occ_symbol)
+        return None
+
+    if not close.get("submitted", True):
+        _log.info("attempt_recovery_exit(%s): close leg blocked (%s) — not attempting the sell leg", symbol, close["block_reason"])
+        return {"closed": close, "sold": _not_submitted(close["block_reason"], symbol=symbol, qty=qty)}
+
+    sold = sell_shares(symbol, qty)
+    if sold is None or not sold.get("submitted", True):
+        reason = "API rejection" if sold is None else sold.get("block_reason")
+        mark_needs_attention(
+            symbol,
+            f"recovery-exit closed {occ_symbol} but sell_shares did NOT go through ({reason}) — "
+            "shares are UNCOVERED and UNSOLD",
+        )
+        _log.error(
+            "attempt_recovery_exit(%s): close leg succeeded for %s but sell leg did NOT go through (%s) — "
+            "shares are UNCOVERED AND UNSOLD. Marked needs-attention.",
+            symbol, occ_symbol, reason,
+        )
+        return None
+
+    return {"closed": close, "sold": sold}

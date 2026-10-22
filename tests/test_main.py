@@ -62,12 +62,19 @@ def _patch_common(monkeypatch, **overrides):
         },
         get_option_activities=lambda symbol, lookback_days=14: [],
         check_needs_attention=lambda symbol: None,
+        sell_shares=lambda symbol, qty: {
+            "order_id": "o-sellshares", "symbol": symbol, "qty": qty, "price": 100.0, "submitted": True,
+        },
+        attempt_recovery_exit=lambda symbol, occ, qty, basis, margin: {
+            "closed": {"order_id": "o-rec-close", "submitted": True},
+            "sold": {"order_id": "o-rec-sell", "price": 100.0, "submitted": True},
+        },
     )
     defaults.update(overrides)
     for name, fn in defaults.items():
         monkeypatch.setattr(trader, name, fn)
 
-    logged = {"option_trades": [], "share_trades": [], "errors": []}
+    logged = {"option_trades": [], "share_trades": [], "errors": [], "lot_flags": []}
     monkeypatch.setattr(main, "get_last_open_occ_symbol", lambda symbol: None)
     monkeypatch.setattr(main, "log_option_trade", lambda *a, **k: logged["option_trades"].append((a, k)))
     monkeypatch.setattr(main, "log_share_trade", lambda *a, **k: logged["share_trades"].append((a, k)))
@@ -75,6 +82,15 @@ def _patch_common(monkeypatch, **overrides):
     monkeypatch.setattr(main, "_get_spot_price", lambda symbol: 100.0)
     monkeypatch.setattr(main, "get_chain_snapshot", lambda symbol: {})
     monkeypatch.setattr(main, "_watchlist_is_stale", lambda: False)
+    # Lot Manager (Task 6) -- DATABASE_URL is unset in dev, so these all
+    # silently no-op there, but must still be mocked explicitly: a real
+    # DATABASE_URL (CI, Railway) would otherwise make every test in this
+    # file hit a real database.
+    monkeypatch.setattr(main, "get_open_lot", lambda symbol: None)
+    monkeypatch.setattr(main, "open_lot", lambda symbol, qty, price: logged["lot_flags"].append(("open", symbol, qty, price)))
+    monkeypatch.setattr(main, "close_lot", lambda symbol, reason, price: logged["lot_flags"].append(("close", symbol, reason, price)))
+    monkeypatch.setattr(main, "flag_lot_no_qualifying_call", lambda symbol: logged["lot_flags"].append(("flag", symbol)))
+    monkeypatch.setattr(main, "clear_lot_no_qualifying_call_flag", lambda symbol: logged["lot_flags"].append(("clear", symbol)))
     # Coroutines from notifier.send_* are never actually awaited in tests --
     # asyncio.run() would execute the real body (an HTTP call), so close the
     # coroutine object instead of running it. Calling the async function
@@ -504,3 +520,185 @@ def test_holding_no_trigger_reports_profit_captured(monkeypatch):
 
     assert "holding" in result
     assert "%" in result
+
+
+# ── Lot Manager (Task 6) ──────────────────────────────────────────────────────
+
+def _fake_lot(qty=SHARES_PER_LOT, cost_basis_per_share=150.0, opened_at=None):
+    return {
+        "id": 1, "symbol": "AAPL", "qty": qty, "cost_basis_per_share": cost_basis_per_share,
+        "opened_at": opened_at or datetime.now(timezone.utc),
+        "no_qualifying_call_flagged_at": None,
+    }
+
+
+def test_buy_shares_opens_a_lot(monkeypatch):
+    logged = _patch_common(monkeypatch)
+
+    main.run_symbol_cycle("AAPL")
+
+    assert ("open", "AAPL", SHARES_PER_LOT, 100.0) in logged["lot_flags"]
+
+
+def test_assignment_closes_the_lot(monkeypatch):
+    old_occ = _far_occ_symbol("AAPL", dte=-2, strike=150.0)
+    logged = _patch_common(
+        monkeypatch,
+        get_option_activities=lambda symbol, lookback_days=14: [{"activity_type": "OPASN", "symbol": old_occ}],
+    )
+    monkeypatch.setattr(main, "get_last_open_occ_symbol", lambda symbol: old_occ)
+
+    main.run_symbol_cycle("AAPL")
+
+    close_calls = [f for f in logged["lot_flags"] if f[0] == "close"]
+    assert len(close_calls) == 1
+    assert close_calls[0][1] == "AAPL"
+    assert close_calls[0][2] == "ASSIGNED"
+    assert close_calls[0][3] == 150.0
+
+
+def test_sell_passes_lot_basis_as_min_strike(monkeypatch):
+    candidate = FakeCandidate(_far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.25)
+    pick_strike_calls = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "get_open_lot", lambda symbol: _fake_lot(cost_basis_per_share=150.0))
+
+    def fake_pick_strike(*a, **k):
+        pick_strike_calls.append(k)
+        return candidate
+
+    monkeypatch.setattr(main, "pick_strike", fake_pick_strike)
+
+    main.run_symbol_cycle("AAPL")
+
+    assert pick_strike_calls[0]["min_strike"] == 150.0
+    assert ("clear", "AAPL") in logged["lot_flags"]
+
+
+def test_no_qualifying_call_above_basis_flags_lot_and_skips(monkeypatch):
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "get_open_lot", lambda symbol: _fake_lot(cost_basis_per_share=150.0))
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: None)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" in result
+    assert "basis" in result.lower()
+    assert ("flag", "AAPL") in logged["lot_flags"]
+
+
+def test_no_lot_pick_strike_none_is_unaffected(monkeypatch):
+    """A symbol with no tracked lot (predates Task 6) must behave exactly
+    as before -- no min_strike, no flagging, the old 'held' message."""
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "get_open_lot", lambda symbol: None)
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: None)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "no suitable strike found" in result
+    assert logged["lot_flags"] == []
+
+
+def test_stale_lot_alerts_without_blocking(monkeypatch):
+    candidate = FakeCandidate(_far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.25)
+    old_open = datetime.now(timezone.utc) - timedelta(weeks=main.STALE_LOT_WEEKS + 1)
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "get_open_lot", lambda symbol: _fake_lot(opened_at=old_open))
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: candidate)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" not in result
+    assert "sold" in result
+    assert len(logged["errors"]) == 0  # alert goes via notifier, not log_error -- just confirm it didn't block
+
+
+def test_fresh_lot_does_not_alert(monkeypatch):
+    candidate = FakeCandidate(_far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.25)
+    alerts = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "get_open_lot", lambda symbol: _fake_lot(opened_at=datetime.now(timezone.utc)))
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: candidate)
+    monkeypatch.setattr(main.notifier, "send_error", lambda symbol, msg: alerts.append(msg))
+
+    main.run_symbol_cycle("AAPL")
+
+    assert alerts == []
+
+
+def test_roll_recovery_exit_not_enabled_fails_plain(monkeypatch):
+    old_occ = _far_occ_symbol("AAPL", dte=3)
+    short_call = FakeShortCallPosition(symbol=old_occ, cost_basis="-250.0", market_value="-240.0")
+    recovery_calls = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+        find_short_call=lambda symbol: short_call,
+        attempt_recovery_exit=lambda *a, **k: recovery_calls.append(a),
+    )
+    monkeypatch.setattr(main, "get_open_lot", lambda symbol: _fake_lot(cost_basis_per_share=150.0))
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: None)
+    monkeypatch.setattr(main, "RECOVERY_EXIT_ENABLED_SYMBOLS", [])
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "FAILED to find new strike" in result
+    assert recovery_calls == []
+    assert ("flag", "AAPL") in logged["lot_flags"]
+
+
+def test_roll_recovery_exit_enabled_and_succeeds(monkeypatch):
+    old_occ = _far_occ_symbol("AAPL", dte=3)
+    short_call = FakeShortCallPosition(symbol=old_occ, cost_basis="-250.0", market_value="-240.0")
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+        find_short_call=lambda symbol: short_call,
+    )
+    monkeypatch.setattr(main, "get_open_lot", lambda symbol: _fake_lot(cost_basis_per_share=150.0))
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: None)
+    monkeypatch.setattr(main, "RECOVERY_EXIT_ENABLED_SYMBOLS", ["AAPL"])
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "recovery-exit completed" in result
+    close_calls = [f for f in logged["lot_flags"] if f[0] == "close"]
+    assert len(close_calls) == 1
+    assert close_calls[0][2] == "RECOVERY_EXIT"
+    assert len(logged["option_trades"]) == 1
+    assert len(logged["share_trades"]) == 1
+
+
+def test_roll_recovery_exit_enabled_but_fails(monkeypatch):
+    old_occ = _far_occ_symbol("AAPL", dte=3)
+    short_call = FakeShortCallPosition(symbol=old_occ, cost_basis="-250.0", market_value="-240.0")
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+        find_short_call=lambda symbol: short_call,
+        attempt_recovery_exit=lambda *a, **k: None,
+    )
+    monkeypatch.setattr(main, "get_open_lot", lambda symbol: _fake_lot(cost_basis_per_share=150.0))
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: None)
+    monkeypatch.setattr(main, "RECOVERY_EXIT_ENABLED_SYMBOLS", ["AAPL"])
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "recovery-exit did not complete" in result
+    assert logged["lot_flags"] == [("flag", "AAPL")]
