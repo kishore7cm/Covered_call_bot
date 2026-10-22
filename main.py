@@ -242,14 +242,33 @@ def _log_and_alert_failure(symbol: str, default_msg: str) -> None:
     needs-attention before returning None. Checking here means every
     order path alerts immediately when that's fresh, the same way
     roll_call's failure handling already did -- not just on the NEXT
-    cycle's top-of-function needs-attention check.
+    cycle's top-of-function needs-attention check. Routed through
+    notifier.send_needs_attention (local console/alerts.log/macOS
+    notification, see alerts.py) specifically when the flag IS fresh, so
+    that actionable case is never just another send_error among many.
     """
     msg = default_msg
     needs_attention_reason = trader.check_needs_attention(symbol)
     if needs_attention_reason:
         msg = f"{symbol}: {needs_attention_reason}"
     log_error("main.run_symbol_cycle", msg)
-    _run_async(notifier.send_error(symbol, msg))
+    if needs_attention_reason:
+        _run_async(notifier.send_needs_attention(symbol, needs_attention_reason))
+    else:
+        _run_async(notifier.send_error(symbol, msg))
+
+
+def _alert_if_kill_switch_tripped(symbol: str, description: str, block_reason: str) -> None:
+    """
+    Every other block reason (DRY_RUN, market hours, open orders, hard
+    caps) is routine and already logged via logger.info at the call site
+    -- not alert-worthy on its own. The kill switch is different: it's a
+    deliberate, external safety trip (the env var or the pipeline_state/
+    kill_switch file), and manual/Stage 3 testing needs to know
+    immediately that it fired, not just see it buried in the log stream.
+    """
+    if block_reason == "kill_switch":
+        _run_async(notifier.send_kill_switch_trip(f"{symbol}: {description} — blocked by kill switch"))
 
 
 def _ex_div_warning_text(candidate, spot: float | None) -> str | None:
@@ -303,7 +322,7 @@ def run_symbol_cycle(
     needs_attention_reason = trader.check_needs_attention(symbol)
     if needs_attention_reason:
         log_error("main.run_symbol_cycle", f"{symbol}: flagged needs-attention — {needs_attention_reason}")
-        _run_async(notifier.send_error(symbol, f"needs-attention flag still set: {needs_attention_reason}"))
+        _run_async(notifier.send_needs_attention(symbol, needs_attention_reason))
         return f"{symbol}: SKIPPED — needs-attention flag set, needs manual review"
 
     dte_min, dte_max = _dte_window(recommended_dte)
@@ -345,7 +364,7 @@ def run_symbol_cycle(
         if share_qty > 0:
             msg = f"{symbol}: partial share quantity ({share_qty}, expected 0 or {SHARES_PER_LOT}) — needs manual review"
             log_error("main.run_symbol_cycle", msg)
-            _run_async(notifier.send_error(symbol, msg))
+            _run_async(notifier.send_partial_fill(symbol, msg))
             return f"{symbol}: SKIPPED — {msg}"
 
         # Distinguish "never held shares yet" from "shares were just
@@ -416,6 +435,7 @@ def run_symbol_cycle(
             return f"{symbol}: FAILED to buy shares"
         if status == "blocked":
             logger.info("%s: buy_shares blocked (%s) — not logging as a real trade", symbol, result["block_reason"])
+            _alert_if_kill_switch_tripped(symbol, f"buy {SHARES_PER_LOT} shares", result["block_reason"])
             return f"{symbol}: would buy {SHARES_PER_LOT} shares ({result['block_reason']} — not submitted)"
 
         # result["qty"] is the ACTUAL filled quantity (trader.py's fill
@@ -432,7 +452,7 @@ def run_symbol_cycle(
         if filled_qty != SHARES_PER_LOT:
             msg = f"{symbol}: buy_shares only partially filled ({filled_qty}/{SHARES_PER_LOT} shares) — remainder was cancelled"
             log_error("main.run_symbol_cycle", msg)
-            _run_async(notifier.send_error(symbol, msg))
+            _run_async(notifier.send_partial_fill(symbol, msg))
         _run_async(notifier.send_shares_bought(symbol, filled_qty, result["order_id"]))
         return f"{symbol}: bought {filled_qty} shares"
 
@@ -480,6 +500,7 @@ def run_symbol_cycle(
             logger.info(
                 "%s: sell_to_open_call blocked (%s) — not logging as a real trade", symbol, result["block_reason"]
             )
+            _alert_if_kill_switch_tripped(symbol, f"sell {candidate.occ_symbol}", result["block_reason"])
             return (
                 f"{symbol}: would sell {candidate.occ_symbol} @ ${candidate.mid_price:.2f} "
                 f"(delta {candidate.delta:.2f}) ({result['block_reason']} — not submitted)"
@@ -549,6 +570,7 @@ def run_symbol_cycle(
             logger.info(
                 "%s: buy_to_close_call blocked (%s) — not logging as a real trade", symbol, result["block_reason"]
             )
+            _alert_if_kill_switch_tripped(symbol, f"close {occ_symbol} (profit take)", result["block_reason"])
             return f"{symbol}: would close {occ_symbol} for profit take ({result['block_reason']} — not submitted)"
         pnl = (entry_credit - current_value) * 100
         log_option_trade(symbol, occ_symbol, "BUY_TO_CLOSE", premium=current_value, order_id=result["order_id"])
@@ -636,6 +658,7 @@ def run_symbol_cycle(
             # leg wasn't real either, so checking the close leg is enough.
             block_reason = result["closed"]["block_reason"]
             logger.info("%s: roll_call blocked (%s) — not logging as a real trade", symbol, block_reason)
+            _alert_if_kill_switch_tripped(symbol, f"roll {occ_symbol} -> {new_candidate.occ_symbol}", block_reason)
             return f"{symbol}: would roll {occ_symbol} -> {new_candidate.occ_symbol} ({block_reason} — not submitted)"
 
         log_option_trade(symbol, new_candidate.occ_symbol, "ROLL",
@@ -662,9 +685,28 @@ def run_symbol_cycle(
     return f"{symbol}: holding {occ_symbol} ({profit_captured_pct:.0%} profit captured)"
 
 
+def _print_open_needs_attention() -> None:
+    """
+    Every currently-flagged symbol, printed and logged at the start of
+    every cycle -- a flag silently sitting in pipeline_state/
+    needs_attention.json for weeks between manual checks is exactly the
+    kind of thing that must be visible on every single run, not just the
+    one where it was first set.
+    """
+    open_flags = trader.get_all_needs_attention()
+    if not open_flags:
+        logger.info("No open needs-attention flags.")
+        return
+    for sym, info in open_flags.items():
+        msg = f"{sym}: {info.get('reason')} (flagged {info.get('flagged_at')})"
+        logger.warning("OPEN NEEDS-ATTENTION: %s", msg)
+        print(f"[NEEDS-ATTENTION] {msg}")
+
+
 def run_cycle() -> None:
     logger.info("=" * 60)
     logger.info("CYCLE START")
+    _print_open_needs_attention()
     # MAX_ORDERS_PER_CYCLE is a per-cycle cap -- reset once here, not once
     # per symbol, so it actually limits a cycle's total order volume
     # rather than resetting away on the very next symbol.

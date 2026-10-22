@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from telegram import Bot
 from telegram.error import TelegramError
 
+import alerts
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 logger = logging.getLogger(__name__)
@@ -101,3 +102,23 @@ async def send_cycle_summary(actions: list[str]) -> None:
 
 async def send_error(symbol: str, error_message: str) -> None:
     await _send(f"🚨 <b>BOT ERROR — {symbol}</b>\n{error_message}")
+
+
+async def send_needs_attention(symbol: str, reason: str) -> None:
+    """Also fires the local alert sink (console/alerts.log/macOS
+    notification), unconditionally -- unlike send_error above, this is
+    for the specific, actionable "a human must clear this" case (see
+    trader.mark_needs_attention), not every logged error."""
+    message = f"{symbol}: needs-attention — {reason}"
+    alerts.notify("needs_attention", message)
+    await _send(f"🚨 <b>NEEDS ATTENTION — {symbol}</b>\n{reason}")
+
+
+async def send_partial_fill(symbol: str, message: str) -> None:
+    alerts.notify("partial_fill", f"{symbol}: {message}")
+    await _send(f"⚠️ <b>PARTIAL FILL — {symbol}</b>\n{message}")
+
+
+async def send_kill_switch_trip(message: str) -> None:
+    alerts.notify("kill_switch", message)
+    await _send(f"🛑 <b>KILL SWITCH TRIPPED</b>\n{message}")

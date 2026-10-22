@@ -229,10 +229,10 @@ def test_buy_shares_failure_with_fresh_needs_attention_alerts_immediately(monkey
         check_needs_attention=fake_check_needs_attention,
     )
 
-    async def fake_send_error(symbol, msg):
-        alerts.append(msg)
+    async def fake_send_needs_attention(symbol, reason):
+        alerts.append(reason)
 
-    monkeypatch.setattr(main.notifier, "send_error", fake_send_error)
+    monkeypatch.setattr(main.notifier, "send_needs_attention", fake_send_needs_attention)
     # _patch_common's default _run_async just closes the coroutine without
     # running it (safe for tests that don't care what the body does) --
     # this test needs the body to actually run so alerts gets populated,
@@ -918,6 +918,128 @@ def test_ex_div_warning_reports_itm_when_spot_above_strike(monkeypatch):
     result = main.run_symbol_cycle("AAPL")
 
     assert "ITM" in result
+
+
+# ── Local alert routing: needs-attention / partial fill / kill switch ───────
+
+def test_needs_attention_flag_set_alerts_via_send_needs_attention(monkeypatch):
+    sent = []
+    _patch_common(monkeypatch, check_needs_attention=lambda symbol: "uncovered shares")
+    monkeypatch.setattr(main.notifier, "send_needs_attention", _capture_async_call(sent))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" in result
+    assert len(sent) == 1
+    assert sent[0]["args"] == ("AAPL", "uncovered shares")
+
+
+def test_buy_shares_failure_without_needs_attention_uses_send_error(monkeypatch):
+    """The plain-rejection case (no fresh needs-attention flag) must still
+    go through the generic send_error channel, not send_needs_attention --
+    only an ACTUALLY fresh flag gets the dedicated alert."""
+    sent = []
+    _patch_common(monkeypatch, buy_shares=lambda symbol, qty, **k: None)
+    monkeypatch.setattr(main.notifier, "send_error", _capture_async_call(sent))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "FAILED" in result
+    assert len(sent) == 1
+
+
+def test_partial_share_quantity_60_of_100_alerts_via_send_partial_fill_and_places_no_order(monkeypatch):
+    """The literal Stage 3 scenario-1 shape: a broker position sitting at
+    60/100 shares must skip without buying anything, and the alert must
+    go through send_partial_fill (not the generic send_error)."""
+    sent = []
+    buy_calls = []
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty="60"),
+        buy_shares=lambda symbol, qty, **k: buy_calls.append((symbol, qty)),
+    )
+    monkeypatch.setattr(main.notifier, "send_partial_fill", _capture_async_call(sent))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" in result
+    assert "partial" in result.lower()
+    assert buy_calls == []
+    assert len(sent) == 1
+    assert "60" in sent[0]["args"][1]
+
+
+def test_buy_shares_real_partial_fill_alerts_via_send_partial_fill(monkeypatch):
+    sent = []
+    _patch_common(monkeypatch, buy_shares=lambda symbol, qty, **k: {
+        "order_id": "o1", "symbol": symbol, "qty": 60, "price": 100.0, "submitted": True,
+    })
+    monkeypatch.setattr(main.notifier, "send_partial_fill", _capture_async_call(sent))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "bought 60 shares" in result
+    assert len(sent) == 1
+    assert "60" in sent[0]["args"][1]
+
+
+def test_alert_if_kill_switch_tripped_fires_only_for_kill_switch(monkeypatch):
+    sent = []
+    monkeypatch.setattr(main.notifier, "send_kill_switch_trip", _capture_async_call(sent))
+    monkeypatch.setattr(main, "_run_async", lambda coro: coro.close())
+
+    main._alert_if_kill_switch_tripped("AAPL", "buy 100 shares", "kill_switch")
+    assert len(sent) == 1
+    assert "AAPL" in sent[0]["args"][0]
+    assert "kill switch" in sent[0]["args"][0]
+
+    main._alert_if_kill_switch_tripped("AAPL", "buy 100 shares", "dry_run")
+    assert len(sent) == 1  # unchanged -- a routine block reason never alerts
+
+
+def test_buy_shares_blocked_by_kill_switch_alerts_at_the_real_call_site(monkeypatch):
+    sent = []
+    _patch_common(monkeypatch, buy_shares=lambda symbol, qty, **k: {
+        "order_id": None, "submitted": False, "block_reason": "kill_switch",
+    })
+    monkeypatch.setattr(main.notifier, "send_kill_switch_trip", _capture_async_call(sent))
+
+    main.run_symbol_cycle("AAPL")
+
+    assert len(sent) == 1
+    assert "AAPL" in sent[0]["args"][0]
+
+
+def test_buy_shares_blocked_by_dry_run_does_not_trip_kill_switch_alert(monkeypatch):
+    sent = []
+    _patch_common(monkeypatch, buy_shares=lambda symbol, qty, **k: {
+        "order_id": None, "submitted": False, "block_reason": "dry_run",
+    })
+    monkeypatch.setattr(main.notifier, "send_kill_switch_trip", _capture_async_call(sent))
+
+    main.run_symbol_cycle("AAPL")
+
+    assert sent == []
+
+
+# ── Print open needs-attention flags at the start of every cycle ────────────
+
+def test_print_open_needs_attention_prints_each_flag(monkeypatch, capsys):
+    monkeypatch.setattr(trader, "get_all_needs_attention", lambda: {
+        "AAPL": {"reason": "uncovered shares", "flagged_at": "2026-01-01T00:00:00+00:00"},
+    })
+    main._print_open_needs_attention()
+    out = capsys.readouterr().out
+    assert "AAPL" in out
+    assert "uncovered shares" in out
+
+
+def test_print_open_needs_attention_silent_when_none(monkeypatch, capsys):
+    monkeypatch.setattr(trader, "get_all_needs_attention", lambda: {})
+    main._print_open_needs_attention()
+    out = capsys.readouterr().out
+    assert out == ""
 
 
 # ── Paper/live startup guard ──────────────────────────────────────────────────
