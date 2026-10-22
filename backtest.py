@@ -19,6 +19,12 @@ TASK 2 ADDITIONS (on top of the original yield-sweep above):
     (plausible with very few cycles) — without it, such a combo got
     total_return_pct substituted in unscaled, with no risk penalty at all,
     which could let a one-cycle lucky combo outrank a well-evidenced one.
+    The floor alone doesn't stop that combo from COMPETING, though — it
+    just stops its score from being unboundedly generous. ELIGIBILITY
+    (MIN_CYCLES_FOR_SELECTION) is the other half: a combo with fewer
+    in-sample cycles than that is excluded from the comparison entirely,
+    logged (not printed — routine), not scored. If nothing is eligible for
+    a symbol, it's dropped from the proposal and __main__ prints why.
   - DISCRETE LOTS, NOT COMPOUNDING REINVESTMENT: the original
     strategy_total_return/avg_annualized_yield (kept, unchanged, below)
     model a reinvest-100%-of-proceeds-every-cycle return — fine for
@@ -37,7 +43,13 @@ TASK 2 ADDITIONS (on top of the original yield-sweep above):
     with that exact combo — in_sample_yield, out_of_sample_yield, and the
     gap between them are reported alongside the pick, so a symbol whose
     backtest doesn't generalize is visible, not hidden behind one
-    full-history number.
+    full-history number. oos_total_return_pct/oos_max_drawdown_pct/
+    oos_risk_adjusted_return are ALSO stored (and written to
+    proposed_watchlist.json) — the yield gap alone only validates the
+    OLD metric out of sample, not the thing selection actually optimized
+    for (risk-adjusted total return), so a combo could look validated on
+    yield while its risk-adjusted performance quietly fell apart
+    out-of-sample. apply_watchlist.py flags that case separately.
   - FILL HAIRCUT: the synthetic premium is shaved by FILL_HAIRCUT_FRACTION
     of half the bid-ask spread — Scout's live-measured spread_pct for this
     symbol when the caller has it, DEFAULT_ASSUMED_SPREAD_PCT otherwise.
@@ -104,8 +116,8 @@ import yfinance as yf
 
 from config import (
     DEFAULT_ASSUMED_SPREAD_PCT, DELTA_SWEEP_BUCKETS, FILL_HAIRCUT_FRACTION,
-    MIN_DRAWDOWN_FLOOR_PCT, RISK_FREE_RATE, SHRINKAGE_MIN_CYCLES, TARGET_DELTA,
-    WALK_FORWARD_TRAIN_FRACTION,
+    MIN_CYCLES_FOR_SELECTION, MIN_DRAWDOWN_FLOOR_PCT, RISK_FREE_RATE,
+    SHRINKAGE_MIN_CYCLES, TARGET_DELTA, WALK_FORWARD_TRAIN_FRACTION,
 )
 from greeks import bs_call_price, strike_from_delta
 
@@ -150,6 +162,16 @@ class CycleStats:
     spread_pct_used: float | None = None
     spread_source: str | None = None            # "scout" or "default"
     shrunk_from_dte: int | None = None          # pre-shrinkage dte, only set if shrinkage changed it
+
+    # Out-of-sample analogs of this same combo's total_return_pct/
+    # max_drawdown_pct/risk_adjusted_return (all three above are IN-SAMPLE --
+    # this object IS the train-window CycleStats, extended via replace()).
+    # Reported so a human (or apply_watchlist.py) can tell whether the thing
+    # selection actually optimized for -- risk-adjusted return, not just
+    # yield -- held up out of sample, not just the yield metric.
+    oos_total_return_pct: float | None = None
+    oos_max_drawdown_pct: float | None = None
+    oos_risk_adjusted_return: float | None = None
 
 
 def _price_history(symbol: str, lookback: str = DEFAULT_LOOKBACK) -> pd.Series:
@@ -387,15 +409,23 @@ def backtest_symbol_total_return(
     rate: float = RISK_FREE_RATE,
     haircut_fraction: float = FILL_HAIRCUT_FRACTION,
     train_fraction: float = WALK_FORWARD_TRAIN_FRACTION,
+    min_cycles_for_selection: int = MIN_CYCLES_FOR_SELECTION,
 ) -> CycleStats | None:
     """
     Task 2's main entry point. Sweeps dte_buckets x delta_buckets on the
     TRAIN slice only (selection never sees the validation window), picking
-    the combo with the best risk-adjusted total return (falling back to
-    avg_annualized_yield if risk_adjusted_return isn't available for every
-    candidate -- shouldn't happen once there's at least one cycle, but
-    mirrors backtest_dte's own None-on-no-cycles contract). That exact
-    combo is then validated out-of-sample on the untouched remainder.
+    the combo with the best risk-adjusted total return. That exact combo is
+    then validated out-of-sample on the untouched remainder.
+
+    ELIGIBILITY: a combo with fewer than min_cycles_for_selection in-sample
+    cycles is excluded from the comparison entirely, not just scored
+    conservatively. MIN_DRAWDOWN_FLOOR_PCT (in backtest_dte) stops a
+    near-zero-drawdown combo's ratio from being unboundedly generous, but it
+    doesn't stop a 1-2 cycle fluke from competing -- and winning -- against
+    a well-evidenced combo in the first place. This does. Excluded combos
+    are logged (not printed -- routine, can be frequent); if NOTHING is
+    eligible for this symbol, it's dropped entirely and the caller (CLI
+    __main__) prints why.
     """
     closes = _price_history(symbol, lookback)
     vol = _realized_vol(closes)
@@ -405,17 +435,35 @@ def backtest_symbol_total_return(
     train_closes, train_vol = closes.iloc[:split_idx], vol.iloc[:split_idx]
     test_closes, test_vol = closes.iloc[split_idx:], vol.iloc[split_idx:]
 
+    found_any_valid_combo = False
     best, best_score = None, None
     for delta in delta_buckets:
         for dte in dte_buckets:
             stats = backtest_dte(train_closes, train_vol, dte, delta, rate, spread_pct, haircut_fraction)
             if stats is None:
                 continue
+            found_any_valid_combo = True
+
+            if stats.num_cycles < min_cycles_for_selection:
+                _log.info(
+                    "%s: DTE=%d delta=%.2f ineligible for selection -- %d in-sample cycle(s), need >= %d",
+                    symbol, dte, delta, stats.num_cycles, min_cycles_for_selection,
+                )
+                continue
+
             score = stats.risk_adjusted_return if stats.risk_adjusted_return is not None else stats.avg_annualized_yield
             if best is None or score > best_score:
                 best, best_score = stats, score
 
     if best is None:
+        if found_any_valid_combo:
+            _log.warning(
+                "%s: every (DTE, delta) combo had fewer than %d in-sample cycles -- "
+                "dropping from the proposal (nothing eligible for selection)",
+                symbol, min_cycles_for_selection,
+            )
+        else:
+            _log.warning("%s: no (DTE, delta) combo produced any in-sample cycles at all -- dropping", symbol)
         return None
 
     oos_stats = backtest_dte(test_closes, test_vol, best.dte, best.target_delta, rate, spread_pct, haircut_fraction)
@@ -430,6 +478,9 @@ def backtest_symbol_total_return(
         oos_gap_pp=gap_pp,
         spread_pct_used=spread_pct,
         spread_source=spread_source,
+        oos_total_return_pct=oos_stats.total_return_pct if oos_stats is not None else None,
+        oos_max_drawdown_pct=oos_stats.max_drawdown_pct if oos_stats is not None else None,
+        oos_risk_adjusted_return=oos_stats.risk_adjusted_return if oos_stats is not None else None,
     )
 
 
@@ -440,6 +491,7 @@ def apply_dte_shrinkage(
     rate: float = RISK_FREE_RATE,
     haircut_fraction: float = FILL_HAIRCUT_FRACTION,
     train_fraction: float = WALK_FORWARD_TRAIN_FRACTION,
+    min_cycles_for_selection: int = MIN_CYCLES_FOR_SELECTION,
 ) -> dict[str, CycleStats]:
     """
     Pull a symbol's recommended DTE toward the cross-symbol consensus when
@@ -480,12 +532,14 @@ def apply_dte_shrinkage(
             symbol, dte_buckets=(new_dte,), delta_buckets=(stats.target_delta,),
             lookback=lookback, spread_pct=stats.spread_pct_used, spread_source=stats.spread_source,
             rate=rate, haircut_fraction=haircut_fraction, train_fraction=train_fraction,
+            min_cycles_for_selection=min_cycles_for_selection,
         )
         if refreshed is None:
             _log.warning(
                 "%s: shrinkage wanted to move DTE %d -> %d (toward consensus %d) but the refresh "
-                "backtest found no valid cycles there -- keeping the original DTE=%d unshrunk",
-                symbol, stats.dte, new_dte, global_best_dte, stats.dte,
+                "backtest found no eligible cycles there (none, or fewer than %d) -- keeping the "
+                "original DTE=%d unshrunk",
+                symbol, stats.dte, new_dte, global_best_dte, min_cycles_for_selection, stats.dte,
             )
             shrunk[symbol] = stats
             continue
@@ -561,6 +615,9 @@ if __name__ == "__main__":
     parser.add_argument("--train-fraction", type=float, default=WALK_FORWARD_TRAIN_FRACTION,
                          help="fraction of history used for in-sample selection; the rest is out-of-sample")
     parser.add_argument("--haircut-fraction", type=float, default=FILL_HAIRCUT_FRACTION)
+    parser.add_argument("--min-cycles-for-selection", type=int, default=MIN_CYCLES_FOR_SELECTION,
+                         help="a (DTE, delta) combo needs at least this many in-sample cycles to be "
+                              "eligible for selection at all")
     parser.add_argument("--legacy-yield-only", action="store_true",
                          help="use the original single-metric ranking (avg annualized yield, no walk-forward/"
                               "drawdown/delta-sweep) instead of Task 2's risk-adjusted total-return objective")
@@ -601,9 +658,11 @@ if __name__ == "__main__":
                 symbol, dte_buckets, delta_buckets, lookback=args.lookback,
                 spread_pct=spread_pct, spread_source=spread_source,
                 haircut_fraction=args.haircut_fraction, train_fraction=args.train_fraction,
+                min_cycles_for_selection=args.min_cycles_for_selection,
             )
             if stats is None:
-                print(f"{symbol}: FAILED — no valid cycles for any DTE/delta combo")
+                print(f"{symbol}: FAILED — no (DTE, delta) combo had >= {args.min_cycles_for_selection} "
+                      f"in-sample cycles (see warning above for detail) — dropped from proposal")
                 continue
 
             recommendations[symbol] = stats
@@ -619,6 +678,13 @@ if __name__ == "__main__":
                 f"risk_adjusted={stats.risk_adjusted_return:.2f} | "
                 f"spread={stats.spread_pct_used * 100:.1f}% (source: {stats.spread_source})"
             )
+            oos_return_str = f"{stats.oos_total_return_pct * 100:.1f}%" if stats.oos_total_return_pct is not None else "n/a"
+            oos_dd_str = f"{stats.oos_max_drawdown_pct * 100:.1f}%" if stats.oos_max_drawdown_pct is not None else "n/a"
+            oos_ra_str = f"{stats.oos_risk_adjusted_return:.2f}" if stats.oos_risk_adjusted_return is not None else "n/a"
+            print(
+                f"    OOS total_return={oos_return_str} OOS max_drawdown={oos_dd_str} "
+                f"OOS risk_adjusted={oos_ra_str}"
+            )
         except Exception as e:
             _log.exception("backtest failed for %s", symbol)
             print(f"{symbol}: FAILED — {e}")
@@ -626,7 +692,7 @@ if __name__ == "__main__":
     if not args.legacy_yield_only and not args.no_shrinkage and recommendations:
         recommendations = apply_dte_shrinkage(
             recommendations, lookback=args.lookback, haircut_fraction=args.haircut_fraction,
-            train_fraction=args.train_fraction,
+            train_fraction=args.train_fraction, min_cycles_for_selection=args.min_cycles_for_selection,
         )
         for symbol, stats in recommendations.items():
             if stats.shrunk_from_dte is not None:

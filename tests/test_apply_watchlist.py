@@ -41,6 +41,48 @@ def test_summary_degrades_gracefully_for_pre_task2_watchlist_entries():
     assert summary == "IS yield=n/a OOS yield=n/a"
 
 
+# ── _risk_adjusted_summary ────────────────────────────────────────────────────
+
+def test_risk_adjusted_summary_no_flag_when_close():
+    stats = {"risk_adjusted_return": 2.0, "oos_risk_adjusted_return": 1.8}
+    summary = aw._risk_adjusted_summary(stats)
+    assert "IS risk-adjusted=2.00 OOS risk-adjusted=1.80" == summary
+
+
+def test_risk_adjusted_summary_flags_degradation_below_threshold():
+    # OOS (0.8) is 40% of IS (2.0) -- below the 50% threshold.
+    stats = {"risk_adjusted_return": 2.0, "oos_risk_adjusted_return": 0.8}
+    summary = aw._risk_adjusted_summary(stats)
+    assert "fell to 40% of in-sample" in summary
+    assert "!!" in summary
+
+
+def test_risk_adjusted_summary_not_flagged_at_exactly_half():
+    stats = {"risk_adjusted_return": 2.0, "oos_risk_adjusted_return": 1.0}
+    summary = aw._risk_adjusted_summary(stats)
+    assert "!!" not in summary
+
+
+def test_risk_adjusted_summary_flags_sign_flip():
+    stats = {"risk_adjusted_return": 1.5, "oos_risk_adjusted_return": -0.3}
+    summary = aw._risk_adjusted_summary(stats)
+    assert "went non-positive" in summary
+
+
+def test_risk_adjusted_summary_empty_when_either_side_missing():
+    assert aw._risk_adjusted_summary({"risk_adjusted_return": 2.0}) == ""
+    assert aw._risk_adjusted_summary({"oos_risk_adjusted_return": 1.0}) == ""
+    assert aw._risk_adjusted_summary({}) == ""
+
+
+def test_risk_adjusted_summary_no_flag_when_in_sample_already_non_positive():
+    # Nothing positive to "lose" -- in-sample was already bad, this isn't
+    # the "backtest doesn't generalize" story being flagged for.
+    stats = {"risk_adjusted_return": -0.5, "oos_risk_adjusted_return": -2.0}
+    summary = aw._risk_adjusted_summary(stats)
+    assert "!!" not in summary
+
+
 # ── _diff() output ────────────────────────────────────────────────────────────
 
 def _watchlist(symbols: dict) -> dict:
@@ -58,6 +100,26 @@ def test_diff_add_shows_is_oos_summary(capsys):
     assert "ADD:" in out
     assert "+ AAPL: DTE=30" in out
     assert "IS yield=18.0% OOS yield=16.0%" in out
+    # No risk-adjusted fields on this entry -- line must not appear at all.
+    assert "risk-adjusted" not in out
+
+
+def test_diff_add_shows_risk_adjusted_degradation_flag(capsys):
+    active = _watchlist({})
+    proposed = _watchlist({
+        "SOFI": {"dte": 30, "avg_annualized_yield": 0.18, "in_sample_yield": 0.18,
+                 "out_of_sample_yield": 0.17, "oos_gap_pp": 1.0,
+                 "risk_adjusted_return": 2.0, "oos_risk_adjusted_return": 0.5},
+    })
+    aw._diff(active, proposed)
+    out = capsys.readouterr().out
+    # Yield gap is small (no flag there), but risk-adjusted degraded hard --
+    # this is exactly the "passes the yield check, fails on risk-adjusted"
+    # case this flag exists for.
+    assert "IS yield=18.0% OOS yield=17.0%" in out
+    assert "LARGE GAP" not in out
+    assert "IS risk-adjusted=2.00 OOS risk-adjusted=0.50" in out
+    assert "fell to 25% of in-sample" in out
 
 
 def test_diff_remove_shows_summary_from_active_stats(capsys):

@@ -96,6 +96,15 @@ DEFAULT_ASSUMED_SPREAD_PCT = 0.05
 # risk_adjusted_return a real, consistently-scaled ratio for every combo,
 # capping (not eliminating) how much credit a thin-evidence path can get.
 MIN_DRAWDOWN_FLOOR_PCT = 0.02
+# Minimum in-sample cycles a (DTE, delta) combo needs to be ELIGIBLE for
+# selection at all -- the drawdown floor above only caps how generous a
+# thin-evidence combo's score can be, it doesn't stop a 1-2 cycle fluke
+# from competing (and winning) in the first place. This disqualifies it
+# from the comparison entirely instead. Distinct from SHRINKAGE_MIN_CYCLES
+# below, which is a separate, higher bar for a DIFFERENT question (how much
+# to trust an ALREADY-selected pick's DTE against the cross-symbol
+# consensus, not whether it's eligible to be selected at all).
+MIN_CYCLES_FOR_SELECTION = 5
 # Below this many backtested cycles, a symbol's own DTE pick is shrunk
 # toward the cross-symbol consensus DTE (empirical-Bayes-style correction —
 # too little of its own history to trust the pick on its own).

@@ -14,6 +14,12 @@ whose backtest doesn't generalize is visible at the one point a human
 actually reviews it, before it can affect live positions. Still changes
 nothing without --confirm -- this is a display-only addition.
 
+Also flags when OOS risk-adjusted return (premium + stock P&L, divided by
+drawdown -- the thing selection actually optimizes for) degraded hard
+relative to in-sample, separately from the yield gap above: yield ignores
+drawdown/stock P&L entirely, so a combo can pass the yield-gap check while
+its risk-adjusted performance quietly fell apart out of sample.
+
 Usage:
     python apply_watchlist.py                 # show the diff, change nothing
     python apply_watchlist.py --confirm       # show the diff, then apply it
@@ -30,6 +36,15 @@ ACTIVE_PATH = "pipeline_state/active_watchlist.json"
 # into"), kept local here rather than in config.py -- same existing pattern
 # as this file's own PROPOSED_PATH/ACTIVE_PATH constants.
 OOS_GAP_FLAG_THRESHOLD_PP = 10.0
+
+# risk_adjusted_return is a dimensionless ratio, not a bounded percentage
+# like yield -- a fixed absolute (percentage-point-style) threshold isn't
+# meaningful for it the way OOS_GAP_FLAG_THRESHOLD_PP is for yield. Instead:
+# flag when OOS fell below this FRACTION of in-sample (e.g. 0.5 = OOS cut
+# to less than half of what in-sample showed), or went non-positive outright
+# while in-sample was positive -- both scale-independent, and both are the
+# "backtest doesn't generalize" story this is trying to catch.
+RISK_ADJUSTED_DEGRADATION_THRESHOLD = 0.5
 
 
 def _load(path: str) -> dict:
@@ -67,6 +82,33 @@ def _is_oos_summary(stats: dict) -> str:
     return summary
 
 
+def _risk_adjusted_summary(stats: dict) -> str:
+    """
+    Separate from _is_oos_summary's yield-gap check: flags when OOS
+    risk-adjusted return (total_return_pct / drawdown -- what selection
+    actually optimized for) degraded hard relative to in-sample, even if
+    the yield gap above looked fine. "" (nothing printed) if either side
+    is missing -- older watchlist entries, or a symbol whose OOS slice
+    produced no cycles at all (oos_risk_adjusted_return stays None).
+    """
+    is_ra = stats.get("risk_adjusted_return")
+    oos_ra = stats.get("oos_risk_adjusted_return")
+    if is_ra is None or oos_ra is None:
+        return ""
+
+    summary = f"IS risk-adjusted={is_ra:.2f} OOS risk-adjusted={oos_ra:.2f}"
+    if is_ra > 0 and oos_ra <= 0:
+        summary += "  [!! OOS risk-adjusted return went non-positive — backtest may not generalize]"
+    elif is_ra > 0 and oos_ra < is_ra * RISK_ADJUSTED_DEGRADATION_THRESHOLD:
+        pct_of_is = oos_ra / is_ra * 100
+        summary += (
+            f"  [!! OOS risk-adjusted fell to {pct_of_is:.0f}% of in-sample "
+            f"(below the {RISK_ADJUSTED_DEGRADATION_THRESHOLD * 100:.0f}% threshold) — "
+            f"backtest may not generalize]"
+        )
+    return summary
+
+
 def _diff(active: dict, proposed: dict) -> None:
     active_symbols = active.get("symbols", {})
     proposed_symbols = proposed.get("symbols", {})
@@ -88,16 +130,25 @@ def _diff(active: dict, proposed: dict) -> None:
             stats = proposed_symbols[s]
             print(f"  + {s}: DTE={stats['dte']} (avg annualized yield {stats['avg_annualized_yield'] * 100:.1f}%)")
             print(f"      {_is_oos_summary(stats)}")
+            ra_summary = _risk_adjusted_summary(stats)
+            if ra_summary:
+                print(f"      {ra_summary}")
     if removed:
         print("REMOVE:")
         for s in removed:
             print(f"  - {s}")
             print(f"      {_is_oos_summary(active_symbols[s])}")
+            ra_summary = _risk_adjusted_summary(active_symbols[s])
+            if ra_summary:
+                print(f"      {ra_summary}")
     if changed:
         print("CHANGE DTE:")
         for s in changed:
             print(f"  ~ {s}: {active_symbols[s]['dte']} -> {proposed_symbols[s]['dte']}")
             print(f"      {_is_oos_summary(proposed_symbols[s])}")
+            ra_summary = _risk_adjusted_summary(proposed_symbols[s])
+            if ra_summary:
+                print(f"      {ra_summary}")
     if not (added or removed or changed):
         print("No differences — active watchlist already matches the proposed one.")
 

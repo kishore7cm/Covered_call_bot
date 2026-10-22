@@ -173,6 +173,100 @@ def test_selection_prefers_risk_adjusted_return_over_raw_yield(monkeypatch):
     assert result.risk_adjusted_return == 2.0
 
 
+# ── Eligibility: MIN_CYCLES_FOR_SELECTION ────────────────────────────────────
+
+def test_eligibility_excludes_zero_drawdown_fluke_in_favor_of_well_evidenced_combo(monkeypatch):
+    """The MIN_DRAWDOWN_FLOOR_PCT floor alone isn't enough: a 2-cycle combo
+    with zero observed drawdown and a HIGHER raw return would still score
+    higher (total_return/floor) than a 12-cycle combo with a real drawdown
+    and a LOWER raw return, and would win on score alone. Eligibility must
+    exclude the 2-cycle combo from competing at all."""
+    monkeypatch.setattr(backtest, "_price_history", lambda symbol, lookback=None: _synthetic_closes(n=500))
+
+    fluke_score = 0.10 / backtest.MIN_DRAWDOWN_FLOOR_PCT  # = 5.0
+    evidenced_score = 0.08 / 0.05                          # = 1.6
+    assert fluke_score > evidenced_score  # sanity: without eligibility, the fluke would win
+
+    def fake_backtest_dte(closes, vol, dte, target_delta, *a, **k):
+        canned = {
+            7: backtest.CycleStats(  # the fluke: 2 cycles, zero drawdown, HIGHER raw return
+                dte=7, num_cycles=2, total_premium_pct=0.1, avg_annualized_yield=0.50,
+                assignment_rate=0.5, strategy_total_return=0.10, buy_and_hold_return=0.05,
+                target_delta=target_delta, total_return_pct=0.10, max_drawdown_pct=0.0,
+                risk_adjusted_return=fluke_score,
+            ),
+            30: backtest.CycleStats(  # well-evidenced: 12 cycles, real drawdown, LOWER raw return
+                dte=30, num_cycles=12, total_premium_pct=0.08, avg_annualized_yield=0.15,
+                assignment_rate=0.2, strategy_total_return=0.08, buy_and_hold_return=0.05,
+                target_delta=target_delta, total_return_pct=0.08, max_drawdown_pct=0.05,
+                risk_adjusted_return=evidenced_score,
+            ),
+        }.get(dte)
+        return canned
+
+    monkeypatch.setattr(backtest, "backtest_dte", fake_backtest_dte)
+
+    result = backtest.backtest_symbol_total_return(
+        "FAKE", dte_buckets=(7, 30), delta_buckets=(0.25,), min_cycles_for_selection=5,
+    )
+
+    assert result.dte == 30
+    assert result.num_cycles == 12
+
+
+def test_ineligible_combo_is_logged_not_printed(monkeypatch, caplog):
+    monkeypatch.setattr(backtest, "_price_history", lambda symbol, lookback=None: _synthetic_closes(n=500))
+
+    def fake_backtest_dte(closes, vol, dte, target_delta, *a, **k):
+        if dte == 7:
+            return backtest.CycleStats(
+                dte=7, num_cycles=2, total_premium_pct=0.1, avg_annualized_yield=0.50,
+                assignment_rate=0.5, strategy_total_return=0.10, buy_and_hold_return=0.05,
+                target_delta=target_delta, total_return_pct=0.10, max_drawdown_pct=0.01,
+                risk_adjusted_return=5.0,
+            )
+        return backtest.CycleStats(
+            dte=30, num_cycles=12, total_premium_pct=0.08, avg_annualized_yield=0.15,
+            assignment_rate=0.2, strategy_total_return=0.08, buy_and_hold_return=0.05,
+            target_delta=target_delta, total_return_pct=0.08, max_drawdown_pct=0.05,
+            risk_adjusted_return=1.6,
+        )
+
+    monkeypatch.setattr(backtest, "backtest_dte", fake_backtest_dte)
+
+    with caplog.at_level(logging.INFO, logger="backtest"):
+        result = backtest.backtest_symbol_total_return(
+            "FAKE", dte_buckets=(7, 30), delta_buckets=(0.25,), min_cycles_for_selection=5,
+        )
+
+    assert result.dte == 30
+    messages = [rec.message for rec in caplog.records]
+    assert any("DTE=7" in m and "ineligible for selection" in m for m in messages)
+
+
+def test_symbol_dropped_with_warning_when_nothing_eligible(monkeypatch, caplog):
+    monkeypatch.setattr(backtest, "_price_history", lambda symbol, lookback=None: _synthetic_closes(n=500))
+
+    def fake_backtest_dte(closes, vol, dte, target_delta, *a, **k):
+        return backtest.CycleStats(  # every combo has too few cycles
+            dte=dte, num_cycles=1, total_premium_pct=0.05, avg_annualized_yield=0.30,
+            assignment_rate=0.5, strategy_total_return=0.05, buy_and_hold_return=0.02,
+            target_delta=target_delta, total_return_pct=0.05, max_drawdown_pct=0.0,
+            risk_adjusted_return=0.05 / backtest.MIN_DRAWDOWN_FLOOR_PCT,
+        )
+
+    monkeypatch.setattr(backtest, "backtest_dte", fake_backtest_dte)
+
+    with caplog.at_level(logging.WARNING, logger="backtest"):
+        result = backtest.backtest_symbol_total_return(
+            "FAKE", dte_buckets=(7, 30), delta_buckets=(0.25,), min_cycles_for_selection=5,
+        )
+
+    assert result is None
+    messages = [rec.message for rec in caplog.records]
+    assert any("dropping from the proposal" in m for m in messages)
+
+
 # ── Walk-forward: in-sample vs. out-of-sample yield ──────────────────────────
 
 def test_walk_forward_reports_is_oos_and_gap(monkeypatch):
@@ -198,6 +292,60 @@ def test_walk_forward_reports_is_oos_and_gap(monkeypatch):
     # The regime shift should produce a real (non-zero) gap, not an
     # accidental exact match between the two windows.
     assert abs(result.oos_gap_pp) > 0.01
+
+
+def test_oos_risk_adjusted_metrics_are_stored_not_just_yield(monkeypatch):
+    """oos_gap_pp only validates avg_annualized_yield out of sample -- the
+    OLD metric, not what selection actually optimizes for. These three
+    fields must ALSO be populated so a reviewer (or apply_watchlist.py) can
+    tell whether risk-adjusted performance itself held up out of sample."""
+    n = 600
+    calm = _synthetic_closes(n=int(n * 0.7), start=100.0, drift=0.0001, vol=0.006, seed=1)
+    wild_start = calm.iloc[-1]
+    rng = np.random.default_rng(2)
+    wild_idx = pd.date_range(calm.index[-1] + timedelta(days=1), periods=n - len(calm), freq="D")
+    wild_prices = wild_start * np.exp(np.cumsum(rng.normal(0.004, 0.04, len(wild_idx))))
+    wild = pd.Series(wild_prices, index=wild_idx)
+    closes = pd.concat([calm, wild])
+    monkeypatch.setattr(backtest, "_price_history", lambda symbol, lookback=None: closes)
+
+    result = backtest.backtest_symbol_total_return("FAKE", dte_buckets=(14, 30), delta_buckets=(0.25,))
+
+    assert result.oos_total_return_pct is not None
+    assert result.oos_max_drawdown_pct is not None
+    assert result.oos_risk_adjusted_return is not None
+    # Sanity: the OOS ratio should actually equal OOS return / OOS drawdown
+    # (floored), not something derived from the in-sample numbers instead.
+    assert result.oos_risk_adjusted_return == pytest.approx(
+        result.oos_total_return_pct / max(result.oos_max_drawdown_pct, backtest.MIN_DRAWDOWN_FLOOR_PCT)
+    )
+
+
+def test_oos_metrics_none_when_test_slice_has_no_cycles(monkeypatch):
+    monkeypatch.setattr(backtest, "_price_history", lambda symbol, lookback=None: _synthetic_closes(n=500))
+
+    def fake_backtest_dte(closes, vol, dte, target_delta, *a, **k):
+        # train slice (~350 rows, 70% of 500) gets a real result; test
+        # slice (~150 rows) returns None, as if it had too little data for
+        # even one cycle.
+        if len(closes) > 200:
+            return backtest.CycleStats(
+                dte=dte, num_cycles=10, total_premium_pct=0.1, avg_annualized_yield=0.15,
+                assignment_rate=0.2, strategy_total_return=0.1, buy_and_hold_return=0.05,
+                target_delta=target_delta, total_return_pct=0.1, max_drawdown_pct=0.05,
+                risk_adjusted_return=2.0,
+            )
+        return None
+
+    monkeypatch.setattr(backtest, "backtest_dte", fake_backtest_dte)
+
+    result = backtest.backtest_symbol_total_return("FAKE", dte_buckets=(30,), delta_buckets=(0.25,))
+
+    assert result is not None
+    assert result.out_of_sample_yield is None
+    assert result.oos_total_return_pct is None
+    assert result.oos_max_drawdown_pct is None
+    assert result.oos_risk_adjusted_return is None
 
 
 # ── DTE shrinkage toward the cross-symbol consensus ──────────────────────────
