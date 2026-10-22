@@ -8,7 +8,7 @@ from datetime import date, datetime
 
 import psycopg2
 
-from config import DATABASE_URL
+from config import DATABASE_URL, SHARES_PER_LOT
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +236,57 @@ def get_last_open_occ_symbol(symbol: str) -> str | None:
             return row[0] if row else None
     except Exception as e:
         logger.error("get_last_open_occ_symbol failed: %s", e)
+        return None
+
+
+def get_own_symbols() -> set[str]:
+    """
+    Every symbol this bot's OWN trade log has ever bought shares of --
+    used to scope the hard capital/position caps (Phase 3, Task 2) to this
+    bot's own activity on a shared Alpaca account, so a separate crypto or
+    ORB stock bot trading the same account never counts toward (or
+    silently satisfies) this bot's budget. Returns an empty set, not None,
+    when DATABASE_URL isn't configured or the query fails -- callers
+    scoping a cap by this set should already be failing closed on other
+    read errors around it, this just shouldn't be the thing that trips it.
+    """
+    if not DATABASE_URL:
+        return set()
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT symbol FROM share_trades WHERE side = 'BUY'")
+            return {row[0] for row in cur.fetchall()}
+    except Exception as e:
+        logger.error("get_own_symbols failed: %s", e)
+        return set()
+
+
+def get_expected_share_qty(symbol: str) -> int | None:
+    """
+    This bot's own best guess at how many shares of `symbol` it should
+    currently hold, computed purely from its own trade log: one
+    SHARES_PER_LOT per logged BUY, minus one SHARES_PER_LOT per logged
+    ASSIGNED (this bot never buys or sells a partial lot, and only ever
+    holds at most one lot per symbol at a time -- see main.py's state
+    machine). This is NOT authoritative -- the broker's live share count
+    always is -- it exists purely as an overlap-detection signal: if the
+    broker's count doesn't match this, something touched this symbol's
+    position that this bot's own log doesn't know about (another bot on
+    this shared account, a human, a bug). Returns None if DATABASE_URL
+    isn't configured or the query fails -- callers must treat that as
+    "can't verify," not as "0 expected."
+    """
+    if not DATABASE_URL:
+        return None
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM share_trades WHERE symbol = %s AND side = 'BUY'", (symbol,))
+            buys = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM option_trades WHERE symbol = %s AND action = 'ASSIGNED'", (symbol,))
+            assignments = cur.fetchone()[0]
+            return max(0, buys - assignments) * SHARES_PER_LOT
+    except Exception as e:
+        logger.error("get_expected_share_qty failed: %s", e)
         return None
 
 

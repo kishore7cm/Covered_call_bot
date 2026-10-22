@@ -46,7 +46,7 @@ def _patch_common(monkeypatch, **overrides):
     defaults = dict(
         get_share_position=lambda symbol: None,
         find_short_call=lambda symbol: None,
-        buy_shares=lambda symbol, qty: {
+        buy_shares=lambda symbol, qty, **k: {
             "order_id": "o-buy", "symbol": symbol, "qty": qty, "price": 100.0, "submitted": True,
         },
         sell_to_open_call=lambda occ, qty=1: {
@@ -92,7 +92,7 @@ def test_never_held_buys_fresh_lot(monkeypatch):
 
 
 def test_buy_shares_blocked_is_not_logged_as_real_trade(monkeypatch):
-    logged = _patch_common(monkeypatch, buy_shares=lambda symbol, qty: {
+    logged = _patch_common(monkeypatch, buy_shares=lambda symbol, qty, **k: {
         "order_id": "NOT_SUBMITTED-x", "submitted": False, "block_reason": "dry_run",
         "symbol": symbol, "qty": qty, "price": None,
     })
@@ -103,7 +103,7 @@ def test_buy_shares_blocked_is_not_logged_as_real_trade(monkeypatch):
 
 
 def test_buy_shares_real_failure_logs_error_and_fails(monkeypatch):
-    logged = _patch_common(monkeypatch, buy_shares=lambda symbol, qty: None)
+    logged = _patch_common(monkeypatch, buy_shares=lambda symbol, qty, **k: None)
     result = main.run_symbol_cycle("AAPL")
     assert "FAILED" in result
     assert len(logged["errors"]) == 1
@@ -171,6 +171,78 @@ def test_assignment_activities_lookup_failure_fails_closed(monkeypatch):
 
     assert "SKIPPED" in result
     assert logged["option_trades"] == []
+
+
+# ── Overlap detection (Task 2) ───────────────────────────────────────────────
+
+def test_other_bots_symbol_is_skipped_before_any_broker_read(monkeypatch):
+    share_pos_calls = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: share_pos_calls.append(symbol),
+    )
+    monkeypatch.setattr(main, "OTHER_BOTS_SYMBOLS", ["AAPL"])
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" in result
+    assert "overlap" in result.lower()
+    assert share_pos_calls == []  # never even looked at broker state
+    assert len(logged["errors"]) == 1
+
+
+def test_share_count_mismatch_skips_when_shares_held(monkeypatch):
+    """Broker shows a full lot, but this bot's own trade log only expects
+    0 (never bought it) -- e.g. another bot on the shared account bought
+    AAPL independently. Must skip rather than manage a position this bot
+    never opened."""
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "get_expected_share_qty", lambda symbol: 0)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" in result
+    assert "overlap" in result.lower()
+    assert len(logged["errors"]) == 1
+
+
+def test_share_count_match_proceeds_normally(monkeypatch):
+    """A matching expected count must not block anything -- this is the
+    overwhelmingly common case (this bot bought the shares it's holding)."""
+    candidate_patch_applied = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "get_expected_share_qty", lambda symbol: SHARES_PER_LOT)
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: None)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" not in result
+    assert logged["errors"] == []
+
+
+def test_share_count_mismatch_not_checked_at_zero_shares(monkeypatch):
+    """At share_qty == 0, the mismatch check must stay out of the way --
+    the activity-confirmed-assignment logic above it already owns that
+    transition with a more precise signal, and checking here too would
+    misfire against a legitimate assignment the log hasn't caught up to
+    yet within this same call."""
+    expected_qty_calls = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: None,  # share_qty == 0
+    )
+    monkeypatch.setattr(main, "get_expected_share_qty", lambda symbol: expected_qty_calls.append(symbol))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert expected_qty_calls == []
+    assert result == f"AAPL: bought {SHARES_PER_LOT} shares"
 
 
 # ── State 2: shares held, no call ────────────────────────────────────────────

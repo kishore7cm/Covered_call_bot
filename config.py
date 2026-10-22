@@ -41,6 +41,39 @@ DRY_RUN = os.getenv("DRY_RUN", "true").lower() not in ("false", "0", "no")
 KILL_SWITCH_ENABLED = os.getenv("KILL_SWITCH_ENABLED", "false").lower() in ("true", "1", "yes")
 KILL_SWITCH_PATH = "pipeline_state/kill_switch"
 
+# ── Hard limits (Phase 3, Task 2) ─────────────────────────────────────────────
+# Checked by trader.py's guard, but ONLY for buy_shares (the one action that
+# deploys new capital / opens a new symbol position) -- selling, closing, or
+# rolling an existing call doesn't commit new capital. This Alpaca account is
+# shared with separate crypto and ORB stock bots, and get_all_positions()
+# returns everyone's positions -- these caps are scoped to symbols THIS bot's
+# own trade log has actually bought (logger.get_own_symbols()), so the other
+# bots' activity never trips (or silently satisfies) this bot's own budget.
+MAX_CAPITAL_PER_SYMBOL = float(os.getenv("MAX_CAPITAL_PER_SYMBOL", "4000"))   # tracks SIZER_BUDGET * SIZER_MAX_WEIGHT_PER_NAME
+MAX_TOTAL_CAPITAL = float(os.getenv("MAX_TOTAL_CAPITAL", "20000"))            # tracks SIZER_BUDGET
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "10"))
+# Applies to every order this bot submits (buy/sell/close/roll), not just
+# buy_shares -- a runaway loop submitting far more orders than one weekly
+# cycle should ever need is itself worth tripping a breaker over. Reset once
+# per cycle by main.run_cycle(), not per symbol.
+MAX_ORDERS_PER_CYCLE = int(os.getenv("MAX_ORDERS_PER_CYCLE", "20"))
+
+# Symbols known to be traded by the OTHER bots on this shared account. If a
+# watchlist symbol appears here, this bot skips it entirely every cycle --
+# there's no way to safely disambiguate whose position is whose. Fill in by
+# hand; this can't be inferred automatically.
+OTHER_BOTS_SYMBOLS: list[str] = [
+    # "MSTR", "RIOT",
+]
+
+# Account-level backstop, separate from MAX_TOTAL_CAPITAL above -- reads the
+# WHOLE account's buying power regardless of which bot is using it. Below
+# this floor, this bot opens no NEW positions (managing existing ones is
+# still allowed). Deliberately a different block reason ("account_level_
+# limit") from the per-bot caps so a block is never misread as "this bot's
+# own budget is full" when it's actually "the shared account is low."
+MIN_ACCOUNT_BUYING_POWER = float(os.getenv("MIN_ACCOUNT_BUYING_POWER", "1000"))
+
 # ── Watchlist ─────────────────────────────────────────────────────────────────
 # Small fixed list of symbols you're comfortable holding 100-share lots of
 # long-term (assignment is a normal outcome, not a failure). Fill this in.

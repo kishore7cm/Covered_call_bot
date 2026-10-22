@@ -32,8 +32,11 @@ from alpaca.trading.requests import MarketOrderRequest
 
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, DRY_RUN, KILL_SWITCH_ENABLED,
-    KILL_SWITCH_PATH, PAPER, SHARES_PER_LOT,
+    KILL_SWITCH_PATH, MAX_CAPITAL_PER_SYMBOL, MAX_CONCURRENT_POSITIONS,
+    MAX_ORDERS_PER_CYCLE, MAX_TOTAL_CAPITAL, MIN_ACCOUNT_BUYING_POWER,
+    PAPER, SHARES_PER_LOT,
 )
+from logger import get_own_symbols
 
 _log = logging.getLogger(__name__)
 
@@ -46,17 +49,108 @@ def _kill_switch_engaged() -> bool:
     return KILL_SWITCH_ENABLED or os.path.exists(KILL_SWITCH_PATH)
 
 
-def _guard(description: str) -> str | None:
+# MAX_ORDERS_PER_CYCLE is a per-CYCLE cap, not a lifetime one -- main.py's
+# run_cycle() calls reset_cycle_order_count() exactly once, before iterating
+# symbols. Module-level (not passed around) because every order-placing
+# function in this module needs to see the same running count regardless
+# of which symbol it's handling.
+_orders_this_cycle = 0
+
+
+def reset_cycle_order_count() -> None:
+    global _orders_this_cycle
+    _orders_this_cycle = 0
+
+
+def _check_hard_limits(symbol: str | None, estimated_dollars: float | None, opens_new_position: bool) -> str | None:
+    """
+    Second gate, checked after the kill switch and before DRY_RUN (see
+    _guard). MAX_ORDERS_PER_CYCLE applies to every order unconditionally;
+    the capital/position caps only matter for opens_new_position=True
+    (currently just buy_shares -- selling, closing, or rolling an existing
+    call doesn't deploy new capital or open a new symbol position).
+
+    The capital/position caps read live broker state (get_all_positions,
+    get_account) rather than trusting any cached/local number, consistent
+    with the rest of this module -- and they're scoped to
+    logger.get_own_symbols() because this Alpaca account is shared with
+    separate crypto and ORB stock bots. Any broker read failure here fails
+    closed (blocks) rather than silently proceeding as if nothing were
+    deployed.
+    """
+    global _orders_this_cycle
+    _orders_this_cycle += 1
+    if _orders_this_cycle > MAX_ORDERS_PER_CYCLE:
+        _log.warning("MAX_ORDERS_PER_CYCLE (%s) exceeded this cycle", MAX_ORDERS_PER_CYCLE)
+        return "max_orders_per_cycle"
+
+    if not opens_new_position:
+        return None
+
+    if symbol is None or estimated_dollars is None:
+        _log.warning("Cannot verify capital caps for %s — missing a price estimate, failing closed", symbol)
+        return "cap_check_unavailable"
+
+    try:
+        account = _client.get_account()
+        positions = _client.get_all_positions()
+    except APIError as e:
+        _log.error("_check_hard_limits: broker read failed: %s — failing closed", e)
+        return "cap_check_unavailable"
+
+    if float(account.buying_power) < MIN_ACCOUNT_BUYING_POWER:
+        _log.warning(
+            "Account buying power $%.2f is below MIN_ACCOUNT_BUYING_POWER $%.2f — blocking new positions "
+            "(account-level limit, not this bot's own budget)",
+            float(account.buying_power), MIN_ACCOUNT_BUYING_POWER,
+        )
+        return "account_level_limit"
+
+    own_symbols = get_own_symbols()
+    own_equity_positions = [
+        p for p in positions if p.asset_class == AssetClass.US_EQUITY and p.symbol in own_symbols
+    ]
+    current_symbol_dollars = sum(abs(float(p.market_value)) for p in own_equity_positions if p.symbol == symbol)
+    current_total_dollars = sum(abs(float(p.market_value)) for p in own_equity_positions)
+    distinct_symbols = {p.symbol for p in own_equity_positions}
+
+    if current_symbol_dollars + estimated_dollars > MAX_CAPITAL_PER_SYMBOL:
+        _log.warning("%s: MAX_CAPITAL_PER_SYMBOL ($%s) would be exceeded", symbol, MAX_CAPITAL_PER_SYMBOL)
+        return "max_capital_per_symbol"
+    if current_total_dollars + estimated_dollars > MAX_TOTAL_CAPITAL:
+        _log.warning("%s: MAX_TOTAL_CAPITAL ($%s) would be exceeded", symbol, MAX_TOTAL_CAPITAL)
+        return "max_total_capital"
+    if symbol not in distinct_symbols and len(distinct_symbols) + 1 > MAX_CONCURRENT_POSITIONS:
+        _log.warning("%s: MAX_CONCURRENT_POSITIONS (%s) would be exceeded", symbol, MAX_CONCURRENT_POSITIONS)
+        return "max_concurrent_positions"
+
+    return None
+
+
+def _guard(description: str, symbol: str | None = None, estimated_dollars: float | None = None,
+           opens_new_position: bool = False) -> str | None:
     """
     Single pre-submission gate. Returns None if a real submission should
-    proceed, or a short reason string ("kill_switch" / "dry_run") if it
-    must be blocked instead. Checked before EVERY order, not cached or
-    checked once per cycle — the kill switch file can appear mid-cycle,
-    and each order must see current state at the moment it's about to fire.
+    proceed, or a short reason string if it must be blocked instead.
+    Checked before EVERY order, not cached or checked once per cycle — the
+    kill switch file can appear mid-cycle, and each order must see current
+    state at the moment it's about to fire.
+
+    Order of checks matters: kill switch first (full stop, highest
+    priority), then the hard caps (structural safety rails that should be
+    visible in the logs even while DRY_RUN is True, so they can be
+    validated before DRY_RUN is ever turned off), then DRY_RUN last (the
+    default-safe, "softest" reason).
     """
     if _kill_switch_engaged():
         _log.warning("KILL SWITCH ENGAGED — blocking order: %s", description)
         return "kill_switch"
+
+    cap_reason = _check_hard_limits(symbol, estimated_dollars, opens_new_position)
+    if cap_reason:
+        _log.warning("BLOCKED by hard limit (%s): %s", cap_reason, description)
+        return cap_reason
+
     if DRY_RUN:
         _log.info("DRY RUN — would submit: %s", description)
         return "dry_run"
@@ -209,8 +303,19 @@ def _poll_fill_price(order_id) -> float | None:
     return None
 
 
-def buy_shares(symbol: str, qty: int = SHARES_PER_LOT) -> dict | None:
-    block_reason = _guard(f"BUY {qty} {symbol}")
+def buy_shares(symbol: str, qty: int = SHARES_PER_LOT, estimated_price: float | None = None) -> dict | None:
+    """
+    estimated_price is required for the hard capital caps (Task 2) to be
+    enforceable at all -- a market buy's true fill price isn't known until
+    after submission, so the caller must supply a current quote/trade
+    price estimate. Omitting it doesn't skip the caps, it fails them
+    closed (see _check_hard_limits): "can't verify the cap" blocks the
+    same as "cap exceeded" would, it never defaults to "assume it's fine."
+    """
+    estimated_dollars = qty * estimated_price if estimated_price is not None else None
+    block_reason = _guard(
+        f"BUY {qty} {symbol}", symbol=symbol, estimated_dollars=estimated_dollars, opens_new_position=True,
+    )
     if block_reason:
         return _not_submitted(block_reason, symbol=symbol, qty=qty, price=None)
 

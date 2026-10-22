@@ -24,13 +24,14 @@ from config import (
     WATCHLIST, SHARES_PER_LOT, TARGET_DELTA,
     PROFIT_TAKE_PCT, ROLL_TRIGGER_DELTA, ROLL_MIN_DTE, RISK_FREE_RATE,
     CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET, MIN_IV_HISTORY_POINTS,
-    DTE_MIN, DTE_MAX,
+    DTE_MIN, DTE_MAX, OTHER_BOTS_SYMBOLS,
 )
 from greeks import delta_from_quote
 from iv_rank import iv_rank, iv_percentile
 from logger import (
     init_schema, log_option_trade, log_share_trade, log_error,
     record_iv_snapshot, get_iv_history, get_last_open_occ_symbol,
+    get_expected_share_qty,
 )
 from options_data import pick_strike, get_chain_snapshot, parse_occ_symbol, get_atm_iv
 
@@ -146,10 +147,37 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
     backtest.py -> apply_watchlist.py); None means the pipeline hasn't been
     run for this symbol yet and the global DTE_MIN/DTE_MAX window is used.
     """
+    if symbol in OTHER_BOTS_SYMBOLS:
+        msg = f"{symbol}: listed in OTHER_BOTS_SYMBOLS (used by another bot on this shared Alpaca account)"
+        log_error("main.run_symbol_cycle", msg)
+        _run_async(notifier.send_error(symbol, msg))
+        return f"{symbol}: SKIPPED — symbol overlap with another bot"
+
     dte_min, dte_max = _dte_window(recommended_dte)
 
     share_pos = trader.get_share_position(symbol)
     share_qty = int(float(share_pos.qty)) if share_pos else 0
+
+    # A nonzero broker share count that doesn't match what this bot's OWN
+    # trade log expects (see logger.get_expected_share_qty) means some
+    # other actor touched this symbol's position -- most plausibly another
+    # bot on this shared account also trading it, but could be a human or
+    # a bug. Deliberately only checked when share_qty > 0: at exactly 0,
+    # the assignment-confirmation logic in State 1 below already owns that
+    # transition with a more precise signal (the broker's own OPASN
+    # record), and running this check first there would misfire against a
+    # legitimate assignment the log hasn't caught up to yet within this
+    # same call.
+    if share_qty > 0:
+        expected_qty = get_expected_share_qty(symbol)
+        if expected_qty is not None and share_qty != expected_qty:
+            msg = (
+                f"{symbol}: broker share qty ({share_qty}) doesn't match what this bot's own trade "
+                f"log expects ({expected_qty}) — possible overlap with another bot or manual action"
+            )
+            log_error("main.run_symbol_cycle", msg)
+            _run_async(notifier.send_error(symbol, msg))
+            return f"{symbol}: SKIPPED — symbol overlap, share count mismatch"
 
     short_call = trader.find_short_call(symbol)
 
@@ -202,7 +230,17 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
             )
             _run_async(notifier.send_call_closed(symbol, last_occ_symbol, "assigned", 0.0))
 
-        result = trader.buy_shares(symbol, SHARES_PER_LOT)
+        # A price estimate is required for the hard capital caps (Task 2)
+        # to be enforceable at all -- buy_shares fails that check closed,
+        # not open, when it's missing, so this must not be skipped even
+        # though the old code never needed a price before submitting a
+        # blind market order.
+        spot = _get_spot_price(symbol)
+        if spot is None:
+            log_error("main.run_symbol_cycle", f"{symbol}: no spot price available, can't verify capital caps")
+            return f"{symbol}: FAILED to get spot price"
+
+        result = trader.buy_shares(symbol, SHARES_PER_LOT, estimated_price=spot)
         status = _order_status(result)
         if status == "failed":
             log_error("main.run_symbol_cycle", f"{symbol}: buy_shares failed")
@@ -351,6 +389,10 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
 def run_cycle() -> None:
     logger.info("=" * 60)
     logger.info("CYCLE START")
+    # MAX_ORDERS_PER_CYCLE is a per-cycle cap -- reset once here, not once
+    # per symbol, so it actually limits a cycle's total order volume
+    # rather than resetting away on the very next symbol.
+    trader.reset_cycle_order_count()
     # Loaded fresh every cycle (not cached at module scope) so an
     # apply_watchlist.py --confirm run takes effect on the very next
     # scheduled cycle without needing a restart.
