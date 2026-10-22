@@ -406,6 +406,73 @@ def test_clock_read_failure_fails_closed(monkeypatch):
     assert result["block_reason"] == "market_hours_check_unavailable"
 
 
+def test_early_close_day_uses_real_next_close_not_a_hardcoded_4pm(monkeypatch):
+    """
+    Live-verified against Alpaca's own get_calendar: the day after
+    Thanksgiving 2026-11-27 is a real early-close day, open 9:30 ET,
+    close 13:00 ET (confirmed via a real, read-only get_calendar call --
+    not simulated). get_clock()'s next_close reflects this automatically
+    on a real early-close day, and _market_hours_block relies entirely on
+    that field for the close-side buffer -- this confirms the code
+    actually honors whatever next_close says rather than assuming a
+    fixed 16:00 close.
+    """
+    # 12:50 ET on the early-close day -- 10 min before the REAL 13:00
+    # close, which is inside the 15-min close buffer. A hardcoded 16:00
+    # assumption would wrongly see this as "3h10m to close" and let the
+    # order through.
+    now = datetime(2026, 11, 27, 12, 50, tzinfo=timezone.utc)
+    early_close = datetime(2026, 11, 27, 13, 0, tzinfo=timezone.utc)
+    fake = FakeBroker(clock=FakeClock(timestamp=now, next_close=early_close))
+    monkeypatch.setattr(trader, "_client", fake)
+    monkeypatch.setattr(trader, "MARKET_CLOSE_BUFFER_MINUTES", 15)
+    _unblocked(monkeypatch)
+
+    result = trader.sell_to_open_call("AAPL261113C00200000", qty=1)
+
+    assert fake.submitted_orders == []
+    assert result["block_reason"] == "market_close_buffer"
+
+
+def test_early_close_day_still_allows_orders_well_before_the_early_close(monkeypatch):
+    """Same early-close day, but at 11:00 ET -- 2h before the 13:00
+    close, clear of the buffer -- must still proceed normally."""
+    now = datetime(2026, 11, 27, 11, 0, tzinfo=timezone.utc)
+    early_close = datetime(2026, 11, 27, 13, 0, tzinfo=timezone.utc)
+    fake = FakeBroker(clock=FakeClock(timestamp=now, next_close=early_close))
+    monkeypatch.setattr(trader, "_client", fake)
+    monkeypatch.setattr(trader, "MARKET_CLOSE_BUFFER_MINUTES", 15)
+    _unblocked(monkeypatch)
+
+    result = trader.sell_to_open_call("AAPL261113C00200000", qty=1)
+
+    assert len(fake.submitted_orders) == 1
+    assert result["submitted"] is True
+
+
+def test_holiday_blocks_via_is_open_regardless_of_other_clock_fields(monkeypatch):
+    """
+    Live-verified: Thanksgiving 2026-11-26 is absent from Alpaca's
+    get_calendar entirely (a full holiday, no session at all) -- real
+    get_clock() on that date reports is_open=False all day. The gate must
+    block purely on is_open, without needing next_open/next_close to be
+    sane -- confirmed here by deliberately giving them nonsensical values.
+    """
+    holiday_clock = FakeClock(
+        is_open=False,
+        timestamp=datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc),
+        next_close=datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc),  # nonsensical: "closing" right now
+    )
+    fake = FakeBroker(clock=holiday_clock)
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked(monkeypatch)
+
+    result = trader.sell_to_open_call("AAPL261113C00200000", qty=1)
+
+    assert fake.submitted_orders == []
+    assert result["block_reason"] == "market_closed"
+
+
 # ── Open-orders check (Task 4) ────────────────────────────────────────────────
 
 def test_existing_open_order_blocks_a_duplicate_submit(monkeypatch):
