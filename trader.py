@@ -775,7 +775,19 @@ def roll_call(symbol: str, old_occ_symbol: str, new_occ_symbol: str, qty: int = 
     attempts, and if all of them fail to go through for real, this marks
     the symbol needs-attention (trader.mark_needs_attention) and alerts
     loudly rather than leaving a silent, un-flagged uncovered position.
+
+    qty must be exactly 1: this bot only ever holds one option contract
+    per lot (SHARES_PER_LOT shares), and roll_call's own close-leg-cannot-
+    partially-fill guarantee (see _walk_limit_order's docstring) depends
+    on that being true -- a caller passing anything else is a programming
+    bug, not a market condition, so this fails loudly (raises) rather
+    than silently proceeding against an assumption that no longer holds.
     """
+    if qty != 1:
+        raise ValueError(f"roll_call({symbol}): qty must be 1, got {qty} -- this bot only ever "
+                          "holds one contract per lot, and roll_call's close-leg safety guarantee "
+                          "depends on that invariant")
+
     rolls_so_far = get_rolls_since_last_lot_open(symbol)
     if rolls_so_far is None:
         _log.error("roll_call: could not verify the roll cap for %s — failing closed, not rolling", symbol)

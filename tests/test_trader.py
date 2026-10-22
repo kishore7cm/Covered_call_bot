@@ -332,6 +332,16 @@ def test_dry_run_blocks_roll_call_both_legs(monkeypatch):
     assert result["opened"]["block_reason"] == "dry_run"
 
 
+def test_roll_call_rejects_qty_other_than_one():
+    """This bot only ever holds one contract per lot -- roll_call's own
+    close-leg-cannot-partially-fill guarantee depends on that, so a
+    caller passing anything else is a programming bug and must fail
+    loudly (raise), not silently proceed. Deliberately no broker/quote
+    setup here -- the check must happen before any of that is touched."""
+    with pytest.raises(ValueError, match="qty must be 1"):
+        trader.roll_call("AAPL", "AAPL261113C00200000", "AAPL261120C00205000", qty=2)
+
+
 def test_kill_switch_config_flag_blocks_even_with_dry_run_off(monkeypatch):
     fake = FakeBroker()
     monkeypatch.setattr(trader, "_client", fake)
