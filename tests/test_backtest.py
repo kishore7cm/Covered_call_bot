@@ -471,6 +471,14 @@ def test_delta_buckets_for_hold_and_exit_do_not_overlap():
     assert max(hold_buckets) < min(exit_buckets)
 
 
+def test_delta_buckets_for_intent_raises_on_unrecognized_intent():
+    """No silent fallback to DEFAULT_INTENT's band -- an invalid intent is
+    a caller bug (it should have been caught by _resolve_intent already)
+    and must surface loudly, not get quietly papered over."""
+    with pytest.raises(ValueError, match="unrecognized intent"):
+        backtest._delta_buckets_for_intent("sell_everything")
+
+
 # ── Shrinkage: split consensus per intent group ──────────────────────────────
 
 def test_shrinkage_computes_separate_consensus_per_intent_group():

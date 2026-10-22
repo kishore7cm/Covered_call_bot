@@ -284,9 +284,22 @@ def _resolve_intent(symbol: str, explicit_intents: dict[str, str]) -> tuple[str,
 
 
 def _delta_buckets_for_intent(intent: str) -> tuple[float, ...]:
-    """INTENT_BAND_SWEEP_POINTS evenly-spaced delta points spanning that
-    intent's band (inclusive of both ends)."""
-    lo, hi = INTENT_DELTA_BANDS.get(intent, INTENT_DELTA_BANDS[DEFAULT_INTENT])
+    """
+    INTENT_BAND_SWEEP_POINTS evenly-spaced delta points spanning that
+    intent's band (inclusive of both ends). Callers must pass an already-
+    validated intent (see _resolve_intent, the only intended caller path)
+    -- this deliberately has NO silent fallback for an unrecognized value.
+    A prior version fell back to DEFAULT_INTENT's band unlogged, which
+    would silently paper over a caller bug (e.g. something bypassing
+    _resolve_intent's validation) rather than surfacing it.
+    """
+    if intent not in INTENT_DELTA_BANDS:
+        raise ValueError(
+            f"_delta_buckets_for_intent: unrecognized intent {intent!r} "
+            f"(valid: {sorted(INTENT_DELTA_BANDS)}) -- callers must resolve/validate intent "
+            f"via _resolve_intent before calling this, not pass raw/unvalidated values"
+        )
+    lo, hi = INTENT_DELTA_BANDS[intent]
     if INTENT_BAND_SWEEP_POINTS <= 1:
         return (round((lo + hi) / 2.0, 4),)
     step = (hi - lo) / (INTENT_BAND_SWEEP_POINTS - 1)
@@ -1063,11 +1076,12 @@ if __name__ == "__main__":
                 f"IS yield={stats.in_sample_yield * 100:.1f}% OOS yield={oos_str} (gap={gap_str})"
             )
             turnover_str = f" turnover_score={stats.turnover_score:.4f}" if stats.turnover_score is not None else ""
+            score_used_str = stats.score_used if stats.score_used is not None else "n/a"
             print(
                 f"    total_return={stats.total_return_pct * 100:.1f}% "
                 f"max_drawdown={stats.max_drawdown_pct * 100:.1f}% "
                 f"risk_adjusted={stats.risk_adjusted_return:.2f}{turnover_str} "
-                f"(score used: {stats.score_used}) | "
+                f"(score used: {score_used_str}) | "
                 f"spread={stats.spread_pct_used * 100:.1f}% (source: {stats.spread_source})"
             )
             oos_return_str = f"{stats.oos_total_return_pct * 100:.1f}%" if stats.oos_total_return_pct is not None else "n/a"

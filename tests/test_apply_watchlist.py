@@ -1,4 +1,5 @@
 import json
+from datetime import date, timedelta
 
 import apply_watchlist as aw
 
@@ -272,3 +273,145 @@ def test_confirm_writes_active_file_matching_proposed(tmp_path):
     assert "Applied" in result.stdout
     assert active_path.exists()
     assert json.loads(active_path.read_text()) == json.loads(proposed_path.read_text())
+
+
+# ── _empirical_summary: missing sibling fields show "n/a", never 0.0% ───────
+
+def test_empirical_summary_all_fields_present():
+    stats = {
+        "p_called_away": 0.3, "p_expires_below_strike": 0.7, "p_small_move": 0.5,
+        "median_move_pct": 0.01, "move_threshold_pct_used": 0.05,
+        "empirical_window_count": 100, "empirical_effective_n": 20,
+    }
+    summary = aw._empirical_summary(stats, "empirical (train)")
+    assert "P(called away)=30.0%" in summary
+    assert "P(expires below strike)=70.0%" in summary
+    assert "median move=+1.0%" in summary
+    assert "n=100 windows, effective_n=20" in summary
+    assert "=0.0%" not in summary  # nothing here should look like a measured zero
+
+
+def test_empirical_summary_missing_sibling_shows_na_not_zero():
+    """p_called_away present, but a sibling field is missing (shouldn't
+    normally happen since backtest_dte sets them as one atomic group, but
+    this must never silently render as a measured 0.0%)."""
+    stats = {"p_called_away": 0.4, "move_threshold_pct_used": 0.05}
+    summary = aw._empirical_summary(stats, "empirical (train)")
+    assert "P(called away)=40.0%" in summary
+    assert "P(expires below strike)=n/a" in summary
+    assert "P(|move|<5%)=n/a" in summary
+    assert "median move=n/a" in summary
+    assert "n=n/a windows, effective_n=n/a" in summary
+    assert "=0.0%" not in summary
+
+
+def test_empirical_summary_empty_when_p_called_away_missing():
+    assert aw._empirical_summary({}, "empirical (train)") == ""
+
+
+# ── _load_earnings_by_symbol / _earnings_warning ─────────────────────────────
+
+def _screened(results):
+    return {"generated_at": "2026-10-21", "results": results}
+
+
+def test_load_earnings_by_symbol_parses_known_dates():
+    screened = _screened([
+        {"symbol": "AAPL", "earnings_date": "2026-11-05"},
+        {"symbol": "MSFT", "earnings_date": None},
+        {"symbol": "KO"},  # no earnings_date key at all
+    ])
+    result = aw._load_earnings_by_symbol(screened)
+    assert result == {"AAPL": date(2026, 11, 5)}
+
+
+def test_load_earnings_by_symbol_skips_malformed_date(caplog):
+    screened = _screened([{"symbol": "AAPL", "earnings_date": "not-a-date"}])
+    assert aw._load_earnings_by_symbol(screened) == {}
+
+
+def test_load_earnings_by_symbol_missing_results_key_returns_empty():
+    assert aw._load_earnings_by_symbol({}) == {}
+
+
+def test_earnings_warning_fires_when_inside_implied_window():
+    earnings_date = date.today() + timedelta(days=10)
+    warning = aw._earnings_warning("AAPL", proposed_dte=14, earnings_by_symbol={"AAPL": earnings_date})
+    assert "earnings on" in warning
+    assert earnings_date.isoformat() in warning
+
+
+def test_earnings_warning_empty_when_outside_implied_window():
+    earnings_date = date.today() + timedelta(days=30)
+    warning = aw._earnings_warning("AAPL", proposed_dte=14, earnings_by_symbol={"AAPL": earnings_date})
+    assert warning == ""
+
+
+def test_earnings_warning_empty_when_no_known_earnings_date():
+    assert aw._earnings_warning("AAPL", proposed_dte=14, earnings_by_symbol={}) == ""
+
+
+def test_earnings_warning_boundary_exactly_at_implied_expiration():
+    earnings_date = date.today() + timedelta(days=14)
+    warning = aw._earnings_warning("AAPL", proposed_dte=14, earnings_by_symbol={"AAPL": earnings_date})
+    assert warning != ""  # inclusive of the implied expiration date itself
+
+
+def test_earnings_warning_empty_when_earnings_is_today():
+    warning = aw._earnings_warning("AAPL", proposed_dte=14, earnings_by_symbol={"AAPL": date.today()})
+    assert warning == ""  # strictly AFTER today, not today itself
+
+
+# ── _diff() wires the earnings warning into ADD/CHANGE, not REMOVE ──────────
+
+def test_diff_add_shows_earnings_warning(capsys):
+    earnings_date = date.today() + timedelta(days=5)
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed, earnings_by_symbol={"AAPL": earnings_date})
+    out = capsys.readouterr().out
+    assert "earnings on" in out
+    assert earnings_date.isoformat() in out
+
+
+def test_diff_add_no_earnings_warning_when_outside_window(capsys):
+    earnings_date = date.today() + timedelta(days=90)
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed, earnings_by_symbol={"AAPL": earnings_date})
+    out = capsys.readouterr().out
+    assert "earnings on" not in out
+
+
+def test_diff_change_uses_proposed_dte_for_earnings_check(capsys):
+    # Active's old DTE (60) would put earnings outside the window; the
+    # PROPOSED dte (14) is what must actually be used for the check.
+    earnings_date = date.today() + timedelta(days=10)
+    active = _watchlist({"AAPL": {"dte": 60, "avg_annualized_yield": 0.10}})
+    proposed = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed, earnings_by_symbol={"AAPL": earnings_date})
+    out = capsys.readouterr().out
+    assert "earnings on" in out
+
+
+def test_diff_remove_never_shows_earnings_warning(capsys):
+    # No new position is being opened on a REMOVE -- the warning must not
+    # appear there even if earnings_by_symbol has an entry for it.
+    earnings_date = date.today() + timedelta(days=5)
+    active = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    proposed = _watchlist({})
+    aw._diff(active, proposed, earnings_by_symbol={"AAPL": earnings_date})
+    out = capsys.readouterr().out
+    assert "REMOVE:" in out
+    assert "earnings on" not in out
+
+
+def test_diff_without_earnings_by_symbol_arg_is_backward_compatible(capsys):
+    """_diff() must still work when called the old way (no third arg) --
+    existing callers/tests from before this fix shouldn't break."""
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": 14, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed)  # no earnings_by_symbol at all
+    out = capsys.readouterr().out
+    assert "+ AAPL" in out
+    assert "earnings on" not in out
