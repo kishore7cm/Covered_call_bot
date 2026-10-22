@@ -516,6 +516,33 @@ def test_inconsistent_cost_basis_fails_closed_no_profit_take(monkeypatch):
     assert len(logged["errors"]) == 1
 
 
+def test_profit_captured_pct_logs_raw_cost_basis_and_market_value(monkeypatch, caplog):
+    """The account has never held a real option position before -- the
+    FIRST real short call this bot opens is the first chance to confirm
+    Alpaca's cost_basis/market_value sign convention against the
+    dashboard, so the raw signed fields must be logged alongside the
+    computed percentage every cycle this computes cleanly, not just on
+    the inconsistent-data error path."""
+    occ = _far_occ_symbol("AAPL")
+    short_call = FakeShortCallPosition(symbol=occ, cost_basis="-250.0", market_value="-100.0")
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+        find_short_call=lambda symbol: short_call,
+    )
+
+    with caplog.at_level("INFO"):
+        main.run_symbol_cycle("AAPL")
+
+    messages = [r.message for r in caplog.records]
+    matching = [m for m in messages if "profit_captured_pct" in m]
+    assert len(matching) == 1
+    assert "cost_basis='-250.0'" in matching[0]
+    assert "market_value='-100.0'" in matching[0]
+    assert "entry_credit=$2.50" in matching[0]
+    assert "current_value=$1.00" in matching[0]
+
+
 def test_roll_triggered_by_low_dte_and_succeeds(monkeypatch):
     old_occ = _far_occ_symbol("AAPL", dte=3)  # inside ROLL_MIN_DTE
     new_candidate = FakeCandidate(_far_occ_symbol("AAPL", dte=35), 200.0, date.today() + timedelta(days=35), 2.5, 0.25)

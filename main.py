@@ -589,6 +589,20 @@ def run_symbol_cycle(
         )
     else:
         profit_captured_pct = (entry_credit - current_value) / entry_credit
+        # Logged every cycle this computes cleanly, not just on the
+        # inconsistent-data path above -- the account has never held a
+        # real option position before, so the FIRST real short call this
+        # bot opens is the first chance to confirm Alpaca's sign
+        # convention for cost_basis/market_value against the dashboard
+        # (see this block's opening comment). Raw signed fields alongside
+        # the computed percentage, so that comparison doesn't require a
+        # second live query.
+        logger.info(
+            "%s: %s profit_captured_pct=%.2f%% | entry_credit=$%.2f current_value=$%.2f | "
+            "raw cost_basis=%r market_value=%r",
+            symbol, occ_symbol, profit_captured_pct * 100, entry_credit, current_value,
+            short_call.cost_basis, short_call.market_value,
+        )
 
     if profit_captured_pct is not None and profit_captured_pct >= PROFIT_TAKE_PCT:
         result = trader.buy_to_close_call(occ_symbol, qty=1)
