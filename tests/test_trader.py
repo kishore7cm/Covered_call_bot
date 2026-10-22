@@ -15,10 +15,22 @@ import trader
 
 
 class FakeOrder:
-    def __init__(self, order_id="fake-order-1", filled_avg_price=100.0, limit_price=None):
+    def __init__(self, order_id="fake-order-1", qty="100", status=None,
+                 filled_qty=None, filled_avg_price=100.0, limit_price=None):
         self.id = order_id
-        self.filled_avg_price = filled_avg_price
+        self.qty = qty
         self.limit_price = limit_price
+        # Defaults derived from filled_avg_price so every pre-existing
+        # caller of FakeOrder() (there were many, from before status/
+        # filled_qty existed) keeps behaving exactly as before: a price
+        # means "fully filled," no price means "not filled at all."
+        if status is None:
+            status = trader.OrderStatus.FILLED if filled_avg_price is not None else trader.OrderStatus.NEW
+        self.status = status
+        if filled_qty is None:
+            filled_qty = qty if status == trader.OrderStatus.FILLED else "0"
+        self.filled_qty = filled_qty
+        self.filled_avg_price = filled_avg_price
 
 
 class FakeAccount:
@@ -104,15 +116,25 @@ class FakeBroker:
     orders) so tests not specifically about one of these don't need to
     configure it.
 
-    submit_order "fills" immediately (fills on the very first poll) with
+    submit_order "fills" immediately (fully, status=FILLED) with
     filled_avg_price = the submitted limit_price, so a test that doesn't
     care about the walk still only sees exactly one submitted order --
     tests of the walk's retry-and-chase behavior override this via
-    fail_steps/never_fill.
+    fail_steps/never_fill. get_order_responses scripts exactly what each
+    SUCCESSIVE get_order_by_id call returns (for one order's lifecycle --
+    sufficient since these tests each only ever have one order in flight
+    at a time): each entry is a dict of FakeOrder kwargs (status required,
+    others optional), consumed one per call and clamped to the last entry
+    once exhausted. This is what lets a test script "not filled during
+    polling, THEN filled on the post-cancel re-fetch" deterministically --
+    paired with LIMIT_ORDER_STEP_PAUSE_SECONDS/_POLL_INTERVAL_SECONDS set
+    so exactly one get_order_by_id call happens per poll window (see
+    _unblocked_for_fill_script below).
     """
 
     def __init__(self, positions=None, buying_power="100000.0", open_orders=None,
-                 clock=None, fail_steps=0, never_fill=False):
+                 clock=None, fail_steps=0, never_fill=False,
+                 get_order_responses=None, cancel_raises=None):
         self.submitted_orders = []
         self.cancelled_order_ids = []
         self._orders_by_id = {}
@@ -122,23 +144,65 @@ class FakeBroker:
         self._clock = clock or FakeClock()
         self._fail_steps = fail_steps  # raise APIError on submit for this many calls, then succeed
         self._never_fill = never_fill
+        self._get_order_responses = list(get_order_responses) if get_order_responses is not None else None
+        self._get_order_call_count = 0
+        self._cancel_raises = cancel_raises
 
     def submit_order(self, request):
         if self._fail_steps > 0:
             self._fail_steps -= 1
             raise trader.APIError("submit failed")
         order_id = f"fake-order-{len(self.submitted_orders) + 1}"
-        filled_price = None if self._never_fill else getattr(request, "limit_price", None)
-        order = FakeOrder(order_id=order_id, filled_avg_price=filled_price, limit_price=getattr(request, "limit_price", None))
+        qty = str(request.qty)
+        limit_price = getattr(request, "limit_price", None)
+        if self._get_order_responses is not None:
+            order = FakeOrder(order_id=order_id, qty=qty, limit_price=limit_price, **self._get_order_responses[0])
+        elif self._never_fill:
+            order = FakeOrder(order_id=order_id, qty=qty, status=trader.OrderStatus.NEW,
+                               filled_qty="0", filled_avg_price=None, limit_price=limit_price)
+        else:
+            order = FakeOrder(order_id=order_id, qty=qty, status=trader.OrderStatus.FILLED,
+                              filled_qty=qty, filled_avg_price=limit_price, limit_price=limit_price)
         self.submitted_orders.append(request)
         self._orders_by_id[order_id] = order
         return order
 
     def get_order_by_id(self, order_id):
-        return self._orders_by_id.get(order_id, FakeOrder(order_id=order_id, filled_avg_price=None))
+        if self._get_order_responses is not None:
+            idx = min(self._get_order_call_count, len(self._get_order_responses) - 1)
+            self._get_order_call_count += 1
+            prior = self._orders_by_id.get(order_id)
+            qty = prior.qty if prior is not None else "0"
+            limit_price = prior.limit_price if prior is not None else None
+            order = FakeOrder(order_id=order_id, qty=qty, limit_price=limit_price, **self._get_order_responses[idx])
+            self._orders_by_id[order_id] = order
+            return order
+        return self._orders_by_id.get(
+            order_id, FakeOrder(order_id=order_id, qty="0", status=trader.OrderStatus.NEW,
+                                 filled_qty="0", filled_avg_price=None)
+        )
 
     def cancel_order_by_id(self, order_id):
         self.cancelled_order_ids.append(order_id)
+        if self._cancel_raises is not None:
+            raise self._cancel_raises
+        if self._get_order_responses is not None:
+            # Scripted tests: deliberately do NOT update state here --
+            # whatever the NEXT get_order_responses entry says is the
+            # single source of truth for what "really" happened,
+            # mirroring Alpaca's documented quirk where a cancel's own
+            # response can't be trusted and must be re-fetched to know.
+            return
+        # Unscripted (the common case): simulate a REAL, working cancel
+        # -- whatever was filled so far (0 for never_fill) stays filled,
+        # the order moves to CANCELED. Realistic default, and what the
+        # pre-existing walk/chase tests need: without this, _walk_limit_order's
+        # new post-cancel re-fetch would see a NEW order forever (this
+        # fake never changes it on its own) and correctly treat that as
+        # an unexplained, ambiguous state rather than a clean cancel.
+        order = self._orders_by_id.get(order_id)
+        if order is not None and order.status not in (trader.OrderStatus.FILLED,):
+            order.status = trader.OrderStatus.CANCELED
 
     def get_account(self):
         return self._account
@@ -202,6 +266,19 @@ def _unblocked(monkeypatch):
     assert not trader._kill_switch_engaged(), (
         "pipeline_state/kill_switch exists on disk -- remove it before running tests"
     )
+
+
+def _unblocked_for_fill_script(monkeypatch):
+    """
+    Same as _unblocked, plus timing set so _poll_until_filled's internal
+    loop calls get_order_by_id EXACTLY ONCE per step before its deadline
+    elapses (poll interval > step timeout) -- required for a FakeBroker
+    get_order_responses script to line up one scripted entry per call,
+    deterministically, instead of racing real wall-clock time.
+    """
+    _unblocked(monkeypatch)
+    monkeypatch.setattr(trader, "LIMIT_ORDER_STEP_PAUSE_SECONDS", 0.01)
+    monkeypatch.setattr(trader, "_POLL_INTERVAL_SECONDS", 0.2)
 
 
 def test_dry_run_blocks_buy_shares(monkeypatch):
@@ -630,6 +707,146 @@ def test_client_order_id_includes_prefix_and_step(monkeypatch):
     assert coid.startswith(trader.CLIENT_ORDER_ID_PREFIX)
     assert "AAPL261113C00200000" in coid
     assert coid.endswith("-s0")
+
+
+# ── Fill handling: partial fills, cancel-vs-fill race, unknown state ────────
+#
+# Each of these scripts get_order_by_id's successive responses via
+# FakeBroker(get_order_responses=[...]) -- entry 0 is what polling sees,
+# entry 1 is what the post-cancel re-fetch sees. _unblocked_for_fill_script
+# sets timing so polling calls get_order_by_id exactly once per step,
+# making this deterministic rather than racing real wall-clock time.
+
+def test_partial_fill_cancels_remainder_and_reports_actual_qty(monkeypatch):
+    fake = FakeBroker(get_order_responses=[
+        {"status": trader.OrderStatus.PARTIALLY_FILLED, "filled_qty": "40", "filled_avg_price": 100.0},
+        {"status": trader.OrderStatus.CANCELED, "filled_qty": "40", "filled_avg_price": 100.0},
+    ])
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked_for_fill_script(monkeypatch)
+
+    result = trader.buy_shares("AAPL", qty=100, estimated_price=10.0)
+
+    assert result is not None
+    assert result["submitted"] is True
+    assert result["qty"] == 40  # the ACTUAL filled amount, not the requested 100
+    assert len(fake.submitted_orders) == 1  # never resubmitted on top of the partial
+    assert len(fake.cancelled_order_ids) == 1  # the unfilled remainder was cancelled
+
+
+def test_cancel_silently_succeeds_on_an_already_filled_order(monkeypatch):
+    """Alpaca's documented inconsistency: cancelling an order that has
+    already filled can return success (204) instead of the documented
+    422 rejection -- the cancel response must never be trusted either way,
+    only the post-cancel re-fetch."""
+    fake = FakeBroker(get_order_responses=[
+        {"status": trader.OrderStatus.NEW, "filled_qty": "0", "filled_avg_price": None},
+        {"status": trader.OrderStatus.FILLED, "filled_qty": "100", "filled_avg_price": 100.0},
+    ])
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked_for_fill_script(monkeypatch)
+
+    result = trader.buy_shares("AAPL", qty=100, estimated_price=10.0)
+
+    assert result is not None
+    assert result["submitted"] is True
+    assert result["qty"] == 100
+    assert len(fake.submitted_orders) == 1  # did not submit a second order on top of the real fill
+    assert len(fake.cancelled_order_ids) == 1  # cancel WAS attempted -- it just didn't mean anything
+
+
+def test_fill_lands_after_timeout_even_when_cancel_raises_the_documented_rejection(monkeypatch):
+    """The OTHER documented Alpaca behavior: cancelling an already-filled
+    order can ALSO correctly raise a 422. Either way, only the post-cancel
+    re-fetch decides what happened -- not whether cancel itself raised."""
+    fake = FakeBroker(
+        get_order_responses=[
+            {"status": trader.OrderStatus.NEW, "filled_qty": "0", "filled_avg_price": None},
+            {"status": trader.OrderStatus.FILLED, "filled_qty": "100", "filled_avg_price": 100.0},
+        ],
+        cancel_raises=trader.APIError("422 order already filled, cannot cancel"),
+    )
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked_for_fill_script(monkeypatch)
+
+    result = trader.buy_shares("AAPL", qty=100, estimated_price=10.0)
+
+    assert result is not None
+    assert result["submitted"] is True
+    assert result["qty"] == 100
+    assert len(fake.submitted_orders) == 1
+
+
+def test_unknown_status_after_cancel_fails_closed_and_marks_needs_attention(monkeypatch):
+    fake = FakeBroker(get_order_responses=[
+        {"status": trader.OrderStatus.NEW, "filled_qty": "0", "filled_avg_price": None},
+        {"status": trader.OrderStatus.PENDING_CANCEL, "filled_qty": "0", "filled_avg_price": None},
+    ])
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked_for_fill_script(monkeypatch)
+
+    result = trader.buy_shares("AAPL", qty=100, estimated_price=10.0)
+
+    assert result is None
+    assert len(fake.submitted_orders) == 1  # never resubmitted on top of an unknown state
+    reason = trader.check_needs_attention("AAPL")
+    assert reason is not None
+
+
+def test_api_error_during_poll_fails_closed_and_marks_needs_attention(monkeypatch):
+    class FailingPollClient(FakeBroker):
+        def get_order_by_id(self, order_id):
+            raise trader.APIError("boom")
+
+    fake = FailingPollClient()
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked_for_fill_script(monkeypatch)
+
+    result = trader.buy_shares("AAPL", qty=100, estimated_price=10.0)
+
+    assert result is None
+    reason = trader.check_needs_attention("AAPL")
+    assert reason is not None
+
+
+def test_api_error_during_post_cancel_refetch_fails_closed_and_marks_needs_attention(monkeypatch):
+    fake = FakeBroker(never_fill=True)
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked_for_fill_script(monkeypatch)
+
+    real_get_order_by_id = fake.get_order_by_id
+    calls = []
+
+    def get_order_by_id_fails_second_call(order_id):
+        calls.append(order_id)
+        if len(calls) >= 2:
+            raise trader.APIError("boom")
+        return real_get_order_by_id(order_id)
+
+    monkeypatch.setattr(fake, "get_order_by_id", get_order_by_id_fails_second_call)
+
+    result = trader.buy_shares("AAPL", qty=100, estimated_price=10.0)
+
+    assert result is None
+    reason = trader.check_needs_attention("AAPL")
+    assert reason is not None
+
+
+def test_partial_fill_on_an_option_leg_is_impossible_qty_one_behaves_as_before(monkeypatch):
+    """Options always trade qty=1 in this bot -- there's no fractional
+    state between 0 and 1, so a timeout with filled_qty=0 must still
+    behave exactly like the pre-existing 'clean miss, try next price'
+    path, not the new partial-fill path."""
+    fake = FakeBroker(never_fill=True)
+    monkeypatch.setattr(trader, "_client", fake)
+    monkeypatch.setattr(trader, "LIMIT_ORDER_MAX_STEPS", 2)
+    _unblocked_for_fill_script(monkeypatch)
+
+    result = trader.sell_to_open_call("AAPL261113C00200000", qty=1)
+
+    assert result is None
+    assert len(fake.submitted_orders) == 2  # walked through both steps normally
+    assert trader.check_needs_attention("AAPL") is None
 
 
 # ── Roll cap and net-credit checks (Task 4) ──────────────────────────────────

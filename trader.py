@@ -31,7 +31,9 @@ from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestQuoteRequest
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import AssetClass, OrderSide, PositionIntent, PositionSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import (
+    AssetClass, OrderSide, OrderStatus, PositionIntent, PositionSide, QueryOrderStatus, TimeInForce,
+)
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
 
 from config import (
@@ -444,25 +446,69 @@ def _get_option_quote(occ_symbol: str) -> tuple[float, float] | None:
 
 # ── Limit-order execution ─────────────────────────────────────────────────────
 
-def _poll_until_filled(order_id, timeout_seconds: float):
-    """Poll an order until it fills or `timeout_seconds` elapses. Returns
-    the filled Order, or None (logged, not raised) on timeout/API error --
-    the caller is expected to cancel the still-resting order on a None."""
+# Statuses that mean "this order will never change again" -- once seen,
+# polling further is pointless. PARTIALLY_FILLED is deliberately NOT here:
+# it can still become FILLED (more fills arriving) or get cancelled, so a
+# step keeps polling through it until either a terminal status appears or
+# the step's own timeout elapses.
+_TERMINAL_ORDER_STATUSES = {
+    OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED,
+    OrderStatus.REJECTED, OrderStatus.DONE_FOR_DAY, OrderStatus.STOPPED,
+    OrderStatus.REPLACED,
+}
+
+# Real seconds between polls within a single step's timeout window --
+# separated from LIMIT_ORDER_STEP_PAUSE_SECONDS (the step's own deadline)
+# so tests can make polling itself fast without needing a long deadline.
+_POLL_INTERVAL_SECONDS = 1.0
+
+
+def _safe_filled_qty(order) -> float | None:
+    """order.filled_qty is typed Optional[str | float] by alpaca-py --
+    None (or unparseable) is treated as UNKNOWN, not zero. Assuming "0"
+    for a None we don't understand would be exactly the kind of silent
+    default substitution that hides a real problem."""
+    if order.filled_qty is None:
+        return None
+    try:
+        return float(order.filled_qty)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_full_fill(order, qty: int) -> bool:
+    if order is None or order.status != OrderStatus.FILLED:
+        return False
+    filled = _safe_filled_qty(order)
+    return filled is not None and filled == qty
+
+
+def _poll_until_filled(order_id, qty: int, timeout_seconds: float):
+    """
+    Poll an order until it reaches a terminal status or `timeout_seconds`
+    elapses. Returns the last-seen Order on timeout (status/filled_qty
+    could be anything -- NEW, PARTIALLY_FILLED, or a non-fill terminal
+    state) so the caller can inspect and act on the REAL state, never
+    just "is there a price on it." Returns None only on an outright API
+    error while polling -- the one case where we truly know nothing.
+    """
     deadline = time.monotonic() + timeout_seconds
+    last_order = None
     while time.monotonic() < deadline:
         try:
             order = _client.get_order_by_id(order_id)
         except APIError as e:
             _log.error("_poll_until_filled(%s) failed: %s", order_id, e)
             return None
-        if order.filled_avg_price is not None:
+        last_order = order
+        if order.status in _TERMINAL_ORDER_STATUSES:
             return order
-        time.sleep(1.0)
-    return None
+        time.sleep(_POLL_INTERVAL_SECONDS)
+    return last_order
 
 
-def _walk_limit_order(order_symbol: str, side, qty: int, bid: float, ask: float,
-                       position_intent, client_order_id_base: str):
+def _walk_limit_order(order_symbol: str, underlying_symbol: str, side, qty: int,
+                       bid: float, ask: float, position_intent, client_order_id_base: str):
     """
     Submit a limit order starting at the quote's mid price, walking toward
     the "natural" price (ask for a BUY, bid for a SELL) over
@@ -471,13 +517,32 @@ def _walk_limit_order(order_symbol: str, side, qty: int, bid: float, ask: float,
     before chasing. The final step prices exactly AT the natural price --
     the same price a market order would effectively cross at -- so "give
     up after N steps" means "didn't fill even at the aggressive price,"
-    not "gave up before trying it." Cancels and resubmits rather than
-    PATCH-replacing between steps -- simpler to reason about, and this
-    bot's order sizes (100 shares / 1 contract) never need partial-fill-
-    then-reprice handling. Returns the filled Order, or None -- including
-    None if the quote is too wide to walk safely at all (see
-    MAX_SLIPPAGE_FROM_MID_PCT): refusing a bad quote outright, rather
-    than ever submitting at a price that far from mid.
+    not "gave up before trying it."
+
+    Every step that doesn't end in a clean full fill goes through the
+    same sequence: attempt a cancel, then ALWAYS re-fetch the order
+    afterward regardless of what the cancel call itself returned --
+    Alpaca has a documented inconsistency where cancelling an order that
+    has already filled can return success instead of the documented 422
+    rejection, so the cancel response alone can't be trusted. Only the
+    re-fetched state decides what happens next:
+      - fully filled (despite/during the cancel) -> that's the real
+        outcome, return it, don't touch anything else
+      - cleanly cancelled, nothing filled -> proceed to the next price
+      - cancelled with a genuine partial fill -> stop here and return
+        that partial fill as the final result (caller must record the
+        ACTUAL filled qty, not the originally requested one) -- this
+        does not keep walking to chase the remainder within the same
+        call, deliberately: what to do about a shortfall is a decision
+        for the caller/next cycle, not something to guess here
+      - anything else (still resting, pending-cancel, re-fetch itself
+        failed) -> we don't know what's actually true on the broker's
+        side. Fail closed: mark the symbol needs-attention and stop,
+        rather than ever submitting a new order on top of an order
+        whose true state is unknown.
+
+    Returns the final Order on a full or partial fill, or None (on
+    refusal, a give-up, or an unknown-state failure).
     """
     mid = (bid + ask) / 2.0
     natural = ask if side == OrderSide.BUY else bid
@@ -510,16 +575,76 @@ def _walk_limit_order(order_symbol: str, side, qty: int, bid: float, ask: float,
             _log.error("_walk_limit_order(%s) step %d submit failed: %s", order_symbol, step, e)
             return None
 
-        filled = _poll_until_filled(order.id, LIMIT_ORDER_STEP_PAUSE_SECONDS)
-        if filled is not None:
-            return filled
+        polled = _poll_until_filled(order.id, qty, LIMIT_ORDER_STEP_PAUSE_SECONDS)
+        if polled is None:
+            _log.error(
+                "_walk_limit_order(%s): lost track of step %d order %s while polling (API error) — "
+                "failing closed rather than guessing its state",
+                order_symbol, step, order.id,
+            )
+            mark_needs_attention(
+                underlying_symbol,
+                f"order {order.id} ({order_symbol}) state unknown — API error while polling, never confirmed",
+            )
+            return None
 
+        if _is_full_fill(polled, qty):
+            return polled
+
+        # Not a full fill at the end of this step's timeout -- attempt a
+        # cancel, then unconditionally re-fetch to learn the real state.
         try:
             _client.cancel_order_by_id(order.id)
         except APIError as e:
-            _log.warning("_walk_limit_order(%s): cancel of unfilled step %d order failed: %s", order_symbol, step, e)
+            _log.warning("_walk_limit_order(%s): cancel of step %d order failed: %s", order_symbol, step, e)
 
-        current_price += increment
+        try:
+            final = _client.get_order_by_id(order.id)
+        except APIError as e:
+            _log.error("_walk_limit_order(%s): re-fetch after cancel failed for step %d order %s: %s",
+                       order_symbol, step, order.id, e)
+            mark_needs_attention(
+                underlying_symbol,
+                f"order {order.id} ({order_symbol}) state unknown — re-fetch after cancel failed, never confirmed",
+            )
+            return None
+
+        if _is_full_fill(final, qty):
+            _log.warning(
+                "_walk_limit_order(%s): step %d order %s filled despite the cancel attempt (race) — "
+                "treating the fill as real, not submitting anything further",
+                order_symbol, step, order.id,
+            )
+            return final
+
+        final_filled_qty = _safe_filled_qty(final)
+
+        if final.status in _TERMINAL_ORDER_STATUSES and final_filled_qty == 0:
+            # Clean cancel, nothing filled -- proceed to the next price.
+            current_price += increment
+            continue
+
+        if final.status in _TERMINAL_ORDER_STATUSES and final_filled_qty is not None and 0 < final_filled_qty < qty:
+            _log.warning(
+                "_walk_limit_order(%s): step %d order %s partially filled (%s/%s) before the remainder "
+                "was cancelled — reporting the actual filled quantity, not continuing the walk",
+                order_symbol, step, order.id, final_filled_qty, qty,
+            )
+            return final
+
+        # Anything else -- still resting, pending-cancel, or a filled_qty
+        # we can't parse -- is a state we can't confidently act on.
+        _log.error(
+            "_walk_limit_order(%s): step %d order %s in an unexpected state after cancel+refetch "
+            "(status=%s, filled_qty=%s) — failing closed rather than guessing",
+            order_symbol, step, order.id, final.status, final.filled_qty,
+        )
+        mark_needs_attention(
+            underlying_symbol,
+            f"order {order.id} ({order_symbol}) state unknown after cancel attempt "
+            f"(status={final.status}, filled_qty={final.filled_qty}) — needs manual review",
+        )
+        return None
 
     _log.warning(
         "_walk_limit_order(%s): did not fill within %d steps up to natural price %.2f — giving up",
@@ -553,15 +678,26 @@ def buy_shares(symbol: str, qty: int = SHARES_PER_LOT, estimated_price: float | 
     bid, ask = quote
 
     client_order_id_base = f"{CLIENT_ORDER_ID_PREFIX}-BUY-{symbol}-{date.today().isoformat()}"
-    order = _walk_limit_order(symbol, OrderSide.BUY, qty, bid, ask, None, client_order_id_base)
+    order = _walk_limit_order(symbol, symbol, OrderSide.BUY, qty, bid, ask, None, client_order_id_base)
     if order is None:
         return None
 
-    _log.info("BUY SHARES filled %s | qty=%s | order_id=%s | price=%s", symbol, qty, order.id, order.filled_avg_price)
-    return {"order_id": str(order.id), "symbol": symbol, "qty": qty, "price": float(order.filled_avg_price), "submitted": True}
+    filled_qty = _safe_filled_qty(order)
+    _log.info("BUY SHARES filled %s | qty=%s | order_id=%s | price=%s", symbol, filled_qty, order.id, order.filled_avg_price)
+    return {
+        "order_id": str(order.id), "symbol": symbol, "qty": int(filled_qty),
+        "price": float(order.filled_avg_price), "submitted": True,
+    }
 
 
 # ── Options: single-leg covered call management ──────────────────────────────
+
+def _occ_root(occ_symbol: str) -> str:
+    """Underlying root from an OCC option symbol -- same slicing as
+    options_data.parse_occ_symbol's root field, duplicated here (not
+    imported) to keep trader.py free of a dependency on options_data.py."""
+    return occ_symbol[:-15]
+
 
 def sell_to_open_call(occ_symbol: str, qty: int = 1) -> dict | None:
     block_reason = _guard(f"SELL_TO_OPEN {qty}x {occ_symbol}", order_symbol=occ_symbol)
@@ -576,13 +712,15 @@ def sell_to_open_call(occ_symbol: str, qty: int = 1) -> dict | None:
 
     client_order_id_base = f"{CLIENT_ORDER_ID_PREFIX}-SELLOPEN-{occ_symbol}-{date.today().isoformat()}"
     order = _walk_limit_order(
-        occ_symbol, OrderSide.SELL, qty, bid, ask, PositionIntent.SELL_TO_OPEN, client_order_id_base,
+        occ_symbol, _occ_root(occ_symbol), OrderSide.SELL, qty, bid, ask,
+        PositionIntent.SELL_TO_OPEN, client_order_id_base,
     )
     if order is None:
         return None
 
-    _log.info("SELL_TO_OPEN filled %s | qty=%s | order_id=%s | price=%s", occ_symbol, qty, order.id, order.filled_avg_price)
-    return {"order_id": str(order.id), "occ_symbol": occ_symbol, "qty": qty, "submitted": True}
+    filled_qty = _safe_filled_qty(order)
+    _log.info("SELL_TO_OPEN filled %s | qty=%s | order_id=%s | price=%s", occ_symbol, filled_qty, order.id, order.filled_avg_price)
+    return {"order_id": str(order.id), "occ_symbol": occ_symbol, "qty": int(filled_qty), "submitted": True}
 
 
 def buy_to_close_call(occ_symbol: str, qty: int = 1) -> dict | None:
@@ -598,13 +736,15 @@ def buy_to_close_call(occ_symbol: str, qty: int = 1) -> dict | None:
 
     client_order_id_base = f"{CLIENT_ORDER_ID_PREFIX}-BUYCLOSE-{occ_symbol}-{date.today().isoformat()}"
     order = _walk_limit_order(
-        occ_symbol, OrderSide.BUY, qty, bid, ask, PositionIntent.BUY_TO_CLOSE, client_order_id_base,
+        occ_symbol, _occ_root(occ_symbol), OrderSide.BUY, qty, bid, ask,
+        PositionIntent.BUY_TO_CLOSE, client_order_id_base,
     )
     if order is None:
         return None
 
-    _log.info("BUY_TO_CLOSE filled %s | qty=%s | order_id=%s | price=%s", occ_symbol, qty, order.id, order.filled_avg_price)
-    return {"order_id": str(order.id), "occ_symbol": occ_symbol, "qty": qty, "submitted": True}
+    filled_qty = _safe_filled_qty(order)
+    _log.info("BUY_TO_CLOSE filled %s | qty=%s | order_id=%s | price=%s", occ_symbol, filled_qty, order.id, order.filled_avg_price)
+    return {"order_id": str(order.id), "occ_symbol": occ_symbol, "qty": int(filled_qty), "submitted": True}
 
 
 def roll_call(symbol: str, old_occ_symbol: str, new_occ_symbol: str, qty: int = 1) -> dict | None:
@@ -726,12 +866,16 @@ def sell_shares(symbol: str, qty: int) -> dict | None:
     bid, ask = quote
 
     client_order_id_base = f"{CLIENT_ORDER_ID_PREFIX}-SELLSHARES-{symbol}-{date.today().isoformat()}"
-    order = _walk_limit_order(symbol, OrderSide.SELL, qty, bid, ask, None, client_order_id_base)
+    order = _walk_limit_order(symbol, symbol, OrderSide.SELL, qty, bid, ask, None, client_order_id_base)
     if order is None:
         return None
 
-    _log.info("SELL SHARES filled %s | qty=%s | order_id=%s | price=%s", symbol, qty, order.id, order.filled_avg_price)
-    return {"order_id": str(order.id), "symbol": symbol, "qty": qty, "price": float(order.filled_avg_price), "submitted": True}
+    filled_qty = _safe_filled_qty(order)
+    _log.info("SELL SHARES filled %s | qty=%s | order_id=%s | price=%s", symbol, filled_qty, order.id, order.filled_avg_price)
+    return {
+        "order_id": str(order.id), "symbol": symbol, "qty": int(filled_qty),
+        "price": float(order.filled_avg_price), "submitted": True,
+    }
 
 
 def attempt_recovery_exit(

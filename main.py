@@ -166,6 +166,24 @@ def _order_status(result: dict | None) -> str:
     return "ok"
 
 
+def _log_and_alert_failure(symbol: str, default_msg: str) -> None:
+    """
+    A None result from any trader.py order function might just be a
+    normal API rejection, or it might be trader.py's new unknown-order-
+    state path (Task 4 fill-handling fix), which ALSO marks the symbol
+    needs-attention before returning None. Checking here means every
+    order path alerts immediately when that's fresh, the same way
+    roll_call's failure handling already did -- not just on the NEXT
+    cycle's top-of-function needs-attention check.
+    """
+    msg = default_msg
+    needs_attention_reason = trader.check_needs_attention(symbol)
+    if needs_attention_reason:
+        msg = f"{symbol}: {needs_attention_reason}"
+    log_error("main.run_symbol_cycle", msg)
+    _run_async(notifier.send_error(symbol, msg))
+
+
 def run_symbol_cycle(
     symbol: str, recommended_dte: int | None = None,
     atm_iv: float | None = None, atm_iv_rank: float | None = None,
@@ -307,18 +325,29 @@ def run_symbol_cycle(
         result = trader.buy_shares(symbol, SHARES_PER_LOT, estimated_price=spot)
         status = _order_status(result)
         if status == "failed":
-            log_error("main.run_symbol_cycle", f"{symbol}: buy_shares failed")
+            _log_and_alert_failure(symbol, f"{symbol}: buy_shares failed")
             return f"{symbol}: FAILED to buy shares"
         if status == "blocked":
             logger.info("%s: buy_shares blocked (%s) — not logging as a real trade", symbol, result["block_reason"])
             return f"{symbol}: would buy {SHARES_PER_LOT} shares ({result['block_reason']} — not submitted)"
-        log_share_trade(symbol, "BUY", SHARES_PER_LOT, price=result.get("price"), order_id=result["order_id"])
+
+        # result["qty"] is the ACTUAL filled quantity (trader.py's fill
+        # check now requires it to match the request for a clean full
+        # fill) -- recording SHARES_PER_LOT unconditionally here would
+        # silently mis-record a partial fill as if the full lot had gone
+        # through, corrupting both the trade log and the lot's own qty.
+        filled_qty = result["qty"]
+        log_share_trade(symbol, "BUY", filled_qty, price=result.get("price"), order_id=result["order_id"])
         if result.get("price") is not None:
-            open_lot(symbol, SHARES_PER_LOT, result["price"])
+            open_lot(symbol, filled_qty, result["price"])
         else:
             log_error("main.run_symbol_cycle", f"{symbol}: bought shares but no fill price — lot opened without a basis")
-        _run_async(notifier.send_shares_bought(symbol, SHARES_PER_LOT, result["order_id"]))
-        return f"{symbol}: bought {SHARES_PER_LOT} shares"
+        if filled_qty != SHARES_PER_LOT:
+            msg = f"{symbol}: buy_shares only partially filled ({filled_qty}/{SHARES_PER_LOT} shares) — remainder was cancelled"
+            log_error("main.run_symbol_cycle", msg)
+            _run_async(notifier.send_error(symbol, msg))
+        _run_async(notifier.send_shares_bought(symbol, filled_qty, result["order_id"]))
+        return f"{symbol}: bought {filled_qty} shares"
 
     # Lot Manager (Phase 3, Task 6) -- read once, used by both States 2 and
     # 3 below. A symbol with no tracked lot (predates Task 6, or a legacy
@@ -358,7 +387,7 @@ def run_symbol_cycle(
         result = trader.sell_to_open_call(candidate.occ_symbol, qty=1)
         status = _order_status(result)
         if status == "failed":
-            log_error("main.run_symbol_cycle", f"{symbol}: sell_to_open_call failed")
+            _log_and_alert_failure(symbol, f"{symbol}: sell_to_open_call failed")
             return f"{symbol}: FAILED to sell call"
         if status == "blocked":
             logger.info(
@@ -421,7 +450,7 @@ def run_symbol_cycle(
         result = trader.buy_to_close_call(occ_symbol, qty=1)
         status = _order_status(result)
         if status == "failed":
-            log_error("main.run_symbol_cycle", f"{symbol}: buy_to_close_call failed (profit take)")
+            _log_and_alert_failure(symbol, f"{symbol}: buy_to_close_call failed (profit take)")
             return f"{symbol}: FAILED to close {occ_symbol} for profit take"
         if status == "blocked":
             logger.info(
@@ -472,13 +501,22 @@ def run_symbol_cycle(
                     symbol, occ_symbol, int(lot["qty"]), float(lot["cost_basis_per_share"]), RECOVERY_EXIT_MIN_MARGIN_PCT,
                 )
                 if exit_result is not None and exit_result["sold"].get("submitted", True):
+                    # exit_result["sold"]["qty"] is the ACTUAL filled
+                    # quantity (trader.py's fill check requires a full
+                    # fill or an explicit, correctly-reported partial) --
+                    # using the lot's nominal qty here would silently
+                    # mis-record a partial sell as a full one.
+                    sold_qty = exit_result["sold"]["qty"]
                     log_option_trade(symbol, occ_symbol, "BUY_TO_CLOSE", order_id=exit_result["closed"]["order_id"])
                     log_share_trade(
-                        symbol, "SELL", int(lot["qty"]),
+                        symbol, "SELL", sold_qty,
                         price=exit_result["sold"]["price"], order_id=exit_result["sold"]["order_id"],
                     )
                     close_lot(symbol, "RECOVERY_EXIT", exit_result["sold"]["price"])
-                    _run_async(notifier.send_error(symbol, f"recovery-exit completed for {symbol} — lot closed"))
+                    alert = f"recovery-exit completed for {symbol} — lot closed"
+                    if sold_qty != int(lot["qty"]):
+                        alert += f" (partial: sold {sold_qty}/{int(lot['qty'])} shares, remainder cancelled)"
+                    _run_async(notifier.send_error(symbol, alert))
                     return f"{symbol}: recovery-exit completed, lot closed"
                 _run_async(notifier.send_error(symbol, msg + " — recovery-exit did not complete, see logs"))
                 return f"{symbol}: FAILED to find new strike, recovery-exit did not complete"
@@ -492,15 +530,12 @@ def run_symbol_cycle(
         if result is None:
             # roll_call itself already marks needs-attention and logs
             # loudly for the specific "shares are now uncovered" failure
-            # mode -- this alert is unconditional on any roll_call
-            # failure (cap refused, no net credit, close leg failed, or
-            # the uncovered-shares case) so a human is notified either way.
-            msg = f"{symbol}: roll_call failed for {occ_symbol} -> {new_candidate.occ_symbol}"
-            needs_attention_reason = trader.check_needs_attention(symbol)
-            if needs_attention_reason:
-                msg = f"{symbol}: {needs_attention_reason}"
-            log_error("main.run_symbol_cycle", msg)
-            _run_async(notifier.send_error(symbol, msg))
+            # mode -- _log_and_alert_failure surfaces that immediately if
+            # it's fresh, same as every other order path now does, so
+            # this alert is unconditional on any roll_call failure (cap
+            # refused, no net credit, close leg failed, or the
+            # uncovered-shares case) either way.
+            _log_and_alert_failure(symbol, f"{symbol}: roll_call failed for {occ_symbol} -> {new_candidate.occ_symbol}")
             return f"{symbol}: FAILED to roll {occ_symbol}"
         if not result["closed"].get("submitted", True):
             # Both legs share one DRY_RUN/kill-switch block reason here --

@@ -8,6 +8,7 @@ Every trader.py function this exercises is monkeypatched to a fake -- see
 conftest.py's autouse fixture, which would raise if any of these reached
 the real broker by accident.
 """
+import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -68,7 +69,7 @@ def _patch_common(monkeypatch, **overrides):
         },
         attempt_recovery_exit=lambda symbol, occ, qty, basis, margin: {
             "closed": {"order_id": "o-rec-close", "submitted": True},
-            "sold": {"order_id": "o-rec-sell", "price": 100.0, "submitted": True},
+            "sold": {"order_id": "o-rec-sell", "price": 100.0, "qty": qty, "submitted": True},
         },
     )
     defaults.update(overrides)
@@ -199,6 +200,45 @@ def test_buy_shares_real_failure_logs_error_and_fails(monkeypatch):
     assert "FAILED" in result
     assert len(logged["errors"]) == 1
     assert logged["share_trades"] == []
+
+
+def test_buy_shares_failure_with_fresh_needs_attention_alerts_immediately(monkeypatch):
+    """trader.py's fill-handling fix marks needs-attention itself before
+    returning None on an unknown order state -- main.py must surface that
+    reason in the SAME cycle's alert, not wait for next cycle's top-of-
+    function check to notice it. check_needs_attention is called TWICE
+    in this path (the top-of-cycle gate, before buy_shares runs at all,
+    and _log_and_alert_failure's check after it fails) -- must be clear
+    on the first call (nothing wrong yet) and only become set after the
+    failure actually happens, same as the real flow."""
+    alerts = []
+    check_calls = []
+
+    def fake_check_needs_attention(symbol):
+        check_calls.append(symbol)
+        return "order state unknown after cancel attempt" if len(check_calls) > 1 else None
+
+    logged = _patch_common(
+        monkeypatch,
+        buy_shares=lambda symbol, qty, **k: None,
+        check_needs_attention=fake_check_needs_attention,
+    )
+
+    async def fake_send_error(symbol, msg):
+        alerts.append(msg)
+
+    monkeypatch.setattr(main.notifier, "send_error", fake_send_error)
+    # _patch_common's default _run_async just closes the coroutine without
+    # running it (safe for tests that don't care what the body does) --
+    # this test needs the body to actually run so alerts gets populated,
+    # which is safe here since fake_send_error itself does nothing real.
+    monkeypatch.setattr(main, "_run_async", lambda coro: asyncio.run(coro))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "FAILED" in result
+    assert len(alerts) == 1
+    assert "order state unknown after cancel attempt" in alerts[0]
 
 
 def test_partial_share_quantity_skips_without_buying(monkeypatch):
