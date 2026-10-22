@@ -122,3 +122,8 @@ async def send_partial_fill(symbol: str, message: str) -> None:
 async def send_kill_switch_trip(message: str) -> None:
     alerts.notify("kill_switch", message)
     await _send(f"🛑 <b>KILL SWITCH TRIPPED</b>\n{message}")
+
+
+async def send_db_unavailable(message: str) -> None:
+    alerts.notify("db_unavailable", message)
+    await _send(f"🛑 <b>DATABASE UNAVAILABLE</b>\n{message}")

@@ -77,6 +77,28 @@ def _connect():
     return psycopg2.connect(DATABASE_URL)
 
 
+def is_db_available() -> bool:
+    """
+    True only if DATABASE_URL is set AND a real connection (plus a
+    trivial round-trip query) succeeds right now. Used by trader._guard()
+    to block every order type -- not just the capital-cap path -- when
+    DRY_RUN is False and persistence can't be trusted this cycle. Unlike
+    every other function in this module, this one's entire job is to
+    report the truth about availability, so there's no "fails soft to a
+    default" ambiguity to worry about here -- False always means exactly
+    "not available right now," never "available but legitimately empty."
+    """
+    if not DATABASE_URL:
+        return False
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return True
+    except Exception as e:
+        logger.error("is_db_available: DB unreachable: %s", e)
+        return False
+
+
 # Phase 3, Task 7: IV/IVR metadata at option open. option_trades already
 # exists in deployed databases, so CREATE TABLE IF NOT EXISTS in _SCHEMA
 # above is a no-op against it -- these columns need their own explicit
@@ -283,26 +305,31 @@ def get_last_open_occ_symbol(symbol: str) -> str | None:
         return None
 
 
-def get_own_symbols() -> set[str]:
+def get_own_symbols() -> set[str] | None:
     """
     Every symbol this bot's OWN trade log has ever bought shares of --
     used to scope the hard capital/position caps (Phase 3, Task 2) to this
     bot's own activity on a shared Alpaca account, so a separate crypto or
     ORB stock bot trading the same account never counts toward (or
-    silently satisfies) this bot's budget. Returns an empty set, not None,
-    when DATABASE_URL isn't configured or the query fails -- callers
-    scoping a cap by this set should already be failing closed on other
-    read errors around it, this just shouldn't be the thing that trips it.
+    silently satisfies) this bot's budget. Returns None -- NOT an empty
+    set -- when DATABASE_URL isn't configured or the query fails, so
+    _check_hard_limits() can fail CLOSED on "can't verify what this bot
+    owns" instead of silently treating a DB outage the same as "verified:
+    this bot owns nothing," which would make its real existing exposure
+    invisible to its own caps (a fail-OPEN gap, confirmed and fixed here --
+    see test_get_own_symbols_db_failure_fails_closed_not_open). An empty
+    set is still the correct, legitimate return when the query succeeds
+    and this bot genuinely has never bought anything.
     """
     if not DATABASE_URL:
-        return set()
+        return None
     try:
         with _connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT DISTINCT symbol FROM share_trades WHERE side = 'BUY'")
             return {row[0] for row in cur.fetchall()}
     except Exception as e:
         logger.error("get_own_symbols failed: %s", e)
-        return set()
+        return None
 
 
 def get_expected_share_qty(symbol: str) -> int | None:

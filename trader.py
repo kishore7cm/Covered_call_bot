@@ -45,7 +45,7 @@ from config import (
     MIN_ACCOUNT_BUYING_POWER, PAPER, ROLL_OPEN_LEG_MAX_RETRIES, SHARES_PER_LOT,
 )
 import config
-from logger import get_own_symbols, get_rolls_since_last_lot_open
+from logger import get_own_symbols, get_rolls_since_last_lot_open, is_db_available
 
 _log = logging.getLogger(__name__)
 
@@ -182,6 +182,9 @@ def _check_hard_limits(symbol: str | None, estimated_dollars: float | None, open
         return "account_level_limit"
 
     own_symbols = get_own_symbols()
+    if own_symbols is None:
+        _log.error("_check_hard_limits: could not verify this bot's own symbols — failing closed")
+        return "cap_check_unavailable"
     own_equity_positions = [
         p for p in positions if p.asset_class == AssetClass.US_EQUITY and p.symbol in own_symbols
     ]
@@ -222,13 +225,22 @@ def _guard(description: str, order_symbol: str, symbol: str | None = None,
     applies.
 
     Order of checks matters: kill switch first (full stop, highest
-    priority), then market hours and the open-orders/hard caps
-    (structural safety rails that should be visible in the logs even
-    while DRY_RUN is True, so they can be validated before DRY_RUN is
-    ever turned off), then DRY_RUN last (the default-safe, "softest"
-    reason). MAX_ORDERS_PER_CYCLE is counted here, first, unconditionally
-    — every call into this function is an order attempt, regardless of
-    which later check ends up blocking it.
+    priority), then DB availability (a real order's own bookkeeping --
+    trade log, lot basis, overlap detection -- depends on persistence
+    being trustworthy; see logger.is_db_available's docstring), then
+    market hours and the open-orders/hard caps (structural safety rails
+    that should be visible in the logs even while DRY_RUN is True, so
+    they can be validated before DRY_RUN is ever turned off), then
+    DRY_RUN last (the default-safe, "softest" reason). MAX_ORDERS_PER_CYCLE
+    is counted here, first, unconditionally — every call into this
+    function is an order attempt, regardless of which later check ends up
+    blocking it.
+
+    The DB-availability check only runs when DRY_RUN is False -- a DRY_RUN
+    rehearsal with no database configured must keep working exactly as it
+    always has (that's this repo's own default dev setup), and probing a
+    live DB connection on every order attempt is pure overhead when
+    nothing is actually going to be submitted anyway.
     """
     global _orders_this_cycle
     _orders_this_cycle += 1
@@ -239,6 +251,10 @@ def _guard(description: str, order_symbol: str, symbol: str | None = None,
     if _kill_switch_engaged():
         _log.warning("KILL SWITCH ENGAGED — blocking order: %s", description)
         return "kill_switch"
+
+    if not DRY_RUN and not is_db_available():
+        _log.error("DATABASE UNAVAILABLE and DRY_RUN is False — blocking order: %s", description)
+        return "db_unavailable"
 
     market_reason = _market_hours_block()
     if market_reason:

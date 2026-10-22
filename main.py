@@ -283,17 +283,22 @@ def _log_and_alert_failure(symbol: str, default_msg: str) -> None:
         _run_async(notifier.send_error(symbol, msg))
 
 
-def _alert_if_kill_switch_tripped(symbol: str, description: str, block_reason: str) -> None:
+def _alert_for_block_reason(symbol: str, description: str, block_reason: str) -> None:
     """
     Every other block reason (DRY_RUN, market hours, open orders, hard
     caps) is routine and already logged via logger.info at the call site
-    -- not alert-worthy on its own. The kill switch is different: it's a
-    deliberate, external safety trip (the env var or the pipeline_state/
-    kill_switch file), and manual/Stage 3 testing needs to know
-    immediately that it fired, not just see it buried in the log stream.
+    -- not alert-worthy on its own. kill_switch and db_unavailable are
+    different: both are deliberate/structural safety trips (an external
+    kill switch, or persistence that can no longer be trusted this
+    cycle), and manual/Stage 3 testing needs to know immediately that
+    either fired, not just see it buried in the log stream.
     """
     if block_reason == "kill_switch":
         _run_async(notifier.send_kill_switch_trip(f"{symbol}: {description} — blocked by kill switch"))
+    elif block_reason == "db_unavailable":
+        _run_async(notifier.send_db_unavailable(
+            f"{symbol}: {description} — blocked, database unavailable and DRY_RUN is False"
+        ))
 
 
 def _ex_div_warning_text(candidate, spot: float | None) -> str | None:
@@ -460,7 +465,7 @@ def run_symbol_cycle(
             return f"{symbol}: FAILED to buy shares"
         if status == "blocked":
             logger.info("%s: buy_shares blocked (%s) — not logging as a real trade", symbol, result["block_reason"])
-            _alert_if_kill_switch_tripped(symbol, f"buy {SHARES_PER_LOT} shares", result["block_reason"])
+            _alert_for_block_reason(symbol, f"buy {SHARES_PER_LOT} shares", result["block_reason"])
             return f"{symbol}: would buy {SHARES_PER_LOT} shares ({result['block_reason']} — not submitted)"
 
         # result["qty"] is the ACTUAL filled quantity (trader.py's fill
@@ -525,7 +530,7 @@ def run_symbol_cycle(
             logger.info(
                 "%s: sell_to_open_call blocked (%s) — not logging as a real trade", symbol, result["block_reason"]
             )
-            _alert_if_kill_switch_tripped(symbol, f"sell {candidate.occ_symbol}", result["block_reason"])
+            _alert_for_block_reason(symbol, f"sell {candidate.occ_symbol}", result["block_reason"])
             return (
                 f"{symbol}: would sell {candidate.occ_symbol} @ ${candidate.mid_price:.2f} "
                 f"(delta {candidate.delta:.2f}) ({result['block_reason']} — not submitted)"
@@ -595,7 +600,7 @@ def run_symbol_cycle(
             logger.info(
                 "%s: buy_to_close_call blocked (%s) — not logging as a real trade", symbol, result["block_reason"]
             )
-            _alert_if_kill_switch_tripped(symbol, f"close {occ_symbol} (profit take)", result["block_reason"])
+            _alert_for_block_reason(symbol, f"close {occ_symbol} (profit take)", result["block_reason"])
             return f"{symbol}: would close {occ_symbol} for profit take ({result['block_reason']} — not submitted)"
         pnl = (entry_credit - current_value) * 100
         log_option_trade(symbol, occ_symbol, "BUY_TO_CLOSE", premium=current_value, order_id=result["order_id"])
@@ -683,7 +688,7 @@ def run_symbol_cycle(
             # leg wasn't real either, so checking the close leg is enough.
             block_reason = result["closed"]["block_reason"]
             logger.info("%s: roll_call blocked (%s) — not logging as a real trade", symbol, block_reason)
-            _alert_if_kill_switch_tripped(symbol, f"roll {occ_symbol} -> {new_candidate.occ_symbol}", block_reason)
+            _alert_for_block_reason(symbol, f"roll {occ_symbol} -> {new_candidate.occ_symbol}", block_reason)
             return f"{symbol}: would roll {occ_symbol} -> {new_candidate.occ_symbol} ({block_reason} — not submitted)"
 
         log_option_trade(symbol, new_candidate.occ_symbol, "ROLL",

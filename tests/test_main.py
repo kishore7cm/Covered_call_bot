@@ -987,18 +987,24 @@ def test_buy_shares_real_partial_fill_alerts_via_send_partial_fill(monkeypatch):
     assert "60" in sent[0]["args"][1]
 
 
-def test_alert_if_kill_switch_tripped_fires_only_for_kill_switch(monkeypatch):
-    sent = []
-    monkeypatch.setattr(main.notifier, "send_kill_switch_trip", _capture_async_call(sent))
+def test_alert_for_block_reason_fires_only_for_kill_switch_and_db_unavailable(monkeypatch):
+    kill_switch_sent = []
+    db_sent = []
+    monkeypatch.setattr(main.notifier, "send_kill_switch_trip", _capture_async_call(kill_switch_sent))
+    monkeypatch.setattr(main.notifier, "send_db_unavailable", _capture_async_call(db_sent))
     monkeypatch.setattr(main, "_run_async", lambda coro: coro.close())
 
-    main._alert_if_kill_switch_tripped("AAPL", "buy 100 shares", "kill_switch")
-    assert len(sent) == 1
-    assert "AAPL" in sent[0]["args"][0]
-    assert "kill switch" in sent[0]["args"][0]
+    main._alert_for_block_reason("AAPL", "buy 100 shares", "kill_switch")
+    assert len(kill_switch_sent) == 1
+    assert "AAPL" in kill_switch_sent[0]["args"][0]
+    assert "kill switch" in kill_switch_sent[0]["args"][0]
 
-    main._alert_if_kill_switch_tripped("AAPL", "buy 100 shares", "dry_run")
-    assert len(sent) == 1  # unchanged -- a routine block reason never alerts
+    main._alert_for_block_reason("AAPL", "buy 100 shares", "db_unavailable")
+    assert len(db_sent) == 1
+    assert "AAPL" in db_sent[0]["args"][0]
+
+    main._alert_for_block_reason("AAPL", "buy 100 shares", "dry_run")
+    assert len(kill_switch_sent) == 1 and len(db_sent) == 1  # unchanged -- a routine reason never alerts
 
 
 def test_buy_shares_blocked_by_kill_switch_alerts_at_the_real_call_site(monkeypatch):

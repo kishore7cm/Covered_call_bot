@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import pytest
 
 import config
+import logger
 import trader
 
 
@@ -223,21 +224,23 @@ def _reset_per_cycle_state(monkeypatch, tmp_path):
     """
     MAX_ORDERS_PER_CYCLE's counter is module-level in trader.py (every
     order-placing function needs to see the same running count), so it
-    must not leak between tests. get_own_symbols/get_rolls_since_last_lot_open
-    are real Postgres queries by default -- patched here so tests don't
-    need a real database; tests about their specific scoping override
-    them. The quote data clients and LIMIT_ORDER_STEP_PAUSE_SECONDS are
-    patched to permissive/fast defaults for the same reason -- a test
-    that doesn't care about pricing or timing shouldn't need to set them
-    up itself. _NEEDS_ATTENTION_PATH is redirected to tmp_path for EVERY
-    test, not just the dedicated round-trip test -- a roll_call test that
-    exercises the uncovered-shares path would otherwise write a real flag
-    to pipeline_state/needs_attention.json and leak it into every test
-    that runs after it in the same session.
+    must not leak between tests. get_own_symbols/get_rolls_since_last_lot_open/
+    is_db_available are real Postgres queries by default -- patched here
+    so tests don't need a real database; tests about their specific
+    scoping override them. The quote data clients and
+    LIMIT_ORDER_STEP_PAUSE_SECONDS are patched to permissive/fast
+    defaults for the same reason -- a test that doesn't care about
+    pricing or timing shouldn't need to set them up itself.
+    _NEEDS_ATTENTION_PATH is redirected to tmp_path for EVERY test, not
+    just the dedicated round-trip test -- a roll_call test that exercises
+    the uncovered-shares path would otherwise write a real flag to
+    pipeline_state/needs_attention.json and leak it into every test that
+    runs after it in the same session.
     """
     trader.reset_cycle_order_count()
     monkeypatch.setattr(trader, "get_own_symbols", lambda: set())
     monkeypatch.setattr(trader, "get_rolls_since_last_lot_open", lambda symbol: 0)
+    monkeypatch.setattr(trader, "is_db_available", lambda: True)
     monkeypatch.setattr(trader, "_stock_data_client", FakeQuoteDataClient())
     monkeypatch.setattr(trader, "_NEEDS_ATTENTION_PATH", str(tmp_path / "needs_attention.json"))
     # FavorableRollQuoteClient (not a flat quote) so roll_call tests that
@@ -371,6 +374,90 @@ def test_kill_switch_file_blocks_even_with_dry_run_off(monkeypatch, tmp_path):
     assert fake.submitted_orders == []
     assert result["submitted"] is False
     assert result["block_reason"] == "kill_switch"
+
+
+# ── DB-availability guard ────────────────────────────────────────────────────
+
+def test_db_raising_mid_cycle_blocks_every_order_when_dry_run_is_false(monkeypatch):
+    """The general case: DATABASE_URL IS configured, but the connection
+    itself raises mid-cycle (an outage) -- with DRY_RUN off, no order of
+    ANY kind must reach the broker."""
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked(monkeypatch)
+    monkeypatch.setattr(trader, "is_db_available", lambda: False)
+
+    result = trader.buy_shares("AAPL", qty=100, estimated_price=10.0)
+
+    assert fake.submitted_orders == []
+    assert result["submitted"] is False
+    assert result["block_reason"] == "db_unavailable"
+
+
+def test_database_url_unset_and_dry_run_false_blocks_the_order(monkeypatch):
+    """DATABASE_URL simply never being set at all must be treated
+    identically to a live connection failure -- "unavailable" either way."""
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked(monkeypatch)
+    # Use the REAL is_db_available() (the autouse fixture defaults it to
+    # an always-available stub), against a genuinely unset DATABASE_URL.
+    monkeypatch.setattr(trader, "is_db_available", logger.is_db_available)
+    monkeypatch.setattr(logger, "DATABASE_URL", "")
+
+    result = trader.sell_to_open_call("AAPL261113C00200000", qty=1)
+
+    assert fake.submitted_orders == []
+    assert result["submitted"] is False
+    assert result["block_reason"] == "db_unavailable"
+
+
+def test_db_unavailable_check_is_skipped_entirely_when_dry_run_is_true(monkeypatch):
+    """A DRY_RUN rehearsal with no database configured (this repo's own
+    default dev setup) must keep blocking via "dry_run", not suddenly
+    report "db_unavailable" instead -- the new check must not change
+    behavior for the existing, routine DRY_RUN=True case."""
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    monkeypatch.setattr(trader, "DRY_RUN", True)
+    monkeypatch.setattr(trader, "is_db_available", lambda: False)
+
+    result = trader.buy_shares("AAPL", qty=100, estimated_price=10.0)
+
+    assert result["block_reason"] == "dry_run"
+
+
+def test_db_available_and_dry_run_false_does_not_block_on_db_grounds(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked(monkeypatch)
+    monkeypatch.setattr(trader, "is_db_available", lambda: True)
+
+    result = trader.buy_shares("AAPL", qty=100, estimated_price=10.0)
+
+    assert result["submitted"] is True
+    assert len(fake.submitted_orders) == 1
+
+
+def test_is_db_available_false_when_database_url_unset(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "")
+    assert logger.is_db_available() is False
+
+
+def test_is_db_available_false_when_connection_raises(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+
+    def _raise_connect():
+        raise Exception("connection refused")
+    monkeypatch.setattr(logger, "_connect", _raise_connect)
+
+    assert logger.is_db_available() is False
+
+
+def test_is_db_available_true_when_connection_succeeds(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    monkeypatch.setattr(logger, "_connect", lambda: _FakeDBConn(set()))
+    assert logger.is_db_available() is True
 
 
 def test_guard_lets_real_order_through_when_both_off(monkeypatch):
@@ -1161,6 +1248,84 @@ def test_other_bots_positions_are_excluded_from_this_bots_caps(monkeypatch):
 
     assert len(fake.submitted_orders) == 1
     assert result["submitted"] is True
+
+
+class _FakeDBCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, *a, **k):
+        pass
+
+    def fetchall(self):
+        return [(r,) for r in self._rows]
+
+
+class _FakeDBConn:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def cursor(self):
+        return _FakeDBCursor(self._rows)
+
+
+def test_get_own_symbols_db_failure_fails_closed_not_open(monkeypatch):
+    """
+    FIXED: logger.get_own_symbols() now returns None (not set()) on a
+    genuine DB failure, distinguishable from "verified: owns nothing" --
+    and _check_hard_limits() fails closed (cap_check_unavailable) on
+    None, rather than silently treating a DB outage the same as this bot
+    legitimately owning nothing.
+
+    Demonstrated here: AAPL already has $19,900 deployed (this bot's own
+    prior buy). MAX_TOTAL_CAPITAL is $20,000. A new $500 buy on a
+    DIFFERENT symbol correctly blocks via max_total_capital when the DB
+    works (control case below) -- and now ALSO blocks (via
+    cap_check_unavailable, not a silent pass-through) when the DB
+    connection raises, instead of going through because AAPL's exposure
+    became invisible.
+    """
+    monkeypatch.setattr(trader, "get_own_symbols", logger.get_own_symbols)  # use the REAL function
+    # Isolate THIS fix from the separate, broader db_unavailable guard
+    # (also added this round) -- that one would otherwise block first and
+    # mask whether _check_hard_limits's OWN None-handling actually works.
+    monkeypatch.setattr(trader, "is_db_available", lambda: True)
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    monkeypatch.setattr(trader, "MAX_TOTAL_CAPITAL", 20_000.0)
+    fake = FakeBroker(positions=[FakePosition("AAPL", market_value="-19900.0")])
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked(monkeypatch)
+
+    # Control: a WORKING DB that correctly reports AAPL as this bot's own
+    # symbol blocks the cap as expected.
+    monkeypatch.setattr(logger, "_connect", lambda: _FakeDBConn({"AAPL"}))
+    blocked_result = trader.buy_shares("MSFT", qty=1, estimated_price=500.0)
+    assert blocked_result["block_reason"] == "max_total_capital"
+
+    # The DB connection raises (simulating an outage) -- get_own_symbols()
+    # now returns None, and _check_hard_limits fails closed on it rather
+    # than silently letting AAPL's exposure disappear.
+    def _raise_connect():
+        raise Exception("connection refused")
+    monkeypatch.setattr(logger, "_connect", _raise_connect)
+
+    result = trader.buy_shares("MSFT", qty=1, estimated_price=500.0)
+
+    assert result["submitted"] is False
+    assert result["block_reason"] == "cap_check_unavailable"
+    assert len(fake.submitted_orders) == 0
 
 
 def test_account_level_limit_blocks_regardless_of_per_symbol_room(monkeypatch):
