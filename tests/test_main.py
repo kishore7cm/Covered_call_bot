@@ -11,6 +11,8 @@ the real broker by accident.
 import asyncio
 import json
 import os
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
@@ -1101,6 +1103,61 @@ def test_acquire_lock_refuses_a_second_instance(monkeypatch, tmp_path):
 def test_release_lock_with_no_lock_present_is_a_no_op(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "LOCK_PATH", str(tmp_path / "main.lock"))
     main._release_lock()  # must not raise
+
+
+def _exited_pid() -> int:
+    """A real PID guaranteed to have already exited -- spawn a trivial
+    subprocess and wait for it, rather than guessing a bogus number."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_pid_is_alive_true_for_the_current_process():
+    assert main._pid_is_alive(os.getpid()) is True
+
+
+def test_pid_is_alive_false_for_a_pid_that_already_exited():
+    assert main._pid_is_alive(_exited_pid()) is False
+
+
+def test_acquire_lock_treats_a_dead_pid_lock_as_stale_and_clears_it(monkeypatch, tmp_path, capsys):
+    lock_path = tmp_path / "main.lock"
+    lock_path.write_text(str(_exited_pid()))
+    monkeypatch.setattr(main, "LOCK_PATH", str(lock_path))
+
+    main._acquire_lock()  # must not raise -- the stale lock is cleared and reacquired
+
+    assert lock_path.read_text().strip() == str(os.getpid())
+    out = capsys.readouterr().out
+    assert "stale lock" in out.lower()
+
+    main._release_lock()
+
+
+def test_acquire_lock_refuses_when_existing_pid_is_still_alive(monkeypatch, tmp_path):
+    lock_path = tmp_path / "main.lock"
+    lock_path.write_text(str(os.getpid()))  # this test process itself -- definitely alive
+    monkeypatch.setattr(main, "LOCK_PATH", str(lock_path))
+
+    with pytest.raises(SystemExit):
+        main._acquire_lock()
+
+    assert lock_path.read_text().strip() == str(os.getpid())  # untouched, not cleared
+
+
+def test_acquire_lock_refuses_when_lock_content_is_malformed(monkeypatch, tmp_path):
+    """A lock file whose content can't be parsed as a PID at all is
+    "can't confirm it's dead," not "assume it's stale" -- must still
+    refuse, the same as a genuinely-alive PID would."""
+    lock_path = tmp_path / "main.lock"
+    lock_path.write_text("not-a-pid")
+    monkeypatch.setattr(main, "LOCK_PATH", str(lock_path))
+
+    with pytest.raises(SystemExit):
+        main._acquire_lock()
+
+    assert lock_path.read_text() == "not-a-pid"  # untouched, not cleared
 
 
 # ── --once: init_schema, exactly one cycle, exit ─────────────────────────────

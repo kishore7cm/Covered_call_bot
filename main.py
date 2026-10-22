@@ -67,6 +67,23 @@ def _check_paper_mode() -> None:
     config.assert_paper_mode()
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """
+    os.kill(pid, 0) sends no signal, it just probes whether the process
+    exists. A PermissionError means it exists but is owned by someone
+    else -- treated as alive, since that's "can't confirm it's dead," not
+    "confirmed dead," and this must never auto-clear a lock it can't
+    actually verify is stale.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _acquire_lock() -> None:
     """
     Refuses to start if another instance's lockfile is already present --
@@ -75,23 +92,39 @@ def _acquire_lock() -> None:
     at once is exactly the kind of double-submission risk a single
     always-running worker is supposed to avoid. O_CREAT|O_EXCL makes the
     check-and-create atomic rather than a separate exists-then-write race.
-    There is deliberately no automatic staleness timeout -- same policy as
-    needs_attention.json: a lockfile left behind by a crash (not a clean
-    exit) must be removed by a human who has confirmed no other instance
-    is actually running, not auto-expired after a guessed timeout.
+
+    An existing lock whose PID is no longer running (the prior process
+    crashed -- kill -9, a power loss -- without reaching _release_lock's
+    cleanup) is treated as STALE: logged loudly, removed, and acquisition
+    retried once, rather than requiring a human to notice and clear it by
+    hand every time. A lock whose PID IS still alive (or whose content is
+    missing/malformed -- "can't confirm it's dead") is never auto-cleared,
+    same deliberate policy as needs_attention.json.
     """
     os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
     try:
         fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        existing_pid = ""
+        existing_pid_str = ""
         try:
             with open(LOCK_PATH) as f:
-                existing_pid = f.read().strip()
+                existing_pid_str = f.read().strip()
         except OSError:
             pass
+
+        existing_pid = int(existing_pid_str) if existing_pid_str.isdigit() else None
+        if existing_pid is not None and not _pid_is_alive(existing_pid):
+            logger.warning(
+                "%s has a stale lock (pid %d is not running) — clearing it and retrying",
+                LOCK_PATH, existing_pid,
+            )
+            print(f"Stale lock detected ({LOCK_PATH}, pid {existing_pid} not running) — clearing it.")
+            os.remove(LOCK_PATH)
+            _acquire_lock()
+            return
+
         print(
-            f"REFUSING TO START: {LOCK_PATH} already exists (pid {existing_pid or '?'}). "
+            f"REFUSING TO START: {LOCK_PATH} already exists (pid {existing_pid_str or '?'}, still running). "
             "If no other instance of main.py is actually running, remove the lockfile and retry.",
             file=sys.stderr,
         )
