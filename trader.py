@@ -153,15 +153,21 @@ def _check_hard_limits(symbol: str | None, estimated_dollars: float | None, open
     try:
         account = _client.get_account()
         positions = _client.get_all_positions()
-    except APIError as e:
+        buying_power = float(account.buying_power)
+    except (APIError, TypeError, ValueError) as e:
+        # TypeError/ValueError here on purpose, not just APIError: Alpaca's
+        # own Account/Position models type buying_power/market_value as
+        # Optional[str] -- a None (real-time data temporarily unavailable)
+        # would otherwise raise an uncaught TypeError past this function
+        # instead of failing closed the same way an API error does.
         _log.error("_check_hard_limits: broker read failed: %s — failing closed", e)
         return "cap_check_unavailable"
 
-    if float(account.buying_power) < MIN_ACCOUNT_BUYING_POWER:
+    if buying_power < MIN_ACCOUNT_BUYING_POWER:
         _log.warning(
             "Account buying power $%.2f is below MIN_ACCOUNT_BUYING_POWER $%.2f — blocking new positions "
             "(account-level limit, not this bot's own budget)",
-            float(account.buying_power), MIN_ACCOUNT_BUYING_POWER,
+            buying_power, MIN_ACCOUNT_BUYING_POWER,
         )
         return "account_level_limit"
 
@@ -169,8 +175,12 @@ def _check_hard_limits(symbol: str | None, estimated_dollars: float | None, open
     own_equity_positions = [
         p for p in positions if p.asset_class == AssetClass.US_EQUITY and p.symbol in own_symbols
     ]
-    current_symbol_dollars = sum(abs(float(p.market_value)) for p in own_equity_positions if p.symbol == symbol)
-    current_total_dollars = sum(abs(float(p.market_value)) for p in own_equity_positions)
+    try:
+        current_symbol_dollars = sum(abs(float(p.market_value)) for p in own_equity_positions if p.symbol == symbol)
+        current_total_dollars = sum(abs(float(p.market_value)) for p in own_equity_positions)
+    except (TypeError, ValueError) as e:
+        _log.error("_check_hard_limits: a position's market_value was unusable (%s) — failing closed", e)
+        return "cap_check_unavailable"
     distinct_symbols = {p.symbol for p in own_equity_positions}
 
     if current_symbol_dollars + estimated_dollars > MAX_CAPITAL_PER_SYMBOL:

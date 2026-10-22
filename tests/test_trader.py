@@ -810,6 +810,34 @@ def test_broker_read_failure_during_cap_check_fails_closed(monkeypatch):
     assert result["block_reason"] == "cap_check_unavailable"
 
 
+def test_none_buying_power_fails_closed_not_uncaught(monkeypatch):
+    """Alpaca types Account.buying_power as Optional[str] -- a None here
+    (real-time data temporarily unavailable) must fail closed like any
+    other broker-read problem, not raise an uncaught TypeError past the guard."""
+    fake = FakeBroker(buying_power=None)
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked(monkeypatch)
+
+    result = trader.buy_shares("AAPL", qty=1, estimated_price=100.0)
+
+    assert fake.submitted_orders == []
+    assert result["block_reason"] == "cap_check_unavailable"
+
+
+def test_none_market_value_fails_closed_not_uncaught(monkeypatch):
+    """Same gap, for Position.market_value -- also typed Optional[str] by
+    Alpaca."""
+    fake = FakeBroker(positions=[FakePosition("AAPL", market_value=None)])
+    monkeypatch.setattr(trader, "_client", fake)
+    monkeypatch.setattr(trader, "get_own_symbols", lambda: {"AAPL"})
+    _unblocked(monkeypatch)
+
+    result = trader.buy_shares("AAPL", qty=1, estimated_price=100.0)
+
+    assert fake.submitted_orders == []
+    assert result["block_reason"] == "cap_check_unavailable"
+
+
 def test_max_orders_per_cycle_blocks_after_limit_reached(monkeypatch):
     fake = FakeBroker()
     monkeypatch.setattr(trader, "_client", fake)
