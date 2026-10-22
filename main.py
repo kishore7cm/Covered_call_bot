@@ -122,6 +122,20 @@ def _track_iv_history(symbol: str) -> str | None:
     return f"{symbol}: IV={atm_iv:.2f}, rank={rank:.0f}%, percentile={pctl:.0f}%"
 
 
+def _order_status(result: dict | None) -> str:
+    """
+    Classify a trader.py order result. "failed" = broker rejected it for
+    real (None). "blocked" = intentionally not submitted (DRY_RUN/kill
+    switch) -- not a failure, and must NEVER be logged to Postgres as if
+    it were a real fill. "ok" = a real submission went through.
+    """
+    if result is None:
+        return "failed"
+    if result.get("submitted") is False:
+        return "blocked"
+    return "ok"
+
+
 def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
     """
     Run one covered-call decision cycle for a single symbol. Returns a short
@@ -141,30 +155,61 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
 
     # ── State 1: no shares — buy a lot ──────────────────────────────────────
     if share_qty < SHARES_PER_LOT:
+        # A nonzero-but-partial share count (not 0, not a full lot) is an
+        # unexpected broker state this state machine was never designed to
+        # resolve on its own — e.g. a prior buy_shares DAY order that only
+        # partially filled before expiring. Topping up blindly could
+        # compound whatever caused it; skip and surface it instead of
+        # guessing.
+        if share_qty > 0:
+            msg = f"{symbol}: partial share quantity ({share_qty}, expected 0 or {SHARES_PER_LOT}) — needs manual review"
+            log_error("main.run_symbol_cycle", msg)
+            _run_async(notifier.send_error(symbol, msg))
+            return f"{symbol}: SKIPPED — {msg}"
+
         # Distinguish "never held shares yet" from "shares were just
-        # assigned away" via the trade log, rather than in-process state
-        # that wouldn't survive a restart — find_short_call() already
-        # confirms there's no open short call to account for the missing
-        # shares, and get_last_open_occ_symbol() tells us whether we ever
-        # sold one in the first place.
+        # assigned away" — find_short_call() already confirms there's no
+        # open short call to account for the missing shares, and
+        # get_last_open_occ_symbol() (local trade log) tells us whether we
+        # ever sold one in the first place. That local signal alone is not
+        # proof of assignment though — it's just "we recall selling a call
+        # at some point" — so it's cross-checked against Alpaca's own
+        # OPASN activity record before acting on it. If the broker record
+        # can't confirm it, this is treated as ambiguous and the symbol is
+        # skipped rather than assumed assigned (which would otherwise buy
+        # a fresh lot on top of whatever is actually going on).
         last_occ_symbol = get_last_open_occ_symbol(symbol) if short_call is None else None
-        if share_qty == 0 and last_occ_symbol:
-            status = trader.check_assignment(symbol, SHARES_PER_LOT)
-            if status == "assigned":
-                parsed = parse_occ_symbol(last_occ_symbol)
-                log_option_trade(
-                    symbol, last_occ_symbol, "ASSIGNED",
-                    strike=parsed.strike, expiration=parsed.expiration,
-                    underlying_price=_get_spot_price(symbol),
+        if last_occ_symbol:
+            activities = trader.get_option_activities(symbol)
+            confirmed_assignment = activities is not None and any(
+                a.get("activity_type") == "OPASN" for a in activities
+            )
+            if not confirmed_assignment:
+                msg = (
+                    f"{symbol}: shares at 0 with a previously-open call ({last_occ_symbol}) but the "
+                    "broker's own activity history does not confirm an assignment — ambiguous, skipping "
+                    "rather than assuming"
                 )
-                _run_async(notifier.send_call_closed(symbol, last_occ_symbol, "assigned", 0.0))
-            elif status == "unexpected_shares":
-                log_error("main.run_symbol_cycle", f"{symbol}: share count mismatch after expected assignment")
+                log_error("main.run_symbol_cycle", msg)
+                _run_async(notifier.send_error(symbol, msg))
+                return f"{symbol}: SKIPPED — ambiguous assignment state, needs manual review"
+
+            parsed = parse_occ_symbol(last_occ_symbol)
+            log_option_trade(
+                symbol, last_occ_symbol, "ASSIGNED",
+                strike=parsed.strike, expiration=parsed.expiration,
+                underlying_price=_get_spot_price(symbol),
+            )
+            _run_async(notifier.send_call_closed(symbol, last_occ_symbol, "assigned", 0.0))
 
         result = trader.buy_shares(symbol, SHARES_PER_LOT)
-        if result is None:
+        status = _order_status(result)
+        if status == "failed":
             log_error("main.run_symbol_cycle", f"{symbol}: buy_shares failed")
             return f"{symbol}: FAILED to buy shares"
+        if status == "blocked":
+            logger.info("%s: buy_shares blocked (%s) — not logging as a real trade", symbol, result["block_reason"])
+            return f"{symbol}: would buy {SHARES_PER_LOT} shares ({result['block_reason']} — not submitted)"
         log_share_trade(symbol, "BUY", SHARES_PER_LOT, price=result.get("price"), order_id=result["order_id"])
         _run_async(notifier.send_shares_bought(symbol, SHARES_PER_LOT, result["order_id"]))
         return f"{symbol}: bought {SHARES_PER_LOT} shares"
@@ -181,9 +226,18 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
             return f"{symbol}: no suitable strike found this cycle (held)"
 
         result = trader.sell_to_open_call(candidate.occ_symbol, qty=1)
-        if result is None:
+        status = _order_status(result)
+        if status == "failed":
             log_error("main.run_symbol_cycle", f"{symbol}: sell_to_open_call failed")
             return f"{symbol}: FAILED to sell call"
+        if status == "blocked":
+            logger.info(
+                "%s: sell_to_open_call blocked (%s) — not logging as a real trade", symbol, result["block_reason"]
+            )
+            return (
+                f"{symbol}: would sell {candidate.occ_symbol} @ ${candidate.mid_price:.2f} "
+                f"(delta {candidate.delta:.2f}) ({result['block_reason']} — not submitted)"
+            )
 
         log_option_trade(
             symbol, candidate.occ_symbol, "SELL_TO_OPEN",
@@ -199,23 +253,46 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
 
     # ── State 3: shares + short call open — check close/roll rules ──────────
     occ_symbol = short_call.symbol
-    # NOTE — unverified against a live position: this assumes Alpaca's
-    # cost_basis/market_value for an option Position already include the
-    # 100x contract multiplier (consistent with how equities report total
-    # dollar cost_basis = qty * price). The account was flat with no open
-    # option positions when this was written, so there was nothing live to
-    # check it against. Verify this against the first real short call this
-    # bot opens — print both raw fields before trusting profit_captured_pct
-    # for a close decision.
-    entry_credit = abs(float(short_call.cost_basis)) / 100.0
-    current_value = abs(float(short_call.market_value)) / 100.0
-    profit_captured_pct = (entry_credit - current_value) / entry_credit if entry_credit else 0.0
+    # NOTE — still unverified against a live position: this assumes
+    # Alpaca's cost_basis/market_value for an option Position already
+    # include the 100x contract multiplier (consistent with how equities
+    # report total dollar cost_basis = qty * price), and abs() is used on
+    # both sides specifically so the result doesn't depend on guessing
+    # Alpaca's sign convention for a short position correctly. The account
+    # has never held a live option position, so there is nothing to check
+    # this against yet. Confirm against the first real short call this bot
+    # opens — print both raw fields before trusting profit_captured_pct for
+    # a close decision. Until then, fail closed (skip profit-take, don't
+    # guess) whenever the numbers don't look sane, rather than silently
+    # treating bad data as "0% captured."
+    profit_captured_pct = None
+    try:
+        entry_credit = abs(float(short_call.cost_basis)) / 100.0
+        current_value = abs(float(short_call.market_value)) / 100.0
+    except (TypeError, ValueError):
+        entry_credit = current_value = None
 
-    if profit_captured_pct >= PROFIT_TAKE_PCT:
+    if entry_credit is None or entry_credit <= 0 or current_value is None or current_value < 0:
+        log_error(
+            "main.run_symbol_cycle",
+            f"{symbol}: cost_basis/market_value look inconsistent for {occ_symbol} "
+            f"(cost_basis={short_call.cost_basis!r}, market_value={short_call.market_value!r}) — "
+            "skipping profit-take check this cycle",
+        )
+    else:
+        profit_captured_pct = (entry_credit - current_value) / entry_credit
+
+    if profit_captured_pct is not None and profit_captured_pct >= PROFIT_TAKE_PCT:
         result = trader.buy_to_close_call(occ_symbol, qty=1)
-        if result is None:
+        status = _order_status(result)
+        if status == "failed":
             log_error("main.run_symbol_cycle", f"{symbol}: buy_to_close_call failed (profit take)")
             return f"{symbol}: FAILED to close {occ_symbol} for profit take"
+        if status == "blocked":
+            logger.info(
+                "%s: buy_to_close_call blocked (%s) — not logging as a real trade", symbol, result["block_reason"]
+            )
+            return f"{symbol}: would close {occ_symbol} for profit take ({result['block_reason']} — not submitted)"
         pnl = (entry_credit - current_value) * 100
         log_option_trade(symbol, occ_symbol, "BUY_TO_CLOSE", premium=current_value, order_id=result["order_id"])
         _run_async(notifier.send_call_closed(symbol, occ_symbol, "profit_take", pnl))
@@ -251,6 +328,13 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
         if result is None:
             log_error("main.run_symbol_cycle", f"{symbol}: roll_call failed")
             return f"{symbol}: FAILED to roll {occ_symbol}"
+        if not result["closed"].get("submitted", True):
+            # Both legs share one DRY_RUN/kill-switch block reason here --
+            # roll_call never attempts the open leg for real when the close
+            # leg wasn't real either, so checking the close leg is enough.
+            block_reason = result["closed"]["block_reason"]
+            logger.info("%s: roll_call blocked (%s) — not logging as a real trade", symbol, block_reason)
+            return f"{symbol}: would roll {occ_symbol} -> {new_candidate.occ_symbol} ({block_reason} — not submitted)"
 
         log_option_trade(symbol, new_candidate.occ_symbol, "ROLL",
                           strike=new_candidate.strike, expiration=new_candidate.expiration,
@@ -259,6 +343,8 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
         _run_async(notifier.send_call_rolled(symbol, occ_symbol, new_candidate.occ_symbol, 0.0))
         return f"{symbol}: rolled {occ_symbol} -> {new_candidate.occ_symbol}"
 
+    if profit_captured_pct is None:
+        return f"{symbol}: holding {occ_symbol} (profit captured unavailable — cost_basis/market_value looked inconsistent)"
     return f"{symbol}: holding {occ_symbol} ({profit_captured_pct:.0%} profit captured)"
 
 

@@ -190,3 +190,42 @@ def test_roll_call_close_leg_failure_never_attempts_open_leg(monkeypatch):
 
     assert result is None
     assert fake.submitted_orders == []
+
+
+class FakeActivitiesClient:
+    """Stands in for _client for get_option_activities -- a read-only
+    query, not an order, so it's intentionally NOT behind _guard()."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    def get(self, path, params):
+        self.calls.append((path, params))
+        return self.rows
+
+
+def test_get_option_activities_filters_to_matching_root(monkeypatch):
+    rows = [
+        {"activity_type": "OPASN", "symbol": "AAPL261113C00200000"},
+        {"activity_type": "OPEXP", "symbol": "AAPLE261113C00200000"},  # different root, must not match
+        {"activity_type": "FILL", "symbol": "AAPL"},  # no digit after root, must not match
+    ]
+    fake = FakeActivitiesClient(rows)
+    monkeypatch.setattr(trader, "_client", fake)
+
+    result = trader.get_option_activities("AAPL")
+
+    assert result == [rows[0]]
+    assert fake.calls[0][0] == "/account/activities"
+    assert "OPASN" in fake.calls[0][1]["activity_types"]
+
+
+def test_get_option_activities_returns_none_on_api_error(monkeypatch):
+    class FailingClient:
+        def get(self, path, params):
+            raise trader.APIError("boom")
+
+    monkeypatch.setattr(trader, "_client", FailingClient())
+
+    assert trader.get_option_activities("AAPL") is None

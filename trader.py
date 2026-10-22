@@ -23,6 +23,7 @@ import logging
 import os
 import time
 import uuid
+from datetime import date, timedelta
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
@@ -128,6 +129,56 @@ def find_short_call(underlying: str):
         if p.symbol[:root_len] == underlying and p.symbol[root_len:root_len + 1].isdigit():
             return p
     return None
+
+
+# Alpaca's account-activities endpoint (/v2/account/activities) isn't wrapped
+# by a typed TradingClient method -- alpaca-py's typed get_account_activities
+# only exists on the separate Broker-API client (alpaca.broker.client), not
+# the single-account TradingClient this bot uses. It's reachable through the
+# generic RESTClient.get() every TradingClient inherits, confirmed live
+# against this paper account (returns raw dicts, HTTP 200, these activity
+# type codes accepted). OPASN/OPEXP/OPEXC are read-only data, not an order,
+# so they are NOT behind _guard() -- DRY_RUN only concerns submission.
+_OPTION_ACTIVITY_TYPES = "OPASN,OPEXP,OPEXC"
+
+
+def get_option_activities(underlying: str, lookback_days: int = 14) -> list[dict] | None:
+    """
+    Query Alpaca's own record of option assignment (OPASN), expiration
+    (OPEXP), and exercise (OPEXC) events for `underlying`, as the
+    broker-authoritative cross-check for "was this symbol's short call
+    actually assigned" rather than inferring it purely from "shares are
+    now 0 and we recall selling a call" (local history alone).
+
+    CAUTION -- field shapes below are NOT verified against a live OPASN/
+    OPEXP row: this paper account has never had an option position reach
+    assignment or expiration, so there is nothing live to confirm the
+    exact field population against (e.g. whether "symbol" is the OCC
+    contract or the underlying root). They're taken from alpaca-py's
+    NonTradeActivity model docs. Re-verify the parsing below the first
+    time a real assignment or expiration happens on this account, and
+    until then treat a None/empty return as "couldn't confirm" rather
+    than "confirmed nothing happened" -- callers must fail closed on
+    that, not assume "no activity" proves "no assignment."
+
+    Returns None on an API error (fail-soft read, same convention as the
+    rest of this module), otherwise the filtered list (possibly empty).
+    """
+    after = (date.today() - timedelta(days=lookback_days)).isoformat()
+    try:
+        rows = _client.get("/account/activities", {"activity_types": _OPTION_ACTIVITY_TYPES, "after": after})
+    except APIError as e:
+        _log.error("get_option_activities(%s) failed: %s", underlying, e)
+        return None
+
+    root_len = len(underlying)
+    matched = []
+    for row in rows:
+        sym = row.get("symbol") or ""
+        # Same root-match guard as find_short_call -- "F" must not match "FB...".
+        if sym[:root_len] == underlying and sym[root_len:root_len + 1].isdigit():
+            matched.append(row)
+    return matched
 
 
 # ── Shares ────────────────────────────────────────────────────────────────────
@@ -263,27 +314,3 @@ def roll_call(old_occ_symbol: str, new_occ_symbol: str, qty: int = 1) -> dict | 
         return None
 
     return {"closed": close, "opened": open_}
-
-
-# ── Assignment / expiration reconciliation ───────────────────────────────────
-
-def check_assignment(symbol: str, expected_shares: int) -> str:
-    """
-    Compare actual share count to what we expect to hold. Call this the
-    cycle after an expiration Friday for any symbol that had a short call
-    expiring. Returns one of: 'as_expected', 'assigned', 'unexpected_shares'.
-    """
-    pos = get_share_position(symbol)
-    actual = int(float(pos.qty)) if pos else 0
-
-    if actual == expected_shares:
-        return "as_expected"
-    if actual == 0 and expected_shares > 0:
-        _log.info("%s: shares gone — short call was assigned", symbol)
-        return "assigned"
-
-    _log.warning(
-        "%s: share count mismatch — expected %s, actual %s. Needs investigation.",
-        symbol, expected_shares, actual,
-    )
-    return "unexpected_shares"
