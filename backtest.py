@@ -115,7 +115,8 @@ import pandas as pd
 import yfinance as yf
 
 from config import (
-    DEFAULT_ASSUMED_SPREAD_PCT, DELTA_SWEEP_BUCKETS, FILL_HAIRCUT_FRACTION,
+    DEFAULT_ASSUMED_SPREAD_PCT, DEFAULT_INTENT, DELTA_SWEEP_BUCKETS,
+    FILL_HAIRCUT_FRACTION, INTENT_BAND_SWEEP_POINTS, INTENT_DELTA_BANDS,
     MIN_CYCLES_FOR_SELECTION, MIN_DRAWDOWN_FLOOR_PCT, RISK_FREE_RATE,
     SHRINKAGE_MIN_CYCLES, TARGET_DELTA, WALK_FORWARD_TRAIN_FRACTION,
 )
@@ -130,6 +131,7 @@ DEFAULT_LOOKBACK = "5y"
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_SCREENER_IN_PATH = "pipeline_state/screened_symbols.json"
 DEFAULT_PROPOSED_OUT_PATH = "pipeline_state/proposed_watchlist.json"
+INTENTS_PATH = "pipeline_state/intents.json"
 
 
 @dataclass
@@ -172,6 +174,61 @@ class CycleStats:
     oos_total_return_pct: float | None = None
     oos_max_drawdown_pct: float | None = None
     oos_risk_adjusted_return: float | None = None
+
+    # Intent (pipeline_state/intents.json): human intent, and which delta
+    # band Oracle swept for this symbol as a result. intent_is_default
+    # distinguishes "nobody listed this symbol" from "somebody explicitly
+    # chose hold" -- both resolve to the same intent value, but the diff
+    # should never present them identically.
+    intent: str | None = None
+    intent_is_default: bool | None = None
+
+
+def _load_intents(path: str = INTENTS_PATH) -> dict[str, str]:
+    """
+    Flat {symbol: "hold"|"exit"} -- human-edited. pipeline_state/intents.json
+    is the one file in that directory carved out of .gitignore's blanket
+    rule and tracked in git (same spirit as config.WATCHLIST): a deliberate
+    decision, not a regenerable pipeline artifact. Missing file means every
+    symbol falls through to DEFAULT_INTENT -- see _resolve_intent().
+    """
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def _resolve_intent(symbol: str, explicit_intents: dict[str, str]) -> tuple[str, bool]:
+    """
+    Returns (intent, was_default). was_default distinguishes "nobody listed
+    this symbol" from "somebody explicitly chose hold" -- both resolve to
+    the same intent value, but __main__/apply_watchlist.py must never show
+    them identically. An intent value that isn't a recognized band (typo in
+    the human-edited file) logs a warning and falls back to the default
+    rather than crashing or silently sweeping an empty band.
+    """
+    if symbol not in explicit_intents:
+        return DEFAULT_INTENT, True
+
+    intent = explicit_intents[symbol]
+    if intent not in INTENT_DELTA_BANDS:
+        _log.warning(
+            "%s: intents.json has unrecognized intent %r (valid: %s) -- falling back to default %r",
+            symbol, intent, sorted(INTENT_DELTA_BANDS), DEFAULT_INTENT,
+        )
+        return DEFAULT_INTENT, True
+
+    return intent, False
+
+
+def _delta_buckets_for_intent(intent: str) -> tuple[float, ...]:
+    """INTENT_BAND_SWEEP_POINTS evenly-spaced delta points spanning that
+    intent's band (inclusive of both ends)."""
+    lo, hi = INTENT_DELTA_BANDS.get(intent, INTENT_DELTA_BANDS[DEFAULT_INTENT])
+    if INTENT_BAND_SWEEP_POINTS <= 1:
+        return (round((lo + hi) / 2.0, 4),)
+    step = (hi - lo) / (INTENT_BAND_SWEEP_POINTS - 1)
+    return tuple(round(lo + step * i, 4) for i in range(INTENT_BAND_SWEEP_POINTS))
 
 
 def _price_history(symbol: str, lookback: str = DEFAULT_LOOKBACK) -> pd.Series:
@@ -410,6 +467,8 @@ def backtest_symbol_total_return(
     haircut_fraction: float = FILL_HAIRCUT_FRACTION,
     train_fraction: float = WALK_FORWARD_TRAIN_FRACTION,
     min_cycles_for_selection: int = MIN_CYCLES_FOR_SELECTION,
+    intent: str = DEFAULT_INTENT,
+    intent_is_default: bool = False,
 ) -> CycleStats | None:
     """
     Task 2's main entry point. Sweeps dte_buckets x delta_buckets on the
@@ -481,6 +540,8 @@ def backtest_symbol_total_return(
         oos_total_return_pct=oos_stats.total_return_pct if oos_stats is not None else None,
         oos_max_drawdown_pct=oos_stats.max_drawdown_pct if oos_stats is not None else None,
         oos_risk_adjusted_return=oos_stats.risk_adjusted_return if oos_stats is not None else None,
+        intent=intent,
+        intent_is_default=intent_is_default,
     )
 
 
@@ -494,57 +555,78 @@ def apply_dte_shrinkage(
     min_cycles_for_selection: int = MIN_CYCLES_FOR_SELECTION,
 ) -> dict[str, CycleStats]:
     """
-    Pull a symbol's recommended DTE toward the cross-symbol consensus when
-    its own backtest had too few cycles (< min_cycles) to trust its pick on
-    its own. The consensus DTE is the most common pick among symbols that
-    DID clear min_cycles (ties broken by total cycle count behind that
-    DTE); shrinkage weight scales linearly with how close a symbol's own
-    cycle count is to min_cycles, so zero trustworthy cycles shrinks all
-    the way to the consensus and a cycle count right at the threshold
+    Pull a symbol's recommended DTE toward a consensus when its own
+    backtest had too few cycles (< min_cycles) to trust its pick on its
+    own. The consensus is computed SEPARATELY PER INTENT GROUP (hold vs.
+    exit), not globally -- an exit-intent symbol (near-the-money, sold for
+    fast turnover) and a hold-intent symbol (lower delta, held longer)
+    have no reason to converge on the same DTE, and blending them into one
+    consensus would distort both groups. If an intent group has no symbol
+    that clears min_cycles, shrinkage is skipped for that ENTIRE group
+    (logged, not silently defaulted to the other group's consensus or left
+    unexplained) -- there's nothing in that group to anchor a consensus to.
+
+    Within a group: the consensus is the most common DTE among symbols
+    that DID clear min_cycles (ties broken by total cycle count behind
+    that DTE); shrinkage weight scales linearly with how close a symbol's
+    own cycle count is to min_cycles, so zero trustworthy cycles shrinks
+    all the way to the consensus and a cycle count right at the threshold
     barely shrinks at all. Re-backtests each shrunk symbol at its new DTE
-    (same delta/spread it already picked) so every dependent field stays
-    consistent -- an extra yfinance fetch per shrunk symbol, acceptable for
-    an infrequent batch research script.
+    (same delta/spread/intent it already had) so every dependent field
+    stays consistent -- an extra yfinance fetch per shrunk symbol,
+    acceptable for an infrequent batch research script.
     """
-    trusted = [s for s in recommendations.values() if s.num_cycles >= min_cycles]
-    if not trusted:
-        return recommendations  # nothing to anchor a consensus to -- leave every pick as-is
-
-    dte_votes = Counter(s.dte for s in trusted)
-    cycles_by_dte: dict[int, int] = {}
-    for s in trusted:
-        cycles_by_dte[s.dte] = cycles_by_dte.get(s.dte, 0) + s.num_cycles
-    global_best_dte = max(dte_votes, key=lambda d: (dte_votes[d], cycles_by_dte[d]))
-
-    shrunk = {}
+    by_intent: dict[str, dict[str, CycleStats]] = {}
     for symbol, stats in recommendations.items():
-        if stats.num_cycles >= min_cycles or stats.dte == global_best_dte:
-            shrunk[symbol] = stats
-            continue
+        by_intent.setdefault(stats.intent or DEFAULT_INTENT, {})[symbol] = stats
 
-        weight = max(0.0, min(1.0, stats.num_cycles / min_cycles))
-        new_dte = round(weight * stats.dte + (1.0 - weight) * global_best_dte)
-        if new_dte == stats.dte:
-            shrunk[symbol] = stats
-            continue
-
-        refreshed = backtest_symbol_total_return(
-            symbol, dte_buckets=(new_dte,), delta_buckets=(stats.target_delta,),
-            lookback=lookback, spread_pct=stats.spread_pct_used, spread_source=stats.spread_source,
-            rate=rate, haircut_fraction=haircut_fraction, train_fraction=train_fraction,
-            min_cycles_for_selection=min_cycles_for_selection,
-        )
-        if refreshed is None:
+    shrunk: dict[str, CycleStats] = {}
+    for intent, group in by_intent.items():
+        trusted = [s for s in group.values() if s.num_cycles >= min_cycles]
+        if not trusted:
             _log.warning(
-                "%s: shrinkage wanted to move DTE %d -> %d (toward consensus %d) but the refresh "
-                "backtest found no eligible cycles there (none, or fewer than %d) -- keeping the "
-                "original DTE=%d unshrunk",
-                symbol, stats.dte, new_dte, global_best_dte, min_cycles_for_selection, stats.dte,
+                "intent=%s: no symbol had >= %d in-sample cycles -- skipping DTE shrinkage for "
+                "this entire intent group (nothing to anchor a consensus to)",
+                intent, min_cycles,
             )
-            shrunk[symbol] = stats
+            shrunk.update(group)  # leave every symbol in this group exactly as-is
             continue
 
-        shrunk[symbol] = replace(refreshed, shrunk_from_dte=stats.dte)
+        dte_votes = Counter(s.dte for s in trusted)
+        cycles_by_dte: dict[int, int] = {}
+        for s in trusted:
+            cycles_by_dte[s.dte] = cycles_by_dte.get(s.dte, 0) + s.num_cycles
+        group_best_dte = max(dte_votes, key=lambda d: (dte_votes[d], cycles_by_dte[d]))
+
+        for symbol, stats in group.items():
+            if stats.num_cycles >= min_cycles or stats.dte == group_best_dte:
+                shrunk[symbol] = stats
+                continue
+
+            weight = max(0.0, min(1.0, stats.num_cycles / min_cycles))
+            new_dte = round(weight * stats.dte + (1.0 - weight) * group_best_dte)
+            if new_dte == stats.dte:
+                shrunk[symbol] = stats
+                continue
+
+            refreshed = backtest_symbol_total_return(
+                symbol, dte_buckets=(new_dte,), delta_buckets=(stats.target_delta,),
+                lookback=lookback, spread_pct=stats.spread_pct_used, spread_source=stats.spread_source,
+                rate=rate, haircut_fraction=haircut_fraction, train_fraction=train_fraction,
+                min_cycles_for_selection=min_cycles_for_selection,
+                intent=intent, intent_is_default=stats.intent_is_default or False,
+            )
+            if refreshed is None:
+                _log.warning(
+                    "%s: shrinkage wanted to move DTE %d -> %d (toward intent=%s consensus %d) but the "
+                    "refresh backtest found no eligible cycles there (none, or fewer than %d) -- "
+                    "keeping the original DTE=%d unshrunk",
+                    symbol, stats.dte, new_dte, intent, group_best_dte, min_cycles_for_selection, stats.dte,
+                )
+                shrunk[symbol] = stats
+                continue
+
+            shrunk[symbol] = replace(refreshed, shrunk_from_dte=stats.dte)
 
     return shrunk
 
@@ -623,6 +705,11 @@ if __name__ == "__main__":
                               "drawdown/delta-sweep) instead of Task 2's risk-adjusted total-return objective")
     parser.add_argument("--no-shrinkage", action="store_true",
                          help="skip DTE shrinkage toward the cross-symbol consensus")
+    parser.add_argument("--intents", default=INTENTS_PATH,
+                         help="pipeline_state/intents.json-shaped {symbol: 'hold'|'exit'} file")
+    parser.add_argument("--ignore-intents", action="store_true",
+                         help="sweep the flat --delta buckets for every symbol instead of each "
+                              "symbol's own intent-derived delta band")
     parser.add_argument("--out", default=None,
                          help=f"write {{symbol: recommended_dte+stats}} JSON for apply_watchlist.py to consume "
                               f"(default when --from-screener is used: {DEFAULT_PROPOSED_OUT_PATH})")
@@ -641,6 +728,7 @@ if __name__ == "__main__":
 
     dte_buckets = tuple(int(x) for x in args.dte.split(","))
     delta_buckets = tuple(float(x) for x in args.delta.split(","))
+    explicit_intents = {} if args.ignore_intents else _load_intents(args.intents)
 
     recommendations: dict[str, CycleStats] = {}
     for symbol in symbols:
@@ -652,13 +740,20 @@ if __name__ == "__main__":
                     recommendations[symbol] = max(results.values(), key=lambda s: s.avg_annualized_yield)
                 continue
 
+            if args.ignore_intents:
+                intent, intent_is_default, symbol_delta_buckets = DEFAULT_INTENT, True, delta_buckets
+            else:
+                intent, intent_is_default = _resolve_intent(symbol, explicit_intents)
+                symbol_delta_buckets = _delta_buckets_for_intent(intent)
+
             spread_pct = spread_pcts.get(symbol)
             spread_source = "scout" if spread_pct is not None else "default"
             stats = backtest_symbol_total_return(
-                symbol, dte_buckets, delta_buckets, lookback=args.lookback,
+                symbol, dte_buckets, symbol_delta_buckets, lookback=args.lookback,
                 spread_pct=spread_pct, spread_source=spread_source,
                 haircut_fraction=args.haircut_fraction, train_fraction=args.train_fraction,
                 min_cycles_for_selection=args.min_cycles_for_selection,
+                intent=intent, intent_is_default=intent_is_default,
             )
             if stats is None:
                 print(f"{symbol}: FAILED — no (DTE, delta) combo had >= {args.min_cycles_for_selection} "
@@ -668,8 +763,9 @@ if __name__ == "__main__":
             recommendations[symbol] = stats
             oos_str = f"{stats.out_of_sample_yield * 100:.1f}%" if stats.out_of_sample_yield is not None else "n/a"
             gap_str = f"{stats.oos_gap_pp:+.1f}pp" if stats.oos_gap_pp is not None else "n/a"
+            intent_str = f"{stats.intent}{' (default)' if stats.intent_is_default else ''}"
             print(
-                f"{symbol}: best DTE={stats.dte} delta={stats.target_delta:.2f} | "
+                f"{symbol}: intent={intent_str} | best DTE={stats.dte} delta={stats.target_delta:.2f} | "
                 f"IS yield={stats.in_sample_yield * 100:.1f}% OOS yield={oos_str} (gap={gap_str})"
             )
             print(

@@ -110,6 +110,26 @@ MIN_CYCLES_FOR_SELECTION = 5
 # too little of its own history to trust the pick on its own).
 SHRINKAGE_MIN_CYCLES = 8
 
+# ── Intent (pipeline_state/intents.json) ─────────────────────────────────────
+# Human-curated per-symbol intent, read by backtest.py. Any symbol NOT
+# listed in intents.json gets DEFAULT_INTENT -- backtest.py tracks (and
+# apply_watchlist.py shows) whether a symbol's intent came from an explicit
+# entry or this default, so "nobody set this" is never silently
+# indistinguishable from "somebody deliberately chose hold."
+DEFAULT_INTENT = "hold"
+# hold = normal covered-call income, lower delta (less likely to be
+# assigned, keep the stock longer). exit = near-the-money, higher delta
+# (more likely to be assigned soon) -- deliberately picked for a symbol
+# you're trying to turn over/exit via assignment, not hold indefinitely.
+INTENT_DELTA_BANDS = {
+    "hold": (0.15, 0.25),
+    "exit": (0.35, 0.50),
+}
+# How many evenly-spaced delta points Oracle sweeps within a symbol's
+# intent band (replaces the flat DELTA_SWEEP_BUCKETS for symbols going
+# through the intent-aware path).
+INTENT_BAND_SWEEP_POINTS = 3
+
 # ── Sizer (sizer.py, Task 1) — position sizing against Scout's screened
 # universe, before Oracle ever runs. Independent of Oracle/backtest.py: it
 # only needs price (from screened_symbols.json), never yield/return data.

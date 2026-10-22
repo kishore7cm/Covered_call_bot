@@ -109,6 +109,22 @@ def _risk_adjusted_summary(stats: dict) -> str:
     return summary
 
 
+def _intent_summary(stats: dict) -> str:
+    """
+    intent + whether it came from an explicit pipeline_state/intents.json
+    entry or the default (nobody listed this symbol) -- the two cases must
+    never be shown identically, per the project's requirement that a
+    default is always visibly a default, not indistinguishable from a
+    deliberate choice. "n/a" for watchlist entries that predate intent
+    tracking entirely (no "intent" key at all).
+    """
+    intent = stats.get("intent")
+    if intent is None:
+        return "intent: n/a (predates intent tracking)"
+    suffix = " (default — not listed in intents.json)" if stats.get("intent_is_default") else " (explicit)"
+    return f"intent={intent}{suffix}"
+
+
 def _diff(active: dict, proposed: dict) -> None:
     active_symbols = active.get("symbols", {})
     proposed_symbols = proposed.get("symbols", {})
@@ -118,6 +134,7 @@ def _diff(active: dict, proposed: dict) -> None:
     changed = sorted(
         s for s in set(active_symbols) & set(proposed_symbols)
         if active_symbols[s].get("dte") != proposed_symbols[s].get("dte")
+        or active_symbols[s].get("intent") != proposed_symbols[s].get("intent")
     )
 
     print(f"Active watchlist generated: {active.get('generated_at', 'never')}")
@@ -129,6 +146,7 @@ def _diff(active: dict, proposed: dict) -> None:
         for s in added:
             stats = proposed_symbols[s]
             print(f"  + {s}: DTE={stats['dte']} (avg annualized yield {stats['avg_annualized_yield'] * 100:.1f}%)")
+            print(f"      {_intent_summary(stats)}")
             print(f"      {_is_oos_summary(stats)}")
             ra_summary = _risk_adjusted_summary(stats)
             if ra_summary:
@@ -137,16 +155,24 @@ def _diff(active: dict, proposed: dict) -> None:
         print("REMOVE:")
         for s in removed:
             print(f"  - {s}")
+            print(f"      {_intent_summary(active_symbols[s])}")
             print(f"      {_is_oos_summary(active_symbols[s])}")
             ra_summary = _risk_adjusted_summary(active_symbols[s])
             if ra_summary:
                 print(f"      {ra_summary}")
     if changed:
-        print("CHANGE DTE:")
+        print("CHANGE:")
         for s in changed:
-            print(f"  ~ {s}: {active_symbols[s]['dte']} -> {proposed_symbols[s]['dte']}")
-            print(f"      {_is_oos_summary(proposed_symbols[s])}")
-            ra_summary = _risk_adjusted_summary(proposed_symbols[s])
+            old, new = active_symbols[s], proposed_symbols[s]
+            parts = []
+            if old.get("dte") != new.get("dte"):
+                parts.append(f"DTE {old.get('dte')} -> {new.get('dte')}")
+            if old.get("intent") != new.get("intent"):
+                parts.append(f"intent {old.get('intent', '?')} -> {new.get('intent', '?')}")
+            print(f"  ~ {s}: {', '.join(parts)}")
+            print(f"      {_intent_summary(new)}")
+            print(f"      {_is_oos_summary(new)}")
+            ra_summary = _risk_adjusted_summary(new)
             if ra_summary:
                 print(f"      {ra_summary}")
     if not (added or removed or changed):

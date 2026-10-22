@@ -3,6 +3,61 @@ import json
 import apply_watchlist as aw
 
 
+# ── _intent_summary ───────────────────────────────────────────────────────────
+
+def test_intent_summary_explicit():
+    stats = {"intent": "exit", "intent_is_default": False}
+    assert aw._intent_summary(stats) == "intent=exit (explicit)"
+
+
+def test_intent_summary_default():
+    stats = {"intent": "hold", "intent_is_default": True}
+    summary = aw._intent_summary(stats)
+    assert "intent=hold" in summary
+    assert "default" in summary
+    assert "not listed in intents.json" in summary
+
+
+def test_intent_summary_na_for_entries_predating_intent_tracking():
+    assert aw._intent_summary({}) == "intent: n/a (predates intent tracking)"
+
+
+# ── _diff() shows intent and flags a default ─────────────────────────────────
+
+def test_diff_add_shows_explicit_intent(capsys):
+    active = _watchlist({})
+    proposed = _watchlist({
+        "AAPL": {"dte": 30, "avg_annualized_yield": 0.18, "intent": "exit", "intent_is_default": False},
+    })
+    aw._diff(active, proposed)
+    out = capsys.readouterr().out
+    assert "intent=exit (explicit)" in out
+
+
+def test_diff_add_shows_default_intent_distinctly(capsys):
+    active = _watchlist({})
+    proposed = _watchlist({
+        "AAPL": {"dte": 30, "avg_annualized_yield": 0.18, "intent": "hold", "intent_is_default": True},
+    })
+    aw._diff(active, proposed)
+    out = capsys.readouterr().out
+    assert "intent=hold" in out
+    assert "default" in out
+
+
+def test_diff_change_fires_on_intent_change_even_if_dte_unchanged(capsys):
+    active = _watchlist({
+        "AAPL": {"dte": 30, "avg_annualized_yield": 0.18, "intent": "hold", "intent_is_default": True},
+    })
+    proposed = _watchlist({
+        "AAPL": {"dte": 30, "avg_annualized_yield": 0.18, "intent": "exit", "intent_is_default": False},
+    })
+    aw._diff(active, proposed)
+    out = capsys.readouterr().out
+    assert "CHANGE:" in out
+    assert "~ AAPL: intent hold -> exit" in out
+
+
 # ── _is_oos_summary ───────────────────────────────────────────────────────────
 
 def test_summary_full_stats_no_flag():
@@ -147,8 +202,8 @@ def test_diff_change_dte_shows_proposed_summary_not_active(capsys):
     })
     aw._diff(active, proposed)
     out = capsys.readouterr().out
-    assert "CHANGE DTE:" in out
-    assert "~ SOFI: 7 -> 30" in out
+    assert "CHANGE:" in out
+    assert "~ SOFI: DTE 7 -> 30" in out
     # The NEW (proposed, 30 DTE) summary is shown, not the old 7-DTE one --
     # a reviewer deciding whether to approve the change needs to see what
     # they're switching TO.

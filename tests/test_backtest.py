@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import date, timedelta
 
@@ -350,11 +351,12 @@ def test_oos_metrics_none_when_test_slice_has_no_cycles(monkeypatch):
 
 # ── DTE shrinkage toward the cross-symbol consensus ──────────────────────────
 
-def _stats(dte, num_cycles, target_delta=0.25):
+def _stats(dte, num_cycles, target_delta=0.25, intent=None, intent_is_default=None):
     return backtest.CycleStats(
         dte=dte, num_cycles=num_cycles, total_premium_pct=0.1, avg_annualized_yield=0.1,
         assignment_rate=0.2, strategy_total_return=0.1, buy_and_hold_return=0.1,
         target_delta=target_delta, spread_pct_used=0.05, spread_source="default",
+        intent=intent, intent_is_default=intent_is_default,
     )
 
 
@@ -388,10 +390,17 @@ def test_shrinkage_pulls_low_cycle_symbol_toward_consensus_dte(monkeypatch):
     assert captured["dte_buckets"] == (24,)
 
 
-def test_shrinkage_noop_when_no_symbol_is_trusted():
+def test_shrinkage_noop_when_no_symbol_is_trusted(caplog):
     recommendations = {"AAA": _stats(dte=7, num_cycles=1), "BBB": _stats(dte=30, num_cycles=2)}
-    result = backtest.apply_dte_shrinkage(recommendations, min_cycles=8)
-    assert result is recommendations
+    with caplog.at_level(logging.WARNING, logger="backtest"):
+        result = backtest.apply_dte_shrinkage(recommendations, min_cycles=8)
+
+    # Content-equal (nothing shrunk, dte/shrunk_from_dte unchanged) -- NOT
+    # necessarily object-identical, since shrinkage is now grouped by
+    # intent and always builds a fresh dict per group.
+    assert result["AAA"].dte == 7 and result["AAA"].shrunk_from_dte is None
+    assert result["BBB"].dte == 30 and result["BBB"].shrunk_from_dte is None
+    assert any("skipping DTE shrinkage for this entire intent group" in rec.message for rec in caplog.records)
 
 
 def test_shrinkage_logs_warning_and_keeps_original_dte_when_refresh_finds_no_cycles(monkeypatch, caplog):
@@ -413,3 +422,101 @@ def test_shrinkage_logs_warning_and_keeps_original_dte_when_refresh_finds_no_cyc
     assert result["OUTLIER"].shrunk_from_dte is None  # NOT marked as shrunk, since it wasn't
     messages = [rec.message for rec in caplog.records]
     assert any("OUTLIER" in m and "shrinkage wanted to move DTE" in m for m in messages)
+
+
+# ── Intent: loading, resolution, delta bands ─────────────────────────────────
+
+def test_load_intents_missing_file_returns_empty(tmp_path):
+    assert backtest._load_intents(str(tmp_path / "nope.json")) == {}
+
+
+def test_load_intents_reads_flat_symbol_to_intent_dict(tmp_path):
+    path = tmp_path / "intents.json"
+    path.write_text(json.dumps({"AAPL": "exit", "MSFT": "hold"}))
+    assert backtest._load_intents(str(path)) == {"AAPL": "exit", "MSFT": "hold"}
+
+
+def test_resolve_intent_explicit():
+    intent, is_default = backtest._resolve_intent("AAPL", {"AAPL": "exit"})
+    assert intent == "exit"
+    assert is_default is False
+
+
+def test_resolve_intent_missing_symbol_defaults(monkeypatch):
+    intent, is_default = backtest._resolve_intent("MSFT", {"AAPL": "exit"})
+    assert intent == backtest.DEFAULT_INTENT
+    assert is_default is True
+
+
+def test_resolve_intent_unrecognized_value_falls_back_with_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="backtest"):
+        intent, is_default = backtest._resolve_intent("AAPL", {"AAPL": "sell_everything"})
+
+    assert intent == backtest.DEFAULT_INTENT
+    assert is_default is True
+    assert any("unrecognized intent" in rec.message for rec in caplog.records)
+
+
+def test_delta_buckets_for_intent_spans_the_band_inclusive():
+    lo, hi = backtest.INTENT_DELTA_BANDS["exit"]
+    buckets = backtest._delta_buckets_for_intent("exit")
+    assert len(buckets) == backtest.INTENT_BAND_SWEEP_POINTS
+    assert buckets[0] == pytest.approx(lo)
+    assert buckets[-1] == pytest.approx(hi)
+
+
+def test_delta_buckets_for_hold_and_exit_do_not_overlap():
+    hold_buckets = backtest._delta_buckets_for_intent("hold")
+    exit_buckets = backtest._delta_buckets_for_intent("exit")
+    assert max(hold_buckets) < min(exit_buckets)
+
+
+# ── Shrinkage: split consensus per intent group ──────────────────────────────
+
+def test_shrinkage_computes_separate_consensus_per_intent_group():
+    recommendations = {
+        # hold group: consensus dte=30
+        "H1": _stats(dte=30, num_cycles=20, intent="hold", intent_is_default=False),
+        "H2": _stats(dte=30, num_cycles=15, intent="hold", intent_is_default=False),
+        # exit group: consensus dte=7 -- a DIFFERENT consensus from hold's
+        "E1": _stats(dte=7, num_cycles=20, intent="exit", intent_is_default=False),
+        "E2": _stats(dte=7, num_cycles=15, intent="exit", intent_is_default=False),
+    }
+    result = backtest.apply_dte_shrinkage(recommendations, min_cycles=8)
+
+    # All trusted (>= min_cycles) -- nothing should have moved, but this
+    # proves the two groups were never blended into one global vote.
+    assert result["H1"].dte == 30 and result["E1"].dte == 7
+
+
+def test_shrinkage_skips_one_group_but_still_shrinks_the_other(monkeypatch, caplog):
+    recommendations = {
+        # hold group: plenty of trusted peers, consensus dte=30
+        "H1": _stats(dte=30, num_cycles=20, intent="hold", intent_is_default=False),
+        "H2": _stats(dte=30, num_cycles=15, intent="hold", intent_is_default=False),
+        "H_OUTLIER": _stats(dte=7, num_cycles=2, intent="hold", intent_is_default=False),
+        # exit group: NOBODY clears min_cycles -- nothing to anchor to.
+        "E_OUTLIER": _stats(dte=14, num_cycles=1, intent="exit", intent_is_default=False),
+    }
+
+    captured = {}
+
+    def fake_refresh(symbol, dte_buckets, delta_buckets, **kwargs):
+        captured["intent"] = kwargs.get("intent")
+        return _stats(dte=dte_buckets[0], num_cycles=2, target_delta=delta_buckets[0],
+                      intent=kwargs.get("intent"), intent_is_default=False)
+
+    monkeypatch.setattr(backtest, "backtest_symbol_total_return", fake_refresh)
+
+    with caplog.at_level(logging.WARNING, logger="backtest"):
+        result = backtest.apply_dte_shrinkage(recommendations, min_cycles=8)
+
+    # hold's outlier shrank toward hold's own consensus (30).
+    assert result["H_OUTLIER"].shrunk_from_dte == 7
+    assert captured["intent"] == "hold"
+    # exit group had nothing to anchor to -- skipped entirely, logged, and
+    # left completely unshrunk (not pulled toward hold's consensus either).
+    assert result["E_OUTLIER"].dte == 14
+    assert result["E_OUTLIER"].shrunk_from_dte is None
+    messages = [rec.message for rec in caplog.records]
+    assert any("intent=exit" in m and "skipping DTE shrinkage for this entire intent group" in m for m in messages)
