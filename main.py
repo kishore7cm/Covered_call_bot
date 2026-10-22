@@ -123,20 +123,22 @@ def _get_spot_price(symbol: str) -> float | None:
         return None
 
 
-def _track_iv_history(symbol: str) -> str | None:
+def _track_iv_history(symbol: str) -> tuple[str | None, float | None, float | None]:
     """
     Record this cycle's ATM IV and, if enough history has accumulated,
-    return a short "IV rank X%, percentile Y%" string for the digest.
-    Best-effort: any failure here is logged but must never block the
-    actual trading decision for this symbol.
+    return (digest_note, atm_iv, rank). Best-effort: any failure here is
+    logged but must never block the actual trading decision for this
+    symbol. atm_iv/rank are also handed to run_symbol_cycle (Phase 3,
+    Task 7) so a real option open can log the IVR context it was opened
+    under, without computing it a second time.
     """
     spot = _get_spot_price(symbol)
     if spot is None:
-        return None
+        return None, None, None
 
     atm_iv = get_atm_iv(symbol, spot)
     if atm_iv is None:
-        return None
+        return None, None, None
 
     record_iv_snapshot(symbol, atm_iv)
 
@@ -144,8 +146,10 @@ def _track_iv_history(symbol: str) -> str | None:
     rank = iv_rank(atm_iv, history)
     pctl = iv_percentile(atm_iv, history)
     if rank is None or pctl is None:
-        return f"{symbol}: IV={atm_iv:.2f} (rank unavailable — {len(history)} pts, need {MIN_IV_HISTORY_POINTS})"
-    return f"{symbol}: IV={atm_iv:.2f}, rank={rank:.0f}%, percentile={pctl:.0f}%"
+        note = f"{symbol}: IV={atm_iv:.2f} (rank unavailable — {len(history)} pts, need {MIN_IV_HISTORY_POINTS})"
+        return note, atm_iv, None
+    note = f"{symbol}: IV={atm_iv:.2f}, rank={rank:.0f}%, percentile={pctl:.0f}%"
+    return note, atm_iv, rank
 
 
 def _order_status(result: dict | None) -> str:
@@ -162,7 +166,10 @@ def _order_status(result: dict | None) -> str:
     return "ok"
 
 
-def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
+def run_symbol_cycle(
+    symbol: str, recommended_dte: int | None = None,
+    atm_iv: float | None = None, atm_iv_rank: float | None = None,
+) -> str:
     """
     Run one covered-call decision cycle for a single symbol. Returns a short
     human-readable summary string for the cycle-level Telegram digest.
@@ -171,6 +178,12 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
     recommended_dte comes from the research pipeline (screener.py ->
     backtest.py -> apply_watchlist.py); None means the pipeline hasn't been
     run for this symbol yet and the global DTE_MIN/DTE_MAX window is used.
+
+    atm_iv/atm_iv_rank (Phase 3, Task 7) come from this same cycle's
+    _track_iv_history() call in run_cycle(), computed once and handed down
+    rather than recomputed here -- metadata only, logged alongside a real
+    option open (SELL_TO_OPEN/ROLL) via log_option_trade's iv_rank_at_entry,
+    never used in any trading decision.
     """
     if symbol in OTHER_BOTS_SYMBOLS:
         msg = f"{symbol}: listed in OTHER_BOTS_SYMBOLS (used by another bot on this shared Alpaca account)"
@@ -361,6 +374,11 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
             strike=candidate.strike, expiration=candidate.expiration,
             premium=candidate.mid_price, delta_at_entry=candidate.delta,
             underlying_price=spot, order_id=result["order_id"],
+            iv_at_entry=candidate.iv, iv_rank_at_entry=atm_iv_rank,
+            iv_source="iv_at_entry: Black-Scholes implied vol solved for the sold contract "
+                      "(options_data.pick_strike); iv_rank_at_entry: this cycle's ATM IV rank "
+                      "against the weekly iv_history series (a different, nearest-the-money "
+                      "contract, not necessarily this one)",
         )
         _run_async(notifier.send_call_sold(
             symbol, candidate.occ_symbol, candidate.strike, candidate.expiration,
@@ -495,7 +513,11 @@ def run_symbol_cycle(symbol: str, recommended_dte: int | None = None) -> str:
         log_option_trade(symbol, new_candidate.occ_symbol, "ROLL",
                           strike=new_candidate.strike, expiration=new_candidate.expiration,
                           premium=new_candidate.mid_price, delta_at_entry=new_candidate.delta,
-                          underlying_price=spot, order_id=result["opened"]["order_id"])
+                          underlying_price=spot, order_id=result["opened"]["order_id"],
+                          iv_at_entry=new_candidate.iv, iv_rank_at_entry=atm_iv_rank,
+                          iv_source="iv_at_entry: Black-Scholes implied vol solved for the new "
+                                    "contract (options_data.pick_strike); iv_rank_at_entry: this "
+                                    "cycle's ATM IV rank against the weekly iv_history series")
         _run_async(notifier.send_call_rolled(symbol, occ_symbol, new_candidate.occ_symbol, 0.0))
         return f"{symbol}: rolled {occ_symbol} -> {new_candidate.occ_symbol}"
 
@@ -517,8 +539,10 @@ def run_cycle() -> None:
     watchlist = _load_watchlist()
     actions = []
     for symbol, recommended_dte in watchlist.items():
+        atm_iv_for_logging = None
+        iv_rank_for_logging = None
         try:
-            iv_note = _track_iv_history(symbol)
+            iv_note, atm_iv_for_logging, iv_rank_for_logging = _track_iv_history(symbol)
             if iv_note:
                 actions.append(iv_note)
         except Exception as e:
@@ -528,7 +552,9 @@ def run_cycle() -> None:
             log_error("main._track_iv_history", f"{symbol}: {e}")
 
         try:
-            actions.append(run_symbol_cycle(symbol, recommended_dte))
+            actions.append(run_symbol_cycle(
+                symbol, recommended_dte, atm_iv=atm_iv_for_logging, atm_iv_rank=iv_rank_for_logging,
+            ))
         except Exception as e:
             # Last-resort guard: even if a symbol's cycle has a bug we didn't
             # anticipate, it must not take down the rest of the watchlist or

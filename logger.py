@@ -77,6 +77,19 @@ def _connect():
     return psycopg2.connect(DATABASE_URL)
 
 
+# Phase 3, Task 7: IV/IVR metadata at option open. option_trades already
+# exists in deployed databases, so CREATE TABLE IF NOT EXISTS in _SCHEMA
+# above is a no-op against it -- these columns need their own explicit
+# ALTER TABLE ... ADD COLUMN IF NOT EXISTS migration to actually land on
+# an already-existing table. Purely additive: every old row keeps reading
+# back fine with these three columns simply NULL.
+_ADD_IV_METADATA_COLUMNS = """
+ALTER TABLE option_trades ADD COLUMN IF NOT EXISTS iv_at_entry NUMERIC;
+ALTER TABLE option_trades ADD COLUMN IF NOT EXISTS iv_rank_at_entry NUMERIC;
+ALTER TABLE option_trades ADD COLUMN IF NOT EXISTS iv_source TEXT;
+"""
+
+
 def init_schema() -> None:
     if not DATABASE_URL:
         logger.warning("DATABASE_URL not set — skipping schema init, logging to stdout only")
@@ -84,6 +97,7 @@ def init_schema() -> None:
     try:
         with _connect() as conn, conn.cursor() as cur:
             cur.execute(_SCHEMA)
+            cur.execute(_ADD_IV_METADATA_COLUMNS)
             conn.commit()
     except Exception as e:
         logger.error("init_schema failed: %s", e)
@@ -94,10 +108,21 @@ def log_option_trade(
     strike: float | None = None, expiration: date | None = None,
     premium: float | None = None, delta_at_entry: float | None = None,
     underlying_price: float | None = None, qty: int = 1, order_id: str | None = None,
+    iv_at_entry: float | None = None, iv_rank_at_entry: float | None = None,
+    iv_source: str | None = None,
 ) -> None:
+    """
+    iv_at_entry/iv_rank_at_entry/iv_source (Phase 3, Task 7) are metadata
+    only, logged whenever a caller has them on hand (main.py passes them
+    for SELL_TO_OPEN/ROLL, the actions that actually open a new option
+    leg) -- never required, never gates anything. None for actions that
+    don't have a meaningful entry IV (BUY_TO_CLOSE, ASSIGNED) or when the
+    caller simply doesn't have one available that cycle.
+    """
     logger.info(
-        "OPTION | %-6s | %-20s | %-14s | strike=%s exp=%s premium=%s delta=%s qty=%s",
+        "OPTION | %-6s | %-20s | %-14s | strike=%s exp=%s premium=%s delta=%s qty=%s iv=%s iv_rank=%s",
         symbol, occ_symbol, action, strike, expiration, premium, delta_at_entry, qty,
+        iv_at_entry, iv_rank_at_entry,
     )
     if not DATABASE_URL:
         return
@@ -107,11 +132,13 @@ def log_option_trade(
                 """
                 INSERT INTO option_trades
                     (symbol, occ_symbol, action, strike, expiration, premium,
-                     delta_at_entry, underlying_price, qty, order_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     delta_at_entry, underlying_price, qty, order_id,
+                     iv_at_entry, iv_rank_at_entry, iv_source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (symbol, occ_symbol, action, strike, expiration, premium,
-                 delta_at_entry, underlying_price, qty, order_id),
+                 delta_at_entry, underlying_price, qty, order_id,
+                 iv_at_entry, iv_rank_at_entry, iv_source),
             )
             conn.commit()
     except Exception as e:

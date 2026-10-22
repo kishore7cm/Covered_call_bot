@@ -36,6 +36,7 @@ class FakeCandidate:
     expiration: date
     mid_price: float
     delta: float
+    iv: float = 0.3
 
 
 def _far_occ_symbol(underlying: str, dte: int = 35, strike: float = 200.0) -> str:
@@ -702,3 +703,77 @@ def test_roll_recovery_exit_enabled_but_fails(monkeypatch):
 
     assert "recovery-exit did not complete" in result
     assert logged["lot_flags"] == [("flag", "AAPL")]
+
+
+# ── IV/IVR metadata at option open (Task 7) ──────────────────────────────────
+
+def test_track_iv_history_returns_note_iv_and_rank(monkeypatch):
+    monkeypatch.setattr(main, "_get_spot_price", lambda symbol: 100.0)
+    monkeypatch.setattr(main, "get_atm_iv", lambda symbol, spot: 0.35)
+    monkeypatch.setattr(main, "record_iv_snapshot", lambda symbol, iv: None)
+    monkeypatch.setattr(main, "get_iv_history", lambda symbol: [0.2] * 10)
+    monkeypatch.setattr(main, "iv_rank", lambda iv, history: 72.0)
+    monkeypatch.setattr(main, "iv_percentile", lambda iv, history: 80.0)
+
+    note, atm_iv, rank = main._track_iv_history("AAPL")
+
+    assert atm_iv == 0.35
+    assert rank == 72.0
+    assert "rank=72" in note
+
+
+def test_track_iv_history_insufficient_history_returns_iv_without_rank(monkeypatch):
+    monkeypatch.setattr(main, "_get_spot_price", lambda symbol: 100.0)
+    monkeypatch.setattr(main, "get_atm_iv", lambda symbol, spot: 0.35)
+    monkeypatch.setattr(main, "record_iv_snapshot", lambda symbol, iv: None)
+    monkeypatch.setattr(main, "get_iv_history", lambda symbol: [])
+    monkeypatch.setattr(main, "iv_rank", lambda iv, history: None)
+    monkeypatch.setattr(main, "iv_percentile", lambda iv, history: None)
+
+    note, atm_iv, rank = main._track_iv_history("AAPL")
+
+    assert atm_iv == 0.35
+    assert rank is None
+    assert "rank unavailable" in note
+
+
+def test_track_iv_history_no_spot_returns_all_none(monkeypatch):
+    monkeypatch.setattr(main, "_get_spot_price", lambda symbol: None)
+
+    note, atm_iv, rank = main._track_iv_history("AAPL")
+
+    assert (note, atm_iv, rank) == (None, None, None)
+
+
+def test_sell_to_open_logs_iv_metadata(monkeypatch):
+    candidate = FakeCandidate(_far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.25, iv=0.42)
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: candidate)
+
+    main.run_symbol_cycle("AAPL", atm_iv=0.40, atm_iv_rank=65.0)
+
+    kwargs = logged["option_trades"][0][1]
+    assert kwargs["iv_at_entry"] == 0.42
+    assert kwargs["iv_rank_at_entry"] == 65.0
+    assert kwargs["iv_source"] is not None
+
+
+def test_roll_logs_iv_metadata(monkeypatch):
+    old_occ = _far_occ_symbol("AAPL", dte=3)
+    new_candidate = FakeCandidate(_far_occ_symbol("AAPL", dte=35), 200.0, date.today() + timedelta(days=35), 2.5, 0.25, iv=0.55)
+    short_call = FakeShortCallPosition(symbol=old_occ, cost_basis="-250.0", market_value="-240.0")
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+        find_short_call=lambda symbol: short_call,
+    )
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: new_candidate)
+
+    main.run_symbol_cycle("AAPL", atm_iv_rank=30.0)
+
+    kwargs = logged["option_trades"][0][1]
+    assert kwargs["iv_at_entry"] == 0.55
+    assert kwargs["iv_rank_at_entry"] == 30.0
