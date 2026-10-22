@@ -110,6 +110,15 @@ MIN_CYCLES_FOR_SELECTION = 5
 # too little of its own history to trust the pick on its own).
 SHRINKAGE_MIN_CYCLES = 8
 
+# ── Empirical outcome stats (backtest.py) ────────────────────────────────────
+# "Small move" threshold for P(|move| < X% over one DTE window) -- the X,
+# configurable. Computed from OVERLAPPING windows (every trading day is a
+# window start, not just the non-overlapping cycle boundaries backtest_dte
+# already walks) for statistical power; see backtest.py's
+# compute_empirical_outcome_stats() for the effective-sample-size
+# correction this overlap necessitates.
+EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT = 0.05
+
 # ── Intent (pipeline_state/intents.json) ─────────────────────────────────────
 # Human-curated per-symbol intent, read by backtest.py. Any symbol NOT
 # listed in intents.json gets DEFAULT_INTENT -- backtest.py tracks (and

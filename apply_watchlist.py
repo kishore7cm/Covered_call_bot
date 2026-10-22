@@ -125,6 +125,41 @@ def _intent_summary(stats: dict) -> str:
     return f"intent={intent}{suffix}"
 
 
+def _empirical_summary(stats: dict, label: str, prefix: str = "") -> str:
+    """
+    One line of backtest.py's empirical outcome stats (train or OOS,
+    selected via prefix="" / "oos_") -- P(called away), P(small move),
+    median move, and the effective sample size, right next to the yield
+    columns per the project's requirement. "" if this watchlist entry
+    predates empirical stats (older proposed_watchlist.json) or this
+    particular window had no valid stats (e.g. an OOS slice with no
+    windows at all).
+    """
+    p_called_away = stats.get(f"{prefix}p_called_away")
+    if p_called_away is None:
+        return ""
+
+    threshold = stats.get("move_threshold_pct_used")
+    threshold_str = f"{threshold:.0%}" if threshold is not None else "?"
+    return (
+        f"{label}: P(called away)={p_called_away:.1%} "
+        f"P(expires below strike)={stats.get(f'{prefix}p_expires_below_strike', 0):.1%} "
+        f"P(|move|<{threshold_str})={stats.get(f'{prefix}p_small_move', 0):.1%} "
+        f"median move={stats.get(f'{prefix}median_move_pct', 0):+.1%} "
+        f"(n={stats.get(f'{prefix}empirical_window_count')} windows, "
+        f"effective_n={stats.get(f'{prefix}empirical_effective_n')})"
+    )
+
+
+def _print_empirical_summaries(stats: dict) -> None:
+    train_line = _empirical_summary(stats, "empirical (train)")
+    if train_line:
+        print(f"      {train_line}")
+    oos_line = _empirical_summary(stats, "empirical (OOS)", prefix="oos_")
+    if oos_line:
+        print(f"      {oos_line}")
+
+
 def _diff(active: dict, proposed: dict) -> None:
     active_symbols = active.get("symbols", {})
     proposed_symbols = proposed.get("symbols", {})
@@ -151,6 +186,7 @@ def _diff(active: dict, proposed: dict) -> None:
             ra_summary = _risk_adjusted_summary(stats)
             if ra_summary:
                 print(f"      {ra_summary}")
+            _print_empirical_summaries(stats)
     if removed:
         print("REMOVE:")
         for s in removed:
@@ -160,6 +196,7 @@ def _diff(active: dict, proposed: dict) -> None:
             ra_summary = _risk_adjusted_summary(active_symbols[s])
             if ra_summary:
                 print(f"      {ra_summary}")
+            _print_empirical_summaries(active_symbols[s])
     if changed:
         print("CHANGE:")
         for s in changed:
@@ -175,6 +212,7 @@ def _diff(active: dict, proposed: dict) -> None:
             ra_summary = _risk_adjusted_summary(new)
             if ra_summary:
                 print(f"      {ra_summary}")
+            _print_empirical_summaries(new)
     if not (added or removed or changed):
         print("No differences — active watchlist already matches the proposed one.")
 

@@ -520,3 +520,93 @@ def test_shrinkage_skips_one_group_but_still_shrinks_the_other(monkeypatch, capl
     assert result["E_OUTLIER"].shrunk_from_dte is None
     messages = [rec.message for rec in caplog.records]
     assert any("intent=exit" in m and "skipping DTE shrinkage for this entire intent group" in m for m in messages)
+
+
+# ── Empirical outcome stats: synthetic path with KNOWN true probabilities ───
+
+def _deterministic_drift_series(n=400, daily_drift=0.01, wiggle_amplitude=0.003, wiggle_period=17, start=100.0):
+    """
+    Fully deterministic (no randomness at all, reproducible bit-for-bit) --
+    a strong constant daily drift plus a small periodic wiggle just large
+    enough that realized vol is solvable (nonzero), small enough that it
+    can never flip the sign of a single window's move. Every overlapping
+    window therefore has the SAME deterministic outcome, so the "true"
+    probabilities are known by construction, not estimated by sampling.
+    """
+    idx = pd.date_range("2020-01-01", periods=n, freq="D")
+    i = np.arange(n)
+    log_returns = daily_drift + wiggle_amplitude * np.sin(2 * np.pi * i / wiggle_period)
+    prices = start * np.exp(np.cumsum(log_returns))
+    return pd.Series(prices, index=idx)
+
+
+def test_empirical_stats_known_probabilities_on_deterministic_uptrend():
+    closes = _deterministic_drift_series()
+    vol = backtest._realized_vol(closes)
+    dte = 30
+
+    stats = backtest.compute_empirical_outcome_stats(closes, vol, dte, 0.25, 0.045, move_threshold_pct=0.05)
+
+    assert stats is not None
+    # The guaranteed-positive drift (~23% per 30-day window) vastly exceeds
+    # any delta=0.25 strike's distance from spot at this (low, wiggle-only)
+    # realized vol -- every window ends called away, by construction, not
+    # by sampling luck. True P(called away) = 1.0, true P(small move) = 0.0.
+    assert stats["p_called_away"] == pytest.approx(1.0)
+    assert stats["p_expires_below_strike"] == pytest.approx(0.0)
+    assert stats["p_small_move"] == pytest.approx(0.0)
+    assert stats["median_move_pct"] == pytest.approx(0.2337, abs=1e-3)
+
+
+def test_empirical_stats_effective_n_smaller_than_window_count():
+    closes = _deterministic_drift_series()
+    vol = backtest._realized_vol(closes)
+    dte = 30
+    step = max(1, round(dte * 5 / 7))
+
+    stats = backtest.compute_empirical_outcome_stats(closes, vol, dte, 0.25, 0.045)
+
+    assert stats["empirical_window_count"] > step
+    assert stats["empirical_effective_n"] == stats["empirical_window_count"] // step
+    assert stats["empirical_effective_n"] < stats["empirical_window_count"]
+
+
+def test_empirical_stats_move_threshold_is_configurable():
+    closes = _deterministic_drift_series()
+    vol = backtest._realized_vol(closes)
+    # The deterministic move is ~23% -- a huge threshold should catch it as "small".
+    stats = backtest.compute_empirical_outcome_stats(closes, vol, 30, 0.25, 0.045, move_threshold_pct=0.50)
+    assert stats["p_small_move"] == pytest.approx(1.0)
+    assert stats["move_threshold_pct_used"] == 0.50
+
+
+def test_empirical_stats_none_when_series_too_short():
+    closes = _deterministic_drift_series(n=10)
+    vol = backtest._realized_vol(closes)
+    assert backtest.compute_empirical_outcome_stats(closes, vol, 30, 0.25, 0.045) is None
+
+
+def test_backtest_dte_populates_empirical_fields(monkeypatch):
+    closes = _synthetic_closes(n=400)
+    vol = backtest._realized_vol(closes)
+    stats = backtest.backtest_dte(closes, vol, 30, 0.25)
+
+    assert stats.p_called_away is not None
+    assert 0.0 <= stats.p_called_away <= 1.0
+    assert stats.empirical_window_count is not None
+    assert stats.empirical_effective_n is not None
+    assert stats.empirical_effective_n <= stats.empirical_window_count
+    assert stats.move_threshold_pct_used == backtest.EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT
+
+
+def test_backtest_symbol_total_return_populates_oos_empirical_fields(monkeypatch):
+    closes = _deterministic_drift_series(n=600)
+    monkeypatch.setattr(backtest, "_price_history", lambda symbol, lookback=None: closes)
+
+    result = backtest.backtest_symbol_total_return("FAKE", dte_buckets=(30,), delta_buckets=(0.25,))
+
+    assert result is not None
+    assert result.p_called_away == pytest.approx(1.0)       # train
+    assert result.oos_p_called_away == pytest.approx(1.0)    # OOS -- same deterministic series
+    assert result.oos_empirical_window_count is not None
+    assert result.oos_empirical_effective_n is not None

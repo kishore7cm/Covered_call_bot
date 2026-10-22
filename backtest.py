@@ -116,9 +116,10 @@ import yfinance as yf
 
 from config import (
     DEFAULT_ASSUMED_SPREAD_PCT, DEFAULT_INTENT, DELTA_SWEEP_BUCKETS,
-    FILL_HAIRCUT_FRACTION, INTENT_BAND_SWEEP_POINTS, INTENT_DELTA_BANDS,
-    MIN_CYCLES_FOR_SELECTION, MIN_DRAWDOWN_FLOOR_PCT, RISK_FREE_RATE,
-    SHRINKAGE_MIN_CYCLES, TARGET_DELTA, WALK_FORWARD_TRAIN_FRACTION,
+    EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT, FILL_HAIRCUT_FRACTION,
+    INTENT_BAND_SWEEP_POINTS, INTENT_DELTA_BANDS, MIN_CYCLES_FOR_SELECTION,
+    MIN_DRAWDOWN_FLOOR_PCT, RISK_FREE_RATE, SHRINKAGE_MIN_CYCLES,
+    TARGET_DELTA, WALK_FORWARD_TRAIN_FRACTION,
 )
 from greeks import bs_call_price, strike_from_delta
 
@@ -182,6 +183,28 @@ class CycleStats:
     # should never present them identically.
     intent: str | None = None
     intent_is_default: bool | None = None
+
+    # Empirical outcome stats (see compute_empirical_outcome_stats docstring):
+    # non-parametric properties of this (dte, target_delta) combo's price
+    # path, from OVERLAPPING windows -- distinct from num_cycles/
+    # assignment_rate above, which come from the sparser non-overlapping
+    # cycle walk. None if there weren't enough valid windows to compute.
+    p_expires_below_strike: float | None = None
+    p_called_away: float | None = None
+    p_small_move: float | None = None
+    median_move_pct: float | None = None
+    empirical_window_count: int | None = None
+    empirical_effective_n: int | None = None
+    move_threshold_pct_used: float | None = None
+
+    # Out-of-sample twins of the six fields above, same pattern as this
+    # dataclass's other oos_ fields.
+    oos_p_expires_below_strike: float | None = None
+    oos_p_called_away: float | None = None
+    oos_p_small_move: float | None = None
+    oos_median_move_pct: float | None = None
+    oos_empirical_window_count: int | None = None
+    oos_empirical_effective_n: int | None = None
 
 
 def _load_intents(path: str = INTENTS_PATH) -> dict[str, str]:
@@ -303,6 +326,73 @@ def _simulate_cycles(
     return events
 
 
+def compute_empirical_outcome_stats(
+    closes: pd.Series, vol: pd.Series, dte: int, target_delta: float, rate: float,
+    move_threshold_pct: float = EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT,
+) -> dict | None:
+    """
+    Non-parametric properties of this (dte, target_delta) combo's price
+    path, estimated from OVERLAPPING dte-length windows (every trading day
+    is a window start) rather than _simulate_cycles' non-overlapping
+    cycle walk -- overlap trades statistical independence for many more
+    data points, which is the right tradeoff for a probability estimate
+    (not for simulating an actual sequence of trades, which is what
+    _simulate_cycles is for and why it stays non-overlapping).
+
+    EFFECTIVE SAMPLE SIZE: overlapping windows are highly autocorrelated
+    (two windows starting a day apart share all but one day of data), so
+    window_count overstates how much independent information there
+    actually is. empirical_effective_n approximates the number of
+    genuinely-independent windows as window_count // step, where step is
+    the SAME non-overlapping cycle length _simulate_cycles already uses
+    for this dte -- i.e., "how many windows could not possibly overlap."
+    This is a standard block-based approximation for block-overlapping
+    dependent samples, not an exact statistical result; treat it as a
+    lower bound on confidence, not a precise count.
+
+    Returns None if there isn't even one valid window (e.g. too-short
+    series, or vol/strike never solvable anywhere in it).
+    """
+    step = max(1, round(dte * 5 / 7))
+    warmup = REALIZED_VOL_WINDOW_DAYS
+    t_years = dte / 365.0
+
+    moves: list[float] = []
+    assigned_flags: list[bool] = []
+
+    last_pos = len(closes) - step - 1
+    for pos in range(warmup, last_pos + 1):
+        spot = closes.iloc[pos]
+        iv = vol.iloc[pos]
+        if pd.isna(iv) or iv <= 0 or spot <= 0:
+            continue
+
+        strike = strike_from_delta(spot, t_years, rate, iv, target_delta)
+        if strike is None:
+            continue
+
+        spot_t = closes.iloc[pos + step]
+        moves.append(spot_t / spot - 1.0)
+        assigned_flags.append(bool(spot_t >= strike))
+
+    if not moves:
+        return None
+
+    window_count = len(moves)
+    moves_arr = np.asarray(moves)
+    assigned_arr = np.asarray(assigned_flags)
+
+    return {
+        "p_expires_below_strike": float(np.mean(~assigned_arr)),
+        "p_called_away": float(np.mean(assigned_arr)),
+        "p_small_move": float(np.mean(np.abs(moves_arr) < move_threshold_pct)),
+        "median_move_pct": float(np.median(moves_arr)),
+        "empirical_window_count": window_count,
+        "empirical_effective_n": max(1, window_count // step),
+        "move_threshold_pct_used": move_threshold_pct,
+    }
+
+
 def backtest_dte(
     closes: pd.Series,
     vol: pd.Series,
@@ -311,17 +401,28 @@ def backtest_dte(
     rate: float = RISK_FREE_RATE,
     spread_pct: float = DEFAULT_ASSUMED_SPREAD_PCT,
     haircut_fraction: float = FILL_HAIRCUT_FRACTION,
+    move_threshold_pct: float = EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT,
 ) -> CycleStats | None:
     """
     Reduce _simulate_cycles()'s event sequence into CycleStats: the
     original compounding-reinvestment yield metrics (unchanged formulas,
     now haircut-adjusted) PLUS Task 2's fixed-100-share-lot dollar P&L,
     total return, and max drawdown -- all from the one event sequence, not
-    two separate simulations.
+    two separate simulations. ALSO runs compute_empirical_outcome_stats()
+    on the SAME (closes, vol, dte, target_delta) for every combo, not just
+    the final pick -- a later exit-intent turnover-score objective needs
+    p_called_away to RANK candidates, not just report it after the fact,
+    so this can't be deferred to a post-hoc enrichment step the way
+    in_sample_yield/out_of_sample_yield are. This is measurably slower
+    (one extra strike solve per trading day instead of per cycle) but
+    keeps one unified computation path rather than forking behavior by
+    what the caller eventually wants to rank by.
     """
     events = _simulate_cycles(closes, vol, dte, target_delta, rate, spread_pct, haircut_fraction)
     if not events:
         return None
+
+    empirical = compute_empirical_outcome_stats(closes, vol, dte, target_delta, rate, move_threshold_pct)
 
     premiums_pct, assigned_flags = [], []
     option_rows = []
@@ -424,6 +525,13 @@ def backtest_dte(
         max_drawdown_pct=max_drawdown_pct,
         risk_adjusted_return=risk_adjusted_return,
         spread_pct_used=spread_pct,
+        p_expires_below_strike=empirical["p_expires_below_strike"] if empirical else None,
+        p_called_away=empirical["p_called_away"] if empirical else None,
+        p_small_move=empirical["p_small_move"] if empirical else None,
+        median_move_pct=empirical["median_move_pct"] if empirical else None,
+        empirical_window_count=empirical["empirical_window_count"] if empirical else None,
+        empirical_effective_n=empirical["empirical_effective_n"] if empirical else None,
+        move_threshold_pct_used=empirical["move_threshold_pct_used"] if empirical else None,
     )
 
 
@@ -469,6 +577,7 @@ def backtest_symbol_total_return(
     min_cycles_for_selection: int = MIN_CYCLES_FOR_SELECTION,
     intent: str = DEFAULT_INTENT,
     intent_is_default: bool = False,
+    move_threshold_pct: float = EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT,
 ) -> CycleStats | None:
     """
     Task 2's main entry point. Sweeps dte_buckets x delta_buckets on the
@@ -498,7 +607,9 @@ def backtest_symbol_total_return(
     best, best_score = None, None
     for delta in delta_buckets:
         for dte in dte_buckets:
-            stats = backtest_dte(train_closes, train_vol, dte, delta, rate, spread_pct, haircut_fraction)
+            stats = backtest_dte(
+                train_closes, train_vol, dte, delta, rate, spread_pct, haircut_fraction, move_threshold_pct,
+            )
             if stats is None:
                 continue
             found_any_valid_combo = True
@@ -525,7 +636,9 @@ def backtest_symbol_total_return(
             _log.warning("%s: no (DTE, delta) combo produced any in-sample cycles at all -- dropping", symbol)
         return None
 
-    oos_stats = backtest_dte(test_closes, test_vol, best.dte, best.target_delta, rate, spread_pct, haircut_fraction)
+    oos_stats = backtest_dte(
+        test_closes, test_vol, best.dte, best.target_delta, rate, spread_pct, haircut_fraction, move_threshold_pct,
+    )
     in_sample_yield = best.avg_annualized_yield
     out_of_sample_yield = oos_stats.avg_annualized_yield if oos_stats is not None else None
     gap_pp = (in_sample_yield - out_of_sample_yield) * 100 if out_of_sample_yield is not None else None
@@ -542,6 +655,12 @@ def backtest_symbol_total_return(
         oos_risk_adjusted_return=oos_stats.risk_adjusted_return if oos_stats is not None else None,
         intent=intent,
         intent_is_default=intent_is_default,
+        oos_p_expires_below_strike=oos_stats.p_expires_below_strike if oos_stats is not None else None,
+        oos_p_called_away=oos_stats.p_called_away if oos_stats is not None else None,
+        oos_p_small_move=oos_stats.p_small_move if oos_stats is not None else None,
+        oos_median_move_pct=oos_stats.median_move_pct if oos_stats is not None else None,
+        oos_empirical_window_count=oos_stats.empirical_window_count if oos_stats is not None else None,
+        oos_empirical_effective_n=oos_stats.empirical_effective_n if oos_stats is not None else None,
     )
 
 
@@ -553,6 +672,7 @@ def apply_dte_shrinkage(
     haircut_fraction: float = FILL_HAIRCUT_FRACTION,
     train_fraction: float = WALK_FORWARD_TRAIN_FRACTION,
     min_cycles_for_selection: int = MIN_CYCLES_FOR_SELECTION,
+    move_threshold_pct: float = EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT,
 ) -> dict[str, CycleStats]:
     """
     Pull a symbol's recommended DTE toward a consensus when its own
@@ -615,6 +735,7 @@ def apply_dte_shrinkage(
                 rate=rate, haircut_fraction=haircut_fraction, train_fraction=train_fraction,
                 min_cycles_for_selection=min_cycles_for_selection,
                 intent=intent, intent_is_default=stats.intent_is_default or False,
+                move_threshold_pct=move_threshold_pct,
             )
             if refreshed is None:
                 _log.warning(
@@ -710,6 +831,8 @@ if __name__ == "__main__":
     parser.add_argument("--ignore-intents", action="store_true",
                          help="sweep the flat --delta buckets for every symbol instead of each "
                               "symbol's own intent-derived delta band")
+    parser.add_argument("--move-threshold-pct", type=float, default=EMPIRICAL_SMALL_MOVE_THRESHOLD_PCT,
+                         help="X in P(|move| < X%% over one DTE window) for the empirical outcome stats")
     parser.add_argument("--out", default=None,
                          help=f"write {{symbol: recommended_dte+stats}} JSON for apply_watchlist.py to consume "
                               f"(default when --from-screener is used: {DEFAULT_PROPOSED_OUT_PATH})")
@@ -754,6 +877,7 @@ if __name__ == "__main__":
                 haircut_fraction=args.haircut_fraction, train_fraction=args.train_fraction,
                 min_cycles_for_selection=args.min_cycles_for_selection,
                 intent=intent, intent_is_default=intent_is_default,
+                move_threshold_pct=args.move_threshold_pct,
             )
             if stats is None:
                 print(f"{symbol}: FAILED — no (DTE, delta) combo had >= {args.min_cycles_for_selection} "
@@ -781,6 +905,22 @@ if __name__ == "__main__":
                 f"    OOS total_return={oos_return_str} OOS max_drawdown={oos_dd_str} "
                 f"OOS risk_adjusted={oos_ra_str}"
             )
+            if stats.p_called_away is not None:
+                print(
+                    f"    empirical (train, n={stats.empirical_window_count} windows, "
+                    f"effective_n={stats.empirical_effective_n}): P(called away)={stats.p_called_away:.1%} "
+                    f"P(expires below strike)={stats.p_expires_below_strike:.1%} "
+                    f"P(|move|<{stats.move_threshold_pct_used:.0%})={stats.p_small_move:.1%} "
+                    f"median move={stats.median_move_pct:+.1%}"
+                )
+            if stats.oos_p_called_away is not None:
+                print(
+                    f"    empirical (OOS, n={stats.oos_empirical_window_count} windows, "
+                    f"effective_n={stats.oos_empirical_effective_n}): P(called away)={stats.oos_p_called_away:.1%} "
+                    f"P(expires below strike)={stats.oos_p_expires_below_strike:.1%} "
+                    f"P(|move|<{stats.move_threshold_pct_used:.0%})={stats.oos_p_small_move:.1%} "
+                    f"median move={stats.oos_median_move_pct:+.1%}"
+                )
         except Exception as e:
             _log.exception("backtest failed for %s", symbol)
             print(f"{symbol}: FAILED — {e}")
@@ -789,6 +929,7 @@ if __name__ == "__main__":
         recommendations = apply_dte_shrinkage(
             recommendations, lookback=args.lookback, haircut_fraction=args.haircut_fraction,
             train_fraction=args.train_fraction, min_cycles_for_selection=args.min_cycles_for_selection,
+            move_threshold_pct=args.move_threshold_pct,
         )
         for symbol, stats in recommendations.items():
             if stats.shrunk_from_dte is not None:
