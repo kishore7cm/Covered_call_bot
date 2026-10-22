@@ -123,3 +123,32 @@ def test_log_share_trade_succeeds_against_a_working_connection(monkeypatch):
     monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
     monkeypatch.setattr(logger, "_connect", lambda: _FakeConn(_FakeCursor()))
     logger.log_share_trade("AAPL", "BUY", 100, price=150.0)  # must not raise
+
+
+# ── get_expected_share_qty: confirmed fail-closed-on-uncertainty (None,
+# distinguishable from a real 0) -- unchanged by this round's fixes,
+# documented here precisely since the prior summary's table row was
+# unclear. The caller (main.py) already treats None as "can't verify,
+# skip the overlap check," not as "0 expected" -- see
+# test_share_count_check_skipped_when_expected_qty_is_none in
+# test_main.py for the end-to-end behavior through run_symbol_cycle.
+
+def test_get_expected_share_qty_returns_none_when_database_url_unset(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "")
+    assert logger.get_expected_share_qty("AAPL") is None
+
+
+def test_get_expected_share_qty_returns_none_when_query_fails(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    monkeypatch.setattr(logger, "_connect", _raise_connect)
+    assert logger.get_expected_share_qty("AAPL") is None
+
+
+def test_get_expected_share_qty_returns_a_real_zero_distinguishable_from_none(monkeypatch):
+    """0 (never bought, never assigned) must still come back as the
+    real int 0, not be confused with the None "can't verify" case."""
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    monkeypatch.setattr(logger, "_connect", lambda: _FakeConn(_FakeCursor(fetchone_return=(0,))))
+    result = logger.get_expected_share_qty("AAPL")
+    assert result == 0
+    assert result is not None

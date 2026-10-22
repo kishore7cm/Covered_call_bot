@@ -412,6 +412,25 @@ def test_share_count_mismatch_not_checked_at_zero_shares(monkeypatch):
     assert result == f"AAPL: bought {SHARES_PER_LOT} shares"
 
 
+def test_share_count_check_skipped_when_expected_qty_is_none(monkeypatch):
+    """logger.get_expected_share_qty() returning None means "can't
+    verify" (DATABASE_URL unset or the query failed) -- the overlap
+    check must be SKIPPED, not misread as "0 expected" (which would
+    incorrectly flag every real position as an overlap). The cycle
+    proceeds normally on the broker's actual state."""
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "get_expected_share_qty", lambda symbol: None)
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: None)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "overlap" not in result.lower()
+    assert logged["errors"] == []
+
+
 # ── State 2: shares held, no call ────────────────────────────────────────────
 
 def test_sells_call_when_candidate_found(monkeypatch):
