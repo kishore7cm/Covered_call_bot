@@ -17,8 +17,9 @@ from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, PAPER,
     DTE_MIN, DTE_MAX, RISK_FREE_RATE, DELTA_TOLERANCE,
     MIN_OPEN_INTEREST, MAX_SPREAD_PCT, REQUIRE_EXPIRY_BEFORE_EARNINGS,
+    QUOTE_MAX_AGE_MINUTES,
 )
-from calendar_data import get_calendar_dates
+from calendar_data import get_earnings_status
 from greeks import implied_vol, bs_call_delta, bs_call_theta_per_day
 
 _log = logging.getLogger(__name__)
@@ -156,12 +157,43 @@ def get_chain_snapshot(underlying: str) -> dict:
 
 
 def _quote(snapshot) -> tuple[float, float] | None:
-    """Return (bid, ask) if both sides are present and non-zero, else None."""
+    """
+    Return (bid, ask) if the quote is usable, else None. Rejects:
+      - missing/zero sides (thin/no market)
+      - crossed quotes (bid > ask) -- an inverted market is never a valid
+        trade price, no matter how it got that way. This used to slip
+        through into _build_candidate, where spread_pct = (ask-bid)/mid
+        came out NEGATIVE and therefore always passed the MAX_SPREAD_PCT
+        gate (a negative number is never greater than a positive
+        threshold) -- rejecting it here, before mid_price is ever
+        computed from it, closes that gap at the source.
+      - stale quotes (older than QUOTE_MAX_AGE_MINUTES)
+      - too-wide spreads (over MAX_SPREAD_PCT of the mid) -- checked here,
+        not just in the post-hoc liquidity gate, so get_atm_iv() (which
+        never runs that gate) gets the same protection as pick_strike().
+    """
     q = getattr(snapshot, "latest_quote", None)
     if q is None or q.bid_price is None or q.ask_price is None:
         return None
     if q.bid_price <= 0 or q.ask_price <= 0:
         return None
+    if q.bid_price > q.ask_price:
+        _log.warning("Crossed quote (bid %.2f > ask %.2f) for %s — rejecting", q.bid_price, q.ask_price, q.symbol)
+        return None
+
+    timestamp = getattr(q, "timestamp", None)
+    if timestamp is not None:
+        age = datetime.now(timezone.utc) - timestamp
+        if age > timedelta(minutes=QUOTE_MAX_AGE_MINUTES):
+            _log.warning("Stale quote (%s old) for %s — rejecting", age, q.symbol)
+            return None
+
+    mid = (q.bid_price + q.ask_price) / 2.0
+    spread_pct = (q.ask_price - q.bid_price) / mid if mid > 0 else None
+    if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
+        _log.warning("Spread %.1f%% exceeds MAX_SPREAD_PCT for %s — rejecting", spread_pct * 100, q.symbol)
+        return None
+
     return (q.bid_price, q.ask_price)
 
 
@@ -256,8 +288,20 @@ def pick_strike(
     dte_min/dte_max default to the global config window but can be
     overridden per call — main.py passes a per-symbol window derived from
     backtest.py's recommended DTE once the research pipeline has run.
+
+    Earnings risk is resolved via calendar_data.get_earnings_status(),
+    which fails CLOSED: "no earnings expected" (a known ETF) and "a
+    confirmed date was found" are the only two statuses that let this
+    continue. "unknown" (lookup failed, the ETF cross-check disagreed, or
+    no usable date could be resolved) skips the symbol entirely for this
+    cycle -- it is NOT treated as "no earnings risk," which is what this
+    function used to do whenever the old get_calendar_dates() lookup
+    simply came back empty for a stock.
     """
-    earnings_date, ex_div_date = get_calendar_dates(underlying)
+    earnings_status, earnings_date, ex_div_date = get_earnings_status(underlying)
+    if earnings_status == "unknown":
+        _log.warning("%s: could not determine earnings risk (lookup failed or signals disagree) — skipping", underlying)
+        return None
 
     contracts = list_call_contracts(underlying, spot_price=spot_price, dte_min=dte_min, dte_max=dte_max)
     if not contracts:

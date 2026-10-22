@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import options_data
 
@@ -94,3 +94,120 @@ def test_target_dte_clamps_low_end_at_one_day(monkeypatch):
     options_data.get_atm_iv("TEST", spot_price=100.0, target_dte=5)
     assert calls["dte_min"] == 1  # max(1, 5 - 10) == 1, not negative
     assert calls["dte_max"] == 15
+
+
+# ── _quote: crossed/stale/wide-spread rejection (Phase 3, Task 3) ───────────
+
+@dataclass
+class FakeQuote:
+    bid_price: float | None
+    ask_price: float | None
+    symbol: str = "TEST261113C00100000"
+    timestamp: object = None
+
+
+@dataclass
+class FakeSnapshot:
+    latest_quote: object
+
+
+def _fresh_timestamp():
+    return datetime.now(timezone.utc)
+
+
+def test_quote_rejects_missing_sides():
+    snap = FakeSnapshot(latest_quote=FakeQuote(bid_price=None, ask_price=5.0, timestamp=_fresh_timestamp()))
+    assert options_data._quote(snap) is None
+
+
+def test_quote_rejects_zero_sides():
+    snap = FakeSnapshot(latest_quote=FakeQuote(bid_price=0.0, ask_price=5.0, timestamp=_fresh_timestamp()))
+    assert options_data._quote(snap) is None
+
+
+def test_quote_rejects_crossed_market():
+    snap = FakeSnapshot(latest_quote=FakeQuote(bid_price=6.0, ask_price=5.0, timestamp=_fresh_timestamp()))
+    assert options_data._quote(snap) is None
+
+
+def test_quote_rejects_stale_quote():
+    old = _fresh_timestamp() - timedelta(minutes=options_data.QUOTE_MAX_AGE_MINUTES + 1)
+    snap = FakeSnapshot(latest_quote=FakeQuote(bid_price=4.9, ask_price=5.1, timestamp=old))
+    assert options_data._quote(snap) is None
+
+
+def test_quote_accepts_fresh_quote_within_max_age():
+    recent = _fresh_timestamp() - timedelta(minutes=options_data.QUOTE_MAX_AGE_MINUTES - 1)
+    snap = FakeSnapshot(latest_quote=FakeQuote(bid_price=4.9, ask_price=5.1, timestamp=recent))
+    assert options_data._quote(snap) == (4.9, 5.1)
+
+
+def test_quote_rejects_too_wide_spread():
+    # mid = 5.5, spread = 1.0 -> 18% > default MAX_SPREAD_PCT (10%)
+    snap = FakeSnapshot(latest_quote=FakeQuote(bid_price=5.0, ask_price=6.0, timestamp=_fresh_timestamp()))
+    assert options_data._quote(snap) is None
+
+
+def test_quote_accepts_narrow_spread():
+    # mid = 5.05, spread = 0.1 -> ~2% < default MAX_SPREAD_PCT (10%)
+    snap = FakeSnapshot(latest_quote=FakeQuote(bid_price=5.0, ask_price=5.1, timestamp=_fresh_timestamp()))
+    assert options_data._quote(snap) == (5.0, 5.1)
+
+
+# ── pick_strike: fail-closed earnings integration (Phase 3, Task 3) ─────────
+
+@dataclass
+class FakeCallContract:
+    symbol: str
+    strike_price: float
+    expiration_date: date
+    open_interest: str = "5000"
+
+
+def _patch_pick_strike_common(monkeypatch, contracts, earnings_status):
+    monkeypatch.setattr(options_data, "list_call_contracts", lambda *a, **k: contracts)
+    monkeypatch.setattr(options_data, "get_chain_snapshot", lambda underlying: {c.symbol: object() for c in contracts})
+    monkeypatch.setattr(options_data, "get_earnings_status", lambda underlying: earnings_status)
+
+    def fake_build_candidate(contract, snap, spot_price, today, ex_dividend_date=None):
+        return options_data.CallCandidate(
+            occ_symbol=contract.symbol, strike=contract.strike_price, expiration=contract.expiration_date,
+            mid_price=5.0, delta=0.25, dte=30, iv=0.3,
+            premium_yield=0.05, annualized_yield=0.6, breakeven=95.0,
+            downside_cushion=0.05, if_called_return=0.05, theta_per_day=0.1,
+            open_interest=5000, bid_ask_spread_pct=0.02,
+        )
+    monkeypatch.setattr(options_data, "_build_candidate", fake_build_candidate)
+
+
+def test_pick_strike_skips_when_earnings_status_unknown(monkeypatch):
+    contracts = [FakeCallContract("A1", 100.0, date.today() + timedelta(days=30))]
+    _patch_pick_strike_common(monkeypatch, contracts, ("unknown", None, None))
+
+    result = options_data.pick_strike("AAPL", spot_price=100.0, target_delta=0.25)
+
+    assert result is None
+
+
+def test_pick_strike_proceeds_for_known_etf(monkeypatch):
+    contracts = [FakeCallContract("A1", 100.0, date.today() + timedelta(days=30))]
+    _patch_pick_strike_common(monkeypatch, contracts, ("no_earnings_expected", None, None))
+
+    result = options_data.pick_strike("SPY", spot_price=100.0, target_delta=0.25)
+
+    assert result is not None
+    assert result.occ_symbol == "A1"
+
+
+def test_pick_strike_drops_contracts_expiring_after_confirmed_earnings(monkeypatch):
+    earnings_date = date.today() + timedelta(days=20)
+    contracts = [
+        FakeCallContract("BEFORE", 100.0, date.today() + timedelta(days=10)),
+        FakeCallContract("AFTER", 100.0, date.today() + timedelta(days=30)),
+    ]
+    _patch_pick_strike_common(monkeypatch, contracts, ("confirmed", earnings_date, None))
+
+    result = options_data.pick_strike("AAPL", spot_price=100.0, target_delta=0.25)
+
+    assert result is not None
+    assert result.occ_symbol == "BEFORE"

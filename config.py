@@ -101,6 +101,37 @@ MIN_OPEN_INTEREST     = 1000    # contracts; below this, treat as illiquid
 MAX_SPREAD_PCT        = 0.10    # bid-ask spread as % of mid; above this, skip
 REQUIRE_EXPIRY_BEFORE_EARNINGS = True  # skip contracts expiring on/after a known earnings date
 
+# ── Quote integrity (Phase 3, Task 3) ────────────────────────────────────────
+# Checked in options_data._quote(), before a candidate is ever built from
+# the quote -- a crossed market (bid > ask) is never a valid trade price
+# regardless of how it got that way, and a quote this old is stale data,
+# not just a thin one. Centralizing the spread-width check here too (not
+# just in the post-hoc liquidity gate) means get_atm_iv() -- which never
+# runs the liquidity gate -- gets the same protection as pick_strike().
+QUOTE_MAX_AGE_MINUTES = 15
+
+# ── Earnings/calendar data integrity (Phase 3, Task 3) ───────────────────────
+# Manually curated list of symbols with no earnings events at all (ETFs,
+# indices) -- the PRIMARY signal for "no earnings expected." yfinance's
+# quoteType is a cross-check, not the primary signal (calendar_data.py is
+# an unofficial, scraped source with no SLA). If the two disagree, OR the
+# cross-check lookup itself fails, this fails CLOSED (the symbol is
+# skipped for the cycle) rather than trusting either signal alone.
+KNOWN_ETFS: list[str] = [
+    # "SPY", "QQQ", "IWM",
+]
+# An earnings date further out than this, or in the past, is treated as
+# missing rather than trusted -- a stale or placeholder date is exactly
+# the kind of bad data a fail-closed check needs to catch, not silently
+# use to clear a symbol for trading.
+MAX_EARNINGS_LOOKAHEAD_DAYS = 120
+# How old a cached calendar-data read (earnings/ex-dividend date) is
+# allowed to be before calendar_data.get_calendar_dates() re-fetches
+# rather than reusing it -- a bit under one weekly cycle's cadence, so a
+# cache can be reused within a single cycle's multiple lookups but never
+# silently carries over, stale, into the next one.
+CALENDAR_DATA_MAX_AGE_HOURS = 20
+
 # IV rank/percentile needs accumulated history to mean anything. This bot
 # only samples once per weekly cycle (see CLAUDE.md), so reaching a
 # textbook-standard lookback (a year of daily readings = ~252 points) would
