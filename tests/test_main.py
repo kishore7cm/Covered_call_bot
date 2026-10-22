@@ -1039,6 +1039,68 @@ def test_buy_shares_real_partial_fill_alerts_via_send_partial_fill(monkeypatch):
     assert "60" in sent[0]["args"][1]
 
 
+def test_real_fill_with_lot_write_failure_sets_needs_attention_and_blocks_next_cycle(monkeypatch):
+    """A REAL buy already happened on the broker -- if persisting it then
+    fails (open_lot raises DBUnavailable), that must set the SAME
+    persisted, file-based needs-attention flag trader.roll_call's own
+    uncovered-shares failure uses, not something DB-dependent (the DB is
+    exactly what's unavailable). The next cycle must see that flag and
+    place no order at all for this symbol."""
+    marked = {}
+    sent = []
+
+    def fake_mark_needs_attention(symbol, reason):
+        marked[symbol] = reason
+    monkeypatch.setattr(trader, "mark_needs_attention", fake_mark_needs_attention)
+
+    def raise_open_lot(symbol, qty, price):
+        raise logger.DBUnavailable("connection refused")
+    logged = _patch_common(monkeypatch)
+    monkeypatch.setattr(main, "open_lot", raise_open_lot)
+    monkeypatch.setattr(main.notifier, "send_needs_attention", _capture_async_call(sent))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "FAILED to persist" in result
+    assert "AAPL" in marked
+    assert "connection refused" in marked["AAPL"]
+    assert len(sent) == 1
+    assert len(logged["errors"]) == 1
+
+    # Next cycle: the persisted flag (now real, via trader.check_needs_attention
+    # reading the same file mark_needs_attention would have written) blocks
+    # the symbol before any order is attempted.
+    buy_calls = []
+    monkeypatch.setattr(trader, "check_needs_attention", lambda symbol: marked.get(symbol))
+    monkeypatch.setattr(trader, "buy_shares", lambda symbol, qty, **k: buy_calls.append((symbol, qty)))
+
+    result2 = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" in result2
+    assert buy_calls == []
+
+
+def test_real_fill_with_trade_log_write_failure_sets_needs_attention(monkeypatch):
+    """Same contract as the lot-write case above, but for the trade-log
+    write (log_share_trade) specifically -- either write failing after a
+    real fill must flag the symbol, not just one of the two."""
+    marked = {}
+
+    def fake_mark_needs_attention(symbol, reason):
+        marked[symbol] = reason
+    monkeypatch.setattr(trader, "mark_needs_attention", fake_mark_needs_attention)
+
+    def raise_log_share_trade(symbol, side, qty, price=None, order_id=None):
+        raise logger.DBUnavailable("connection refused")
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(main, "log_share_trade", raise_log_share_trade)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "FAILED to persist" in result
+    assert "AAPL" in marked
+
+
 def test_alert_for_block_reason_fires_only_for_kill_switch_and_db_unavailable(monkeypatch):
     kill_switch_sent = []
     db_sent = []

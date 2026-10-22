@@ -475,11 +475,27 @@ def run_symbol_cycle(
         # silently mis-record a partial fill as if the full lot had gone
         # through, corrupting both the trade log and the lot's own qty.
         filled_qty = result["qty"]
-        log_share_trade(symbol, "BUY", filled_qty, price=result.get("price"), order_id=result["order_id"])
-        if result.get("price") is not None:
-            open_lot(symbol, filled_qty, result["price"])
-        else:
-            log_error("main.run_symbol_cycle", f"{symbol}: bought shares but no fill price — lot opened without a basis")
+        try:
+            log_share_trade(symbol, "BUY", filled_qty, price=result.get("price"), order_id=result["order_id"])
+            if result.get("price") is not None:
+                open_lot(symbol, filled_qty, result["price"])
+            else:
+                log_error("main.run_symbol_cycle", f"{symbol}: bought shares but no fill price — lot opened without a basis")
+        except DBUnavailable as e:
+            # The REAL buy already happened on the broker -- this is a
+            # persistence failure AFTER the fact, not a reason to retry or
+            # undo anything. The broker and this bot's own trade log can
+            # now disagree about what it holds, so the symbol is flagged
+            # and blocked (trader.check_needs_attention, checked at the
+            # top of every cycle) until a human reconciles it by hand.
+            reason = (
+                f"REAL buy of {filled_qty} shares filled (order {result['order_id']}) but persisting it "
+                f"failed ({e}) — broker and trade log may now disagree; blocked until manually reconciled"
+            )
+            trader.mark_needs_attention(symbol, reason)
+            log_error("main.run_symbol_cycle", f"{symbol}: {reason}")
+            _run_async(notifier.send_needs_attention(symbol, reason))
+            return f"{symbol}: bought {filled_qty} shares but FAILED to persist — flagged needs-attention"
         if filled_qty != SHARES_PER_LOT:
             msg = f"{symbol}: buy_shares only partially filled ({filled_qty}/{SHARES_PER_LOT} shares) — remainder was cancelled"
             log_error("main.run_symbol_cycle", msg)

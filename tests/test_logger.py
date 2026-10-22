@@ -83,3 +83,43 @@ def test_get_open_lot_returns_lot_dict_when_found(monkeypatch):
     lot = logger.get_open_lot("AAPL")
     assert lot["symbol"] == "AAPL"
     assert lot["qty"] == 100
+
+
+# ── open_lot ──────────────────────────────────────────────────────────────────
+
+def test_open_lot_returns_none_when_database_url_unset(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "")
+    assert logger.open_lot("AAPL", 100, 150.0) is None
+
+
+def test_open_lot_raises_dbunavailable_when_insert_fails(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    monkeypatch.setattr(logger, "_connect", _raise_connect)
+    with pytest.raises(DBUnavailable):
+        logger.open_lot("AAPL", 100, 150.0)
+
+
+def test_open_lot_returns_lot_id_on_success(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    monkeypatch.setattr(logger, "_connect", lambda: _FakeConn(_FakeCursor(fetchone_return=(42,))))
+    assert logger.open_lot("AAPL", 100, 150.0) == 42
+
+
+# ── log_share_trade ───────────────────────────────────────────────────────────
+
+def test_log_share_trade_is_a_noop_when_database_url_unset(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "")
+    logger.log_share_trade("AAPL", "BUY", 100, price=150.0)  # must not raise
+
+
+def test_log_share_trade_raises_dbunavailable_when_insert_fails(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    monkeypatch.setattr(logger, "_connect", _raise_connect)
+    with pytest.raises(DBUnavailable):
+        logger.log_share_trade("AAPL", "BUY", 100, price=150.0)
+
+
+def test_log_share_trade_succeeds_against_a_working_connection(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    monkeypatch.setattr(logger, "_connect", lambda: _FakeConn(_FakeCursor()))
+    logger.log_share_trade("AAPL", "BUY", 100, price=150.0)  # must not raise

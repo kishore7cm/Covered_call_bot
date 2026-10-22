@@ -182,6 +182,14 @@ def log_option_trade(
 
 def log_share_trade(symbol: str, side: str, qty: int, price: float | None = None,
                      order_id: str | None = None) -> None:
+    """
+    Raises DBUnavailable if DATABASE_URL IS set but the insert itself
+    fails -- a no-op (not a failure) when DATABASE_URL isn't configured
+    at all. Callers that just recorded a REAL fill (main.py's State 1
+    buy path) must catch this and flag the symbol needs-attention,
+    rather than silently letting the broker and this bot's own trade log
+    disagree about what actually happened.
+    """
     logger.info("SHARE  | %-6s | %-4s | qty=%s price=%s", symbol, side, qty, price)
     if not DATABASE_URL:
         return
@@ -194,6 +202,7 @@ def log_share_trade(symbol: str, side: str, qty: int, price: float | None = None
             conn.commit()
     except Exception as e:
         logger.error("log_share_trade failed: %s", e)
+        raise DBUnavailable(str(e)) from e
 
 
 def log_error(module: str, message: str) -> None:
@@ -420,8 +429,15 @@ def get_rolls_since_last_lot_open(symbol: str) -> int | None:
 # overlap checks already cross-check.
 
 def open_lot(symbol: str, qty: int, cost_basis_per_share: float) -> int | None:
-    """Log a newly-opened lot. Returns the new lot's id, or None if
-    DATABASE_URL isn't configured or the insert fails."""
+    """
+    Log a newly-opened lot. Returns the new lot's id, or None if
+    DATABASE_URL isn't configured (a deliberate no-op, not a failure).
+    Raises DBUnavailable if DATABASE_URL IS set but the insert itself
+    fails -- callers that just recorded a REAL fill (main.py's State 1
+    buy path) must catch this and flag the symbol needs-attention,
+    rather than silently treating a failed write the same as "not
+    configured."
+    """
     if not DATABASE_URL:
         return None
     try:
@@ -435,7 +451,7 @@ def open_lot(symbol: str, qty: int, cost_basis_per_share: float) -> int | None:
             return lot_id
     except Exception as e:
         logger.error("open_lot failed: %s", e)
-        return None
+        raise DBUnavailable(str(e)) from e
 
 
 _LOT_COLS = ("id", "symbol", "qty", "cost_basis_per_share", "opened_at", "no_qualifying_call_flagged_at")
