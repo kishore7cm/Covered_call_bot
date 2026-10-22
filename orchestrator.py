@@ -1,7 +1,14 @@
 """
 Master orchestrator for the covered-call research pipeline. Sequences
-screener.py -> backtest.py -> (prints the pending approval diff) for you,
-instead of you running each command by hand.
+screener.py -> sizer.py -> backtest.py -> (prints the pending approval
+diff) for you, instead of you running each command by hand.
+
+sizer.py runs right after screener.py, before backtest.py: position
+sizing (is this even affordable/diversifiable within budget) doesn't need
+-- and shouldn't wait for -- a backtest result. Its failure is logged but
+NON-fatal to the rest of the pipeline (it's a planning report, not a gate
+on anything downstream); screener.py and backtest.py failures still stop
+the pipeline, same as before.
 
 ORCHESTRATION AUTHORITY ONLY — per Kishore's explicit decision, this script
 never calls apply_watchlist.py with --confirm, so it can never change what
@@ -16,7 +23,7 @@ not a second always-running process like main.py's, since research doesn't
 need a standing loop the way the weekly trading cycle does.
 
 Usage:
-    python orchestrator.py research AAPL MSFT KO ...   # screener -> backtest -> diff
+    python orchestrator.py research AAPL MSFT KO ...   # screener -> sizer -> backtest -> diff
     python orchestrator.py analyze                      # stage 4 only
 """
 import argparse
@@ -44,6 +51,9 @@ def run_research(symbols: list[str], dte: str | None) -> None:
     if not _run(["screener.py", *symbols, "--out", SCREENED_PATH]):
         _log.error("screener.py failed — stopping before backtest.py to avoid feeding it stale/empty input.")
         return
+
+    if not _run(["sizer.py", "--screened", SCREENED_PATH]):
+        _log.warning("sizer.py failed — continuing to backtest.py anyway (sizing is informational, not a gate).")
 
     backtest_cmd = ["backtest.py", "--from-screener", SCREENED_PATH, "--out", PROPOSED_PATH]
     if dte:

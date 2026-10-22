@@ -61,6 +61,11 @@ class ScreenResult:
     bid_ask_spread_pct: float | None = None
     years_of_history: float | None = None
     liquid_near_delta_count: int = 0
+    # Persisted so sizer.py can compute lot cost (100 x price) straight from
+    # screened_symbols.json instead of a second live quote. None only when
+    # _get_spot_price() itself failed (the "no live spot price available"
+    # path below never reaches a return with a price to set).
+    spot_price: float | None = None
 
 
 def _years_of_price_history(symbol: str) -> float | None:
@@ -93,7 +98,7 @@ def screen_symbol(symbol: str, target_delta: float = TARGET_DELTA) -> ScreenResu
     contracts = list_call_contracts(symbol, spot_price=spot)
     if not contracts:
         return ScreenResult(symbol=symbol, passed=False, reason="no call contracts in DTE window",
-                             years_of_history=years)
+                             years_of_history=years, spot_price=spot)
 
     snapshots = get_chain_snapshot(symbol)
     today = date.today()
@@ -109,7 +114,7 @@ def screen_symbol(symbol: str, target_delta: float = TARGET_DELTA) -> ScreenResu
 
     if not candidates:
         return ScreenResult(symbol=symbol, passed=False, reason="no solvable-delta candidates (thin/stale quotes)",
-                             years_of_history=years)
+                             years_of_history=years, spot_price=spot)
 
     near_delta = [c for c in candidates if abs(c.delta - target_delta) <= NEAR_DELTA_WINDOW]
     liquid_near_delta = [
@@ -126,7 +131,7 @@ def screen_symbol(symbol: str, target_delta: float = TARGET_DELTA) -> ScreenResu
             reason=f"only {len(liquid_near_delta)}/{len(near_delta)} contracts near "
                    f"delta {target_delta:.2f} pass liquidity gates (need {MIN_LIQUID_NEAR_DELTA})",
             open_interest=best.open_interest, bid_ask_spread_pct=best.bid_ask_spread_pct,
-            years_of_history=years, liquid_near_delta_count=len(liquid_near_delta),
+            years_of_history=years, liquid_near_delta_count=len(liquid_near_delta), spot_price=spot,
         )
 
     # Report stats from the best LIQUID near-delta candidate, not just the
@@ -138,7 +143,7 @@ def screen_symbol(symbol: str, target_delta: float = TARGET_DELTA) -> ScreenResu
     return ScreenResult(
         symbol=symbol, passed=True,
         open_interest=best_liquid.open_interest, bid_ask_spread_pct=best_liquid.bid_ask_spread_pct,
-        years_of_history=years, liquid_near_delta_count=len(liquid_near_delta),
+        years_of_history=years, liquid_near_delta_count=len(liquid_near_delta), spot_price=spot,
     )
 
 

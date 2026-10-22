@@ -110,6 +110,15 @@ MIN_CYCLES_FOR_SELECTION = 5
 # too little of its own history to trust the pick on its own).
 SHRINKAGE_MIN_CYCLES = 8
 
+# ── Sizer (sizer.py, Task 1) — position sizing against Scout's screened
+# universe, before Oracle ever runs. Independent of Oracle/backtest.py: it
+# only needs price (from screened_symbols.json), never yield/return data.
+SIZER_BUDGET = 20_000.0
+SIZER_MAX_PRICE_PER_SHARE = 35.0       # a single 100-share lot above this is too expensive to size at all
+SIZER_MIN_NAMES = 6                    # diversification floor -- sizer.py reports clearly if it can't hit this
+SIZER_MAX_WEIGHT_PER_NAME = 0.20       # cap on capital (of SIZER_BUDGET, not just the investable portion) per symbol
+SIZER_CASH_RESERVE_PCT = 0.10          # fraction of SIZER_BUDGET sizer.py never allocates
+
 # ── Schedule ──────────────────────────────────────────────────────────────────
 # Weekly cycle — covered calls don't need intraday polling.
 CYCLE_DAY_OF_WEEK = "monday"
