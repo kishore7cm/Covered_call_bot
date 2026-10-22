@@ -6,6 +6,7 @@ monkeypatch.setattr(trader, "_client"/"_stock_data_client"/
 conftest.py's autouse fixture, which would raise if any test forgot to do
 this).
 """
+import os
 from datetime import datetime, timezone
 
 import pytest
@@ -1044,6 +1045,42 @@ def test_needs_attention_round_trip():
 
     assert trader.check_needs_attention("AAPL") == "test reason"
     assert trader.check_needs_attention("MSFT") is None
+
+
+def test_get_all_needs_attention_empty_when_no_file():
+    assert trader.get_all_needs_attention() == {}
+
+
+def test_get_all_needs_attention_returns_every_flagged_symbol():
+    trader.mark_needs_attention("AAPL", "reason A")
+    trader.mark_needs_attention("MSFT", "reason M")
+
+    flags = trader.get_all_needs_attention()
+
+    assert set(flags) == {"AAPL", "MSFT"}
+    assert flags["AAPL"]["reason"] == "reason A"
+    assert flags["MSFT"]["reason"] == "reason M"
+    assert "flagged_at" in flags["AAPL"]
+
+
+def test_clear_needs_attention_removes_only_that_symbol():
+    trader.mark_needs_attention("AAPL", "reason A")
+    trader.mark_needs_attention("MSFT", "reason M")
+
+    trader.clear_needs_attention("AAPL", "resolved by hand")
+
+    assert trader.check_needs_attention("AAPL") is None
+    assert trader.check_needs_attention("MSFT") == "reason M"
+
+
+def test_clear_needs_attention_on_missing_symbol_is_a_no_op():
+    trader.clear_needs_attention("AAPL", "nothing to clear")  # must not raise
+    assert trader.check_needs_attention("AAPL") is None
+
+
+def test_clear_needs_attention_with_no_file_at_all_is_a_no_op():
+    assert not os.path.exists(trader._NEEDS_ATTENTION_PATH)
+    trader.clear_needs_attention("AAPL", "nothing to clear")  # must not raise
 
 
 # ── Hard limits (Task 2) ──────────────────────────────────────────────────────

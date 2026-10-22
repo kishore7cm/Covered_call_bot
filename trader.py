@@ -305,6 +305,44 @@ def check_needs_attention(symbol: str) -> str | None:
         return "needs_attention_check_unavailable"
 
 
+def get_all_needs_attention() -> dict:
+    """Every currently-flagged symbol -> {"reason", "flagged_at"} -- used
+    by main.run_cycle() to print the full open list at the start of every
+    cycle, independent of check_needs_attention()'s single-symbol lookup."""
+    try:
+        if not os.path.exists(_NEEDS_ATTENTION_PATH):
+            return {}
+        with open(_NEEDS_ATTENTION_PATH) as f:
+            return json.load(f)
+    except Exception as e:
+        _log.error("get_all_needs_attention() failed to read flag file: %s", e)
+        return {}
+
+
+def clear_needs_attention(symbol: str, reason: str) -> None:
+    """
+    The only sanctioned way to remove a symbol's needs-attention flag.
+    mark_needs_attention is deliberately one-directional (see its
+    docstring) -- this is the human-operated counterpart, meant to be
+    called via clear_attention.py (which logs who/why via logger.log_error
+    before calling this) rather than someone hand-editing
+    pipeline_state/needs_attention.json and leaving no record a flag was
+    ever cleared or why. `reason` is accepted here (not just logged by the
+    caller) so a direct call still carries it, even though this function
+    itself doesn't persist it anywhere beyond removing the entry.
+    """
+    try:
+        if not os.path.exists(_NEEDS_ATTENTION_PATH):
+            return
+        with open(_NEEDS_ATTENTION_PATH) as f:
+            flags = json.load(f)
+        flags.pop(symbol, None)
+        with open(_NEEDS_ATTENTION_PATH, "w") as f:
+            json.dump(flags, f, indent=2)
+    except Exception as e:
+        _log.error("clear_needs_attention(%s) failed: %s", symbol, e)
+
+
 # ── Positions ─────────────────────────────────────────────────────────────────
 
 def get_share_position(symbol: str):
