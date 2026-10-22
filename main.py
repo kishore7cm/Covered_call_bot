@@ -37,6 +37,7 @@ from logger import (
     record_iv_snapshot, get_iv_history, get_last_open_occ_symbol,
     get_expected_share_qty, open_lot, get_open_lot, close_lot,
     flag_lot_no_qualifying_call, clear_lot_no_qualifying_call_flag,
+    DBUnavailable,
 )
 from options_data import pick_strike, get_chain_snapshot, parse_occ_symbol, get_atm_iv
 
@@ -489,8 +490,18 @@ def run_symbol_cycle(
     # Lot Manager (Phase 3, Task 6) -- read once, used by both States 2 and
     # 3 below. A symbol with no tracked lot (predates Task 6, or a legacy
     # position) just means min_strike stays None and nothing here changes
-    # behavior for it.
-    lot = get_open_lot(symbol)
+    # behavior for it. get_open_lot() raises DBUnavailable rather than
+    # returning None when it can't actually verify -- a lot lookup that
+    # silently read as "no lot" during an outage would drop the
+    # cost-basis floor pick_strike() uses, so States 2/3 skip the symbol
+    # entirely instead of guessing.
+    try:
+        lot = get_open_lot(symbol)
+    except DBUnavailable as e:
+        msg = f"{symbol}: lot lookup unavailable ({e}) — skipping this cycle, State 2/3 need the cost-basis floor"
+        log_error("main.run_symbol_cycle", msg)
+        _run_async(notifier.send_error(symbol, msg))
+        return f"{symbol}: SKIPPED — lot lookup unavailable"
     if lot is not None:
         lot_age = datetime.now(timezone.utc) - lot["opened_at"]
         if lot_age > timedelta(weeks=STALE_LOT_WEEKS):

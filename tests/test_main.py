@@ -19,6 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 import config
+import logger
 import main
 import trader
 from config import PROFIT_TAKE_PCT, SHARES_PER_LOT, WATCHLIST_MAX_AGE_DAYS
@@ -614,6 +615,30 @@ def test_buy_shares_opens_a_lot(monkeypatch):
     main.run_symbol_cycle("AAPL")
 
     assert ("open", "AAPL", SHARES_PER_LOT, 100.0) in logged["lot_flags"]
+
+
+def test_lot_lookup_unavailable_skips_the_symbol_in_state_2_or_3(monkeypatch):
+    """get_open_lot() raising DBUnavailable (DB down or DATABASE_URL
+    unset) must skip the symbol entirely for this cycle, not silently
+    read as "no lot" -- which would drop the cost-basis floor State 2/3
+    use for strike selection."""
+    pick_strike_calls = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+
+    def raise_unavailable(symbol):
+        raise logger.DBUnavailable("connection refused")
+    monkeypatch.setattr(main, "get_open_lot", raise_unavailable)
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: pick_strike_calls.append(a))
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "SKIPPED" in result
+    assert "lot lookup unavailable" in result.lower()
+    assert pick_strike_calls == []
+    assert len(logged["errors"]) == 1
 
 
 def test_assignment_closes_the_lot(monkeypatch):

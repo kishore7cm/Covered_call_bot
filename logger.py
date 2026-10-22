@@ -12,6 +12,19 @@ from config import DATABASE_URL, SHARES_PER_LOT
 
 logger = logging.getLogger(__name__)
 
+
+class DBUnavailable(Exception):
+    """
+    Raised by logger.py functions when DATABASE_URL IS configured but a
+    real read or write against it fails right now -- distinct from
+    DATABASE_URL simply not being configured at all (a deliberate
+    no-persistence mode, which these same functions treat as a normal
+    no-op/None, not a failure). Callers for which "can't verify" must
+    never be silently treated the same as "verified: empty/no-op" catch
+    this specifically -- see get_open_lot, open_lot, log_share_trade.
+    """
+    pass
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS option_trades (
   id SERIAL PRIMARY KEY,
@@ -429,13 +442,21 @@ _LOT_COLS = ("id", "symbol", "qty", "cost_basis_per_share", "opened_at", "no_qua
 
 
 def get_open_lot(symbol: str) -> dict | None:
-    """The currently-open lot for `symbol` (closed_at IS NULL), or None if
-    there isn't one or DATABASE_URL isn't configured. This bot only ever
+    """
+    The currently-open lot for `symbol` (closed_at IS NULL), or None if
+    the query succeeds and there genuinely isn't one. This bot only ever
     holds one open lot per symbol at a time -- LIMIT 1 ORDER BY opened_at
     DESC is defensive, not expected to ever need to actually pick among
-    multiple."""
+    multiple.
+
+    Raises DBUnavailable if DATABASE_URL isn't configured or the query
+    fails -- callers (main.py's State 2/3 lot lookup, used for the
+    cost-basis floor pick_strike() searches with) must treat that as
+    "can't verify," never as "no lot exists," which would silently drop
+    that floor and risk selling a call below the lot's real basis.
+    """
     if not DATABASE_URL:
-        return None
+        raise DBUnavailable("DATABASE_URL not set")
     cols_sql = ", ".join(_LOT_COLS)
     try:
         with _connect() as conn, conn.cursor() as cur:
@@ -448,7 +469,7 @@ def get_open_lot(symbol: str) -> dict | None:
             return dict(zip(_LOT_COLS, row)) if row else None
     except Exception as e:
         logger.error("get_open_lot failed: %s", e)
-        return None
+        raise DBUnavailable(str(e)) from e
 
 
 def close_lot(symbol: str, reason: str, price_per_share: float) -> None:
