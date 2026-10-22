@@ -180,6 +180,13 @@ def _reset_per_cycle_state(monkeypatch, tmp_path):
     # net-credit-specific tests override this themselves.
     monkeypatch.setattr(trader, "_option_data_client", FavorableRollQuoteClient())
     monkeypatch.setattr(trader, "LIMIT_ORDER_STEP_PAUSE_SECONDS", 0.05)
+    # Most existing fixtures in this file use artificially wide bid/ask
+    # spreads purely for arithmetic clarity of the walk math (e.g.
+    # bid=4/ask=6), not because they're meant to represent a realistic
+    # market spread -- permissive by default here so those don't trip the
+    # new slippage cap by accident; the dedicated cap tests set a real,
+    # tight value explicitly.
+    monkeypatch.setattr(trader, "MAX_SLIPPAGE_FROM_MID_PCT", 1.0)
 
 
 def _unblocked(monkeypatch):
@@ -565,6 +572,48 @@ def test_no_usable_quote_fails_without_submitting(monkeypatch):
     _unblocked(monkeypatch)
 
     result = trader.sell_to_open_call("AAPL261113C00200000", qty=1)
+
+    assert result is None
+    assert fake.submitted_orders == []
+
+
+def test_max_slippage_cap_refuses_a_too_wide_quote(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    # mid=5.5, natural=5.0 (sell -> bid) -- 0.5/5.5 = ~9.1% slippage from mid.
+    monkeypatch.setattr(trader, "_option_data_client", FakeQuoteDataClient(bid=5.0, ask=6.0))
+    monkeypatch.setattr(trader, "MAX_SLIPPAGE_FROM_MID_PCT", 0.05)
+    _unblocked(monkeypatch)
+
+    result = trader.sell_to_open_call("AAPL261113C00200000", qty=1)
+
+    assert result is None
+    assert fake.submitted_orders == []
+
+
+def test_max_slippage_cap_allows_a_tight_quote(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    # mid=5.0, natural=4.9 (sell -> bid) -- 0.1/5.0 = 2% slippage from mid.
+    monkeypatch.setattr(trader, "_option_data_client", FakeQuoteDataClient(bid=4.9, ask=5.1))
+    monkeypatch.setattr(trader, "MAX_SLIPPAGE_FROM_MID_PCT", 0.05)
+    _unblocked(monkeypatch)
+
+    result = trader.sell_to_open_call("AAPL261113C00200000", qty=1)
+
+    assert len(fake.submitted_orders) == 1
+    assert result["submitted"] is True
+
+
+def test_max_slippage_cap_applies_to_buy_side_too(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    # mid=5.5, natural=6.0 (buy -> ask) -- same ~9.1% slippage, other direction.
+    monkeypatch.setattr(trader, "_option_data_client", FakeQuoteDataClient(bid=5.0, ask=6.0))
+    monkeypatch.setattr(trader, "MAX_SLIPPAGE_FROM_MID_PCT", 0.05)
+    _unblocked(monkeypatch)
+
+    result = trader.buy_to_close_call("AAPL261113C00200000", qty=1)
 
     assert result is None
     assert fake.submitted_orders == []

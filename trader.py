@@ -39,7 +39,7 @@ from config import (
     KILL_SWITCH_ENABLED, KILL_SWITCH_PATH, LIMIT_ORDER_MAX_STEPS,
     LIMIT_ORDER_STEP_PAUSE_SECONDS, MARKET_CLOSE_BUFFER_MINUTES,
     MARKET_OPEN_BUFFER_MINUTES, MAX_CAPITAL_PER_SYMBOL, MAX_CONCURRENT_POSITIONS,
-    MAX_ORDERS_PER_CYCLE, MAX_ROLLS_PER_LOT, MAX_TOTAL_CAPITAL,
+    MAX_ORDERS_PER_CYCLE, MAX_ROLLS_PER_LOT, MAX_SLIPPAGE_FROM_MID_PCT, MAX_TOTAL_CAPITAL,
     MIN_ACCOUNT_BUYING_POWER, PAPER, ROLL_OPEN_LEG_MAX_RETRIES, SHARES_PER_LOT,
 )
 from logger import get_own_symbols, get_rolls_since_last_lot_open
@@ -474,10 +474,23 @@ def _walk_limit_order(order_symbol: str, side, qty: int, bid: float, ask: float,
     not "gave up before trying it." Cancels and resubmits rather than
     PATCH-replacing between steps -- simpler to reason about, and this
     bot's order sizes (100 shares / 1 contract) never need partial-fill-
-    then-reprice handling. Returns the filled Order, or None.
+    then-reprice handling. Returns the filled Order, or None -- including
+    None if the quote is too wide to walk safely at all (see
+    MAX_SLIPPAGE_FROM_MID_PCT): refusing a bad quote outright, rather
+    than ever submitting at a price that far from mid.
     """
     mid = (bid + ask) / 2.0
     natural = ask if side == OrderSide.BUY else bid
+
+    slippage_pct = abs(natural - mid) / mid if mid > 0 else float("inf")
+    if slippage_pct > MAX_SLIPPAGE_FROM_MID_PCT:
+        _log.warning(
+            "_walk_limit_order(%s): quote too wide to walk safely (mid %.2f, natural %.2f -- "
+            "%.1f%% slippage, cap %.1f%%) — refusing rather than chasing it",
+            order_symbol, mid, natural, slippage_pct * 100, MAX_SLIPPAGE_FROM_MID_PCT * 100,
+        )
+        return None
+
     increment = (natural - mid) / LIMIT_ORDER_MAX_STEPS
     current_price = mid
 

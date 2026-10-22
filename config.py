@@ -272,6 +272,18 @@ MARKET_CLOSE_BUFFER_MINUTES = 15
 # "give up before ever trying it."
 LIMIT_ORDER_MAX_STEPS = 5
 LIMIT_ORDER_STEP_PAUSE_SECONDS = 10
+# Live-dry-run Stage 4 follow-up: _walk_limit_order refuses to walk a
+# quote whose natural price is more than this fraction away from the mid
+# -- equivalent to refusing any bid-ask spread wider than 2x this value
+# as a % of mid, since the natural price is always exactly half the
+# spread away from mid. Chosen to match options_data.MAX_SPREAD_PCT's
+# existing 10%-of-mid liquidity-gate convention (half of that = 5%) --
+# that gate only runs at candidate SELECTION time in options_data.py and
+# only for options; this is trader.py's own independent check at
+# EXECUTION time, for both stock and option orders, so a stale/illiquid
+# quote can't make this bot chase all the way to an aggressive natural
+# price on a spread wide enough that "natural" isn't a fair price at all.
+MAX_SLIPPAGE_FROM_MID_PCT = 0.05
 
 # ── Order dedup (Phase 3, Task 4) ─────────────────────────────────────────────
 # A deterministic client_order_id (per symbol+action+cycle date) protects
