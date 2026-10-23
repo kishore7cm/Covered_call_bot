@@ -111,8 +111,17 @@ MAX_ORDERS_PER_CYCLE = int(os.getenv("MAX_ORDERS_PER_CYCLE", "20"))
 # watchlist symbol appears here, this bot skips it entirely every cycle --
 # there's no way to safely disambiguate whose position is whose. Fill in by
 # hand; this can't be inferred automatically.
+#
+# Populated from ~/Documents/alpaca_trading_bot/config.py's own
+# STOCK_SYMBOLS (a small, fixed, hand-curated list -- a direct, deliberate
+# overlap signal, not a broad screening pool). ~/Documents/stock_bot's
+# universe.py also happens to include AAPL/MSFT, but that's a ~500-symbol
+# S&P500 screening POOL it picks a data-driven handful from each morning
+# (pre-market gap/volume/earnings filters, see stock_bot/screener.py) --
+# not a committed position list, so it isn't reflected here the same way.
+# Re-check alpaca_trading_bot/config.py by hand if that list ever changes.
 OTHER_BOTS_SYMBOLS: list[str] = [
-    # "MSTR", "RIOT",
+    "SPY", "QQQ", "AAPL", "MSFT",
 ]
 
 # Account-level backstop, separate from MAX_TOTAL_CAPITAL above -- reads the
@@ -200,6 +209,24 @@ ATM_IV_TARGET_DTE = 30             # days-to-expiration iv_logger.py samples ATM
 DAILY_IVR_MIN_HISTORY_POINTS = 252  # ~1 trading year of daily snapshots before IV rank is trusted
 
 # ── Oracle research tuning (backtest.py, Task 2) ─────────────────────────────
+# Floor on Oracle's DTE bucket sweep (backtest.py's DEFAULT_DTE_BUCKETS, and
+# any --dte override) -- added after a real backtest run picked dte=7 for
+# two symbols, exactly equal to ROLL_MIN_DTE, with zero runway before the
+# roll trigger fires. A SEPARATE constant from ROLL_MIN_DTE on purpose:
+# Oracle's margin above the roll trigger is a research-time editorial
+# choice (how much runway a cycle should have before a roll even becomes
+# possible), not the roll trigger itself -- main.py's
+# needs_roll_dte = dte <= ROLL_MIN_DTE stays exactly as it is. The assert
+# below only checks ORACLE_MIN_DTE is strictly greater than ROLL_MIN_DTE
+# (a "margin" by definition, not just >=) -- it does not decide HOW big
+# that margin should be; see apply_watchlist.py's diff warning and
+# main.py's own DTE_TOLERANCE_DAYS (+/-5) for how thin 14 vs. 7 actually
+# leaves it (2 days, at main._dte_window's own floor).
+ORACLE_MIN_DTE = 14
+assert ORACLE_MIN_DTE > ROLL_MIN_DTE, (
+    f"ORACLE_MIN_DTE ({ORACLE_MIN_DTE}) must exceed ROLL_MIN_DTE ({ROLL_MIN_DTE}) by a margin"
+)
+
 # Delta sweep, alongside the existing DTE sweep (DEFAULT_DTE_BUCKETS, in
 # backtest.py — it's symbol/options-chain-specific, not a global constant).
 DELTA_SWEEP_BUCKETS = (0.15, 0.25, 0.35)

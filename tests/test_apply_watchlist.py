@@ -2,6 +2,7 @@ import json
 from datetime import date, timedelta
 
 import apply_watchlist as aw
+from config import MAX_CAPITAL_PER_SYMBOL, ROLL_MIN_DTE, SHARES_PER_LOT
 
 
 # ── _intent_summary ───────────────────────────────────────────────────────────
@@ -547,3 +548,125 @@ def test_diff_shows_both_earnings_and_ex_div_warning_when_both_present(capsys):
     out = capsys.readouterr().out
     assert "earnings on" in out
     assert "ex-dividend on" in out
+
+
+# ── _load_spot_price_by_symbol / _capital_cap_summary ───────────────────────
+
+def test_load_spot_price_by_symbol_parses_known_prices():
+    screened = _screened([
+        {"symbol": "AAPL", "spot_price": 348.34},
+        {"symbol": "MSFT", "spot_price": None},
+        {"symbol": "KO"},  # no spot_price key at all
+    ])
+    assert aw._load_spot_price_by_symbol(screened) == {"AAPL": 348.34}
+
+
+def test_load_spot_price_by_symbol_missing_results_key_returns_empty():
+    assert aw._load_spot_price_by_symbol({}) == {}
+
+
+def test_capital_cap_summary_shows_unknown_when_no_spot_price_on_record():
+    summary = aw._capital_cap_summary("AAPL", {})
+    assert "unknown" in summary
+    assert "OVER CAP" not in summary
+
+
+def test_capital_cap_summary_shows_lot_cost_without_warning_when_under_cap():
+    price = (MAX_CAPITAL_PER_SYMBOL / SHARES_PER_LOT) - 1
+    summary = aw._capital_cap_summary("CHEAP", {"CHEAP": price})
+    assert "lot cost" in summary
+    assert f"{MAX_CAPITAL_PER_SYMBOL:,.2f}" in summary
+    assert "OVER CAP" not in summary
+
+
+def test_capital_cap_summary_warns_loudly_when_over_cap():
+    # AAPL's real price at the time this was found, per the go/no-go report.
+    summary = aw._capital_cap_summary("AAPL", {"AAPL": 348.34})
+    assert "OVER CAP" in summary
+    assert "34,834.00" in summary  # 100 x $348.34
+
+
+def test_diff_add_shows_capital_cap_summary_for_every_entry(capsys):
+    price = (MAX_CAPITAL_PER_SYMBOL / SHARES_PER_LOT) - 1
+    active = _watchlist({})
+    proposed = _watchlist({"CHEAP": {"dte": 30, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed, spot_price_by_symbol={"CHEAP": price})
+    out = capsys.readouterr().out
+    assert "lot cost" in out
+    assert "OVER CAP" not in out
+
+
+def test_diff_add_warns_loudly_when_proposed_symbol_is_over_cap(capsys):
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": 30, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed, spot_price_by_symbol={"AAPL": 348.34})
+    out = capsys.readouterr().out
+    assert "OVER CAP" in out
+
+
+def test_diff_change_also_shows_capital_cap_summary(capsys):
+    price = (MAX_CAPITAL_PER_SYMBOL / SHARES_PER_LOT) - 1
+    active = _watchlist({"CHEAP": {"dte": 30, "avg_annualized_yield": 0.10}})
+    proposed = _watchlist({"CHEAP": {"dte": 14, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed, spot_price_by_symbol={"CHEAP": price})
+    out = capsys.readouterr().out
+    assert "lot cost" in out
+
+
+def test_diff_remove_never_shows_capital_cap_summary(capsys):
+    active = _watchlist({"AAPL": {"dte": 30, "avg_annualized_yield": 0.18}})
+    proposed = _watchlist({})
+    aw._diff(active, proposed, spot_price_by_symbol={"AAPL": 348.34})
+    out = capsys.readouterr().out
+    assert "REMOVE:" in out
+    assert "lot cost" not in out
+
+
+def test_diff_without_spot_price_by_symbol_arg_is_backward_compatible(capsys):
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": 30, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed)  # no spot_price_by_symbol at all
+    out = capsys.readouterr().out
+    assert "+ AAPL" in out
+    assert "unknown" in out  # falls back to "no spot price on record"
+
+
+# ── _roll_threshold_warning ──────────────────────────────────────────────────
+
+def test_roll_threshold_warning_fires_at_exactly_roll_min_dte():
+    warning = aw._roll_threshold_warning(ROLL_MIN_DTE)
+    assert "within the roll threshold" in warning
+    assert f"DTE={ROLL_MIN_DTE}" in warning
+
+
+def test_roll_threshold_warning_fires_below_roll_min_dte():
+    warning = aw._roll_threshold_warning(ROLL_MIN_DTE - 1)
+    assert "within the roll threshold" in warning
+
+
+def test_roll_threshold_warning_empty_comfortably_above_roll_min_dte():
+    assert aw._roll_threshold_warning(ROLL_MIN_DTE + 10) == ""
+
+
+def test_diff_add_shows_roll_threshold_warning_for_a_dte7_pick(capsys):
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": ROLL_MIN_DTE, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed)
+    out = capsys.readouterr().out
+    assert "within the roll threshold" in out
+
+
+def test_diff_add_no_roll_threshold_warning_for_a_safely_long_dte(capsys):
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": ROLL_MIN_DTE + 20, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed)
+    out = capsys.readouterr().out
+    assert "within the roll threshold" not in out
+
+
+def test_diff_change_also_shows_roll_threshold_warning(capsys):
+    active = _watchlist({"AAPL": {"dte": 30, "avg_annualized_yield": 0.10}})
+    proposed = _watchlist({"AAPL": {"dte": ROLL_MIN_DTE, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed)
+    out = capsys.readouterr().out
+    assert "within the roll threshold" in out

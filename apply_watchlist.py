@@ -47,6 +47,8 @@ import json
 import os
 from datetime import date, datetime, timedelta, timezone
 
+from config import MAX_CAPITAL_PER_SYMBOL, ROLL_MIN_DTE, SHARES_PER_LOT
+
 PROPOSED_PATH = "pipeline_state/proposed_watchlist.json"
 ACTIVE_PATH = "pipeline_state/active_watchlist.json"
 SCREENED_PATH = "pipeline_state/screened_symbols.json"
@@ -113,6 +115,67 @@ def _load_ex_div_by_symbol(screened: dict) -> dict[str, date]:
         except ValueError:
             continue
     return ex_div_by_symbol
+
+
+def _load_spot_price_by_symbol(screened: dict) -> dict[str, float]:
+    """{symbol: spot_price} from screener.py's screened_symbols.json --
+    used for the lot-cost-vs-MAX_CAPITAL_PER_SYMBOL line on every
+    ADD/CHANGE entry. Mirrors _load_earnings_by_symbol/_load_ex_div_by_symbol."""
+    spot_price_by_symbol = {}
+    for r in screened.get("results", []):
+        spot_price = r.get("spot_price")
+        if spot_price is not None:
+            spot_price_by_symbol[r["symbol"]] = spot_price
+    return spot_price_by_symbol
+
+
+def _capital_cap_summary(symbol: str, spot_price_by_symbol: dict[str, float]) -> str:
+    """
+    Lot cost (100 shares x Scout's recorded spot price) vs
+    MAX_CAPITAL_PER_SYMBOL, shown on EVERY ADD/CHANGE line, not just when
+    it's a problem -- a real research run previously proposed AAPL/MSFT
+    at $348/$522 a share (8-13x over this cap) and nothing in this diff
+    said so until the live buy would have been blocked outright.
+    orchestrator.py's filter_by_capital_caps() now keeps symbols like
+    that out of Oracle's input entirely, but this stays here too as a
+    second, independent check at the one point a human actually reviews
+    the pick (e.g. a hand-edited proposed_watchlist.json, or a stale
+    screened_symbols.json from before the orchestrator fix existed).
+    """
+    spot_price = spot_price_by_symbol.get(symbol)
+    if spot_price is None:
+        return "lot cost: unknown (no spot price on record for this symbol -- re-run screener.py)"
+    lot_cost = SHARES_PER_LOT * spot_price
+    summary = (
+        f"lot cost: ${lot_cost:,.2f} ({SHARES_PER_LOT} x ${spot_price:.2f}) "
+        f"vs MAX_CAPITAL_PER_SYMBOL ${MAX_CAPITAL_PER_SYMBOL:,.2f}"
+    )
+    if lot_cost > MAX_CAPITAL_PER_SYMBOL:
+        summary += (
+            f"  [!! OVER CAP by ${lot_cost - MAX_CAPITAL_PER_SYMBOL:,.2f} -- "
+            "the live buy would be blocked (max_capital_per_symbol)]"
+        )
+    return summary
+
+
+def _roll_threshold_warning(proposed_dte: int) -> str:
+    """
+    Loud warning if a pick's DTE is within the roll threshold -- the
+    EXACT condition main.py's needs_roll_dte check uses
+    (dte <= ROLL_MIN_DTE), not an approximation. A real backtest run
+    previously proposed dte=7, exactly equal to ROLL_MIN_DTE, meaning a
+    call opened there would trigger a roll almost immediately.
+    config.ORACLE_MIN_DTE (backtest.py's own DTE bucket floor) should
+    prevent this at the source now, but this stays here too as a
+    second, independent check at review time -- same reasoning as
+    _capital_cap_summary above.
+    """
+    if proposed_dte <= ROLL_MIN_DTE:
+        return (
+            f"!! DTE={proposed_dte} is within the roll threshold (ROLL_MIN_DTE={ROLL_MIN_DTE}) -- "
+            "a call opened here would trigger a roll almost immediately"
+        )
+    return ""
 
 
 def _ex_div_warning(symbol: str, proposed_dte: int, ex_div_by_symbol: dict[str, date]) -> str:
@@ -310,9 +373,11 @@ def _diff(
     active: dict, proposed: dict,
     earnings_by_symbol: dict[str, date] | None = None,
     ex_div_by_symbol: dict[str, date] | None = None,
+    spot_price_by_symbol: dict[str, float] | None = None,
 ) -> None:
     earnings_by_symbol = earnings_by_symbol or {}
     ex_div_by_symbol = ex_div_by_symbol or {}
+    spot_price_by_symbol = spot_price_by_symbol or {}
     active_symbols = active.get("symbols", {})
     proposed_symbols = proposed.get("symbols", {})
 
@@ -342,6 +407,10 @@ def _diff(
             if ra_summary:
                 print(f"      {ra_summary}")
             _print_empirical_summaries(stats)
+            print(f"      {_capital_cap_summary(s, spot_price_by_symbol)}")
+            roll_warning = _roll_threshold_warning(stats["dte"])
+            if roll_warning:
+                print(f"      {roll_warning}")
             earnings_warning = _earnings_warning(s, stats["dte"], earnings_by_symbol)
             if earnings_warning:
                 print(f"      {earnings_warning}")
@@ -380,6 +449,10 @@ def _diff(
             if ra_summary:
                 print(f"      {ra_summary}")
             _print_empirical_summaries(new)
+            print(f"      {_capital_cap_summary(s, spot_price_by_symbol)}")
+            roll_warning = _roll_threshold_warning(new["dte"])
+            if roll_warning:
+                print(f"      {roll_warning}")
             earnings_warning = _earnings_warning(s, new["dte"], earnings_by_symbol)
             if earnings_warning:
                 print(f"      {earnings_warning}")
@@ -408,7 +481,8 @@ if __name__ == "__main__":
     screened = _load(args.screened)
     earnings_by_symbol = _load_earnings_by_symbol(screened)
     ex_div_by_symbol = _load_ex_div_by_symbol(screened)
-    _diff(active, proposed, earnings_by_symbol, ex_div_by_symbol)
+    spot_price_by_symbol = _load_spot_price_by_symbol(screened)
+    _diff(active, proposed, earnings_by_symbol, ex_div_by_symbol, spot_price_by_symbol)
 
     if not args.confirm:
         print("\n(dry run — pass --confirm to apply this to the live trader's watchlist)")

@@ -93,6 +93,12 @@ def _patch_common(monkeypatch, **overrides):
     monkeypatch.setattr(main, "_get_spot_price", lambda symbol: 100.0)
     monkeypatch.setattr(main, "get_chain_snapshot", lambda symbol: {})
     monkeypatch.setattr(main, "_watchlist_is_stale", lambda: False)
+    # config.OTHER_BOTS_SYMBOLS is real-world data (currently includes
+    # AAPL, this file's own default test symbol) -- tests here are about
+    # run_symbol_cycle's OTHER logic, not about which symbols happen to be
+    # in that list today. Defaulted empty; the dedicated overlap test
+    # overrides this explicitly.
+    monkeypatch.setattr(main, "OTHER_BOTS_SYMBOLS", [])
     # Lot Manager (Task 6) -- DATABASE_URL is unset in dev, so these all
     # silently no-op there, but must still be mocked explicitly: a real
     # DATABASE_URL (CI, Railway) would otherwise make every test in this

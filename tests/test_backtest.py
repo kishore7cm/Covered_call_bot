@@ -778,3 +778,31 @@ def test_exit_intent_drops_symbol_when_nothing_passes_eligibility(monkeypatch, c
 
     assert result is None
     assert any("dropping from the proposal" in rec.message for rec in caplog.records)
+
+
+# ── ORACLE_MIN_DTE floor ──────────────────────────────────────────────────────
+
+def test_apply_oracle_min_dte_floor_drops_buckets_below_floor():
+    kept, dropped = backtest.apply_oracle_min_dte_floor((7, 14, 21, 30, 45), floor=14)
+    assert kept == (14, 21, 30, 45)
+    assert dropped == [7]
+
+
+def test_apply_oracle_min_dte_floor_keeps_everything_when_all_clear():
+    kept, dropped = backtest.apply_oracle_min_dte_floor((14, 21, 30), floor=14)
+    assert kept == (14, 21, 30)
+    assert dropped == []
+
+
+def test_apply_oracle_min_dte_floor_drops_everything_below_floor():
+    kept, dropped = backtest.apply_oracle_min_dte_floor((7, 10), floor=14)
+    assert kept == ()
+    assert dropped == [7, 10]
+
+
+def test_apply_oracle_min_dte_floor_uses_config_default():
+    import config
+    kept, dropped = backtest.apply_oracle_min_dte_floor((7, 14, 21))
+    assert dropped == [7]
+    assert kept == (14, 21)
+    assert config.ORACLE_MIN_DTE == 14

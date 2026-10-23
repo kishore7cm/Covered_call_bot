@@ -27,14 +27,19 @@ Usage:
     python orchestrator.py analyze                      # stage 4 only
 """
 import argparse
+import json
 import logging
+import os
 import subprocess
 import sys
+
+from config import MAX_CAPITAL_PER_SYMBOL, SHARES_PER_LOT, SIZER_MAX_PRICE_PER_SHARE
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _log = logging.getLogger(__name__)
 
 SCREENED_PATH = "pipeline_state/screened_symbols.json"
+CAPITAL_FILTERED_PATH = "pipeline_state/capital_filtered_symbols.json"
 PROPOSED_PATH = "pipeline_state/proposed_watchlist.json"
 
 
@@ -47,6 +52,50 @@ def _run(script_args: list[str]) -> bool:
     return result.returncode == 0
 
 
+def filter_by_capital_caps(screened_path: str, out_path: str) -> list[tuple[str, str]]:
+    """
+    Reads Scout's screened_symbols.json and marks any symbol that passed
+    screening but would violate MAX_CAPITAL_PER_SYMBOL (a real 100-share
+    lot) or SIZER_MAX_PRICE_PER_SHARE as passed=False here, BEFORE Oracle
+    ever runs backtest.py on it. Added after a real research run backtested
+    AAPL ($348/share) and MSFT ($521/share) and "won" on yield -- neither
+    is tradeable at this bot's own position size, an 8-13x overrun, so the
+    backtest cycles spent on them (and the resulting proposed-watchlist
+    entries) were pure waste. Written to a SEPARATE file -- screened_symbols.json
+    itself stays Scout's unfiltered research record.
+
+    Returns the (symbol, reason) pairs dropped here, in Scout's own order.
+    """
+    with open(screened_path) as f:
+        payload = json.load(f)
+
+    dropped: list[tuple[str, str]] = []
+    for r in payload.get("results", []):
+        if not r.get("passed"):
+            continue
+        spot_price = r.get("spot_price")
+        if spot_price is None:
+            reason = "no spot price on record -- re-run screener.py to capture one"
+        elif spot_price > SIZER_MAX_PRICE_PER_SHARE:
+            reason = f"price ${spot_price:.2f} exceeds SIZER_MAX_PRICE_PER_SHARE (${SIZER_MAX_PRICE_PER_SHARE:.2f})"
+        elif SHARES_PER_LOT * spot_price > MAX_CAPITAL_PER_SYMBOL:
+            lot_cost = SHARES_PER_LOT * spot_price
+            reason = (
+                f"100-share lot cost ${lot_cost:,.2f} exceeds MAX_CAPITAL_PER_SYMBOL "
+                f"(${MAX_CAPITAL_PER_SYMBOL:,.2f})"
+            )
+        else:
+            continue
+        r["passed"] = False
+        r["reason"] = reason
+        dropped.append((r["symbol"], reason))
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    return dropped
+
+
 def run_research(symbols: list[str], dte: str | None) -> None:
     if not _run(["screener.py", *symbols, "--out", SCREENED_PATH]):
         _log.error("screener.py failed — stopping before backtest.py to avoid feeding it stale/empty input.")
@@ -55,7 +104,13 @@ def run_research(symbols: list[str], dte: str | None) -> None:
     if not _run(["sizer.py", "--screened", SCREENED_PATH]):
         _log.warning("sizer.py failed — continuing to backtest.py anyway (sizing is informational, not a gate).")
 
-    backtest_cmd = ["backtest.py", "--from-screener", SCREENED_PATH, "--out", PROPOSED_PATH]
+    dropped = filter_by_capital_caps(SCREENED_PATH, CAPITAL_FILTERED_PATH)
+    if dropped:
+        print("\nDropped before Oracle (capital caps):")
+        for symbol, reason in dropped:
+            print(f"  {symbol}: {reason}")
+
+    backtest_cmd = ["backtest.py", "--from-screener", CAPITAL_FILTERED_PATH, "--out", PROPOSED_PATH]
     if dte:
         backtest_cmd += ["--dte", dte]
     if not _run(backtest_cmd):

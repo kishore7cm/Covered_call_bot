@@ -143,8 +143,8 @@ from config import (
     EXIT_MAX_OPEN_TAIL_LOSS_PCT, FILL_HAIRCUT_FRACTION,
     INTENT_BAND_SWEEP_POINTS, INTENT_DELTA_BANDS,
     MIN_CYCLES_FOR_SELECTION, MIN_DRAWDOWN_FLOOR_PCT,
-    MIN_EFFECTIVE_N_FOR_P_CALLED_AWAY, RISK_FREE_RATE, SHRINKAGE_MIN_CYCLES,
-    TARGET_DELTA, WALK_FORWARD_TRAIN_FRACTION,
+    MIN_EFFECTIVE_N_FOR_P_CALLED_AWAY, ORACLE_MIN_DTE, RISK_FREE_RATE,
+    SHRINKAGE_MIN_CYCLES, TARGET_DELTA, WALK_FORWARD_TRAIN_FRACTION,
 )
 from greeks import bs_call_price, strike_from_delta
 
@@ -978,6 +978,23 @@ def _write_proposed_watchlist(recommendations: dict[str, CycleStats], out_path: 
         json.dump(payload, f, indent=2)
 
 
+def apply_oracle_min_dte_floor(
+    requested_dte_buckets: tuple[int, ...], floor: int = ORACLE_MIN_DTE,
+) -> tuple[tuple[int, ...], list[int]]:
+    """
+    Returns (kept, dropped) -- kept is requested_dte_buckets with anything
+    below `floor` removed, dropped is what got removed, in order. Applies
+    to the ACTUAL buckets used regardless of whether they came from
+    DEFAULT_DTE_BUCKETS or an explicit --dte override -- a real backtest
+    run previously picked dte=7 (exactly ROLL_MIN_DTE, zero runway before
+    the roll trigger) for two symbols, which is exactly the outcome this
+    floor exists to prevent.
+    """
+    dropped = [d for d in requested_dte_buckets if d < floor]
+    kept = tuple(d for d in requested_dte_buckets if d >= floor)
+    return kept, dropped
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("symbols", nargs="*", help="symbols to backtest directly (omit if using --from-screener)")
@@ -1029,7 +1046,12 @@ if __name__ == "__main__":
     else:
         parser.error("provide symbols as arguments, or --from-screener PATH")
 
-    dte_buckets = tuple(int(x) for x in args.dte.split(","))
+    requested_dte_buckets = tuple(int(x) for x in args.dte.split(","))
+    dte_buckets, below_floor = apply_oracle_min_dte_floor(requested_dte_buckets)
+    if below_floor:
+        print(f"Dropping DTE bucket(s) {below_floor} -- below ORACLE_MIN_DTE ({ORACLE_MIN_DTE})")
+    if not dte_buckets:
+        parser.error(f"No DTE buckets >= ORACLE_MIN_DTE ({ORACLE_MIN_DTE}) remain after filtering {args.dte}")
     delta_buckets = tuple(float(x) for x in args.delta.split(","))
     explicit_intents = {} if args.ignore_intents else _load_intents(args.intents)
 
