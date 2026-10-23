@@ -1134,6 +1134,27 @@ def test_needs_attention_round_trip():
     assert trader.check_needs_attention("MSFT") is None
 
 
+def test_check_needs_attention_corrupt_file_fails_closed_not_open():
+    """
+    A missing file legitimately means "no flags exist yet" (None, handled
+    above). A file that EXISTS but can't be parsed (disk corruption, a
+    concurrent half-written save, manual editing gone wrong) means
+    "can't verify" -- and must never be silently treated the same as
+    "verified: clear," which would let main.run_symbol_cycle proceed on a
+    symbol a human may have flagged for exactly this cycle. The code
+    already distinguishes these (the bare `except Exception` returns the
+    sentinel string "needs_attention_check_unavailable", not None) -- this
+    test locks that behavior in so a future refactor can't regress it.
+    """
+    with open(trader._NEEDS_ATTENTION_PATH, "w") as f:
+        f.write("{not valid json")
+
+    reason = trader.check_needs_attention("AAPL")
+
+    assert reason is not None
+    assert reason == "needs_attention_check_unavailable"
+
+
 def test_get_all_needs_attention_empty_when_no_file():
     assert trader.get_all_needs_attention() == {}
 
