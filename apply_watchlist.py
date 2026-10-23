@@ -47,11 +47,23 @@ import json
 import os
 from datetime import date, datetime, timedelta, timezone
 
-from config import MAX_CAPITAL_PER_SYMBOL, ROLL_MIN_DTE, SHARES_PER_LOT
+from config import MAX_CAPITAL_PER_SYMBOL, ROLL_MIN_DTE, SHARES_PER_LOT, TARGET_DELTA, validate_live_delta
 
 PROPOSED_PATH = "pipeline_state/proposed_watchlist.json"
 ACTIVE_PATH = "pipeline_state/active_watchlist.json"
 SCREENED_PATH = "pipeline_state/screened_symbols.json"
+
+# Mirrors main.DTE_TOLERANCE_DAYS (main.py) -- duplicated here deliberately,
+# not imported, so this script keeps its existing decoupling from main.py/
+# trader.py (see this module's own docstring: "never touches main.py/
+# trader.py"). Importing main.py directly would transitively import
+# trader.py too (which asserts paper mode and constructs an Alpaca client at
+# import time) -- harmless, but a real coupling this review-only script
+# doesn't have today. If main.DTE_TOLERANCE_DAYS ever changes, this needs a
+# matching manual edit -- same caveat the project already accepts for
+# OOS_GAP_FLAG_THRESHOLD_PP below, which mirrors analysis.py's threshold the
+# same way.
+CLOSER_DTE_TOLERANCE_DAYS = 5
 
 # Flag threshold matches analysis.py's own YIELD_DRIFT_THRESHOLD_PP (same
 # "10 percentage points" convention for "this number drifted enough to look
@@ -176,6 +188,40 @@ def _roll_threshold_warning(proposed_dte: int) -> str:
             "a call opened here would trigger a roll almost immediately"
         )
     return ""
+
+
+def _closer_will_use_summary(stats: dict) -> str:
+    """
+    What main.py will ACTUALLY do with this entry at trade time, shown on
+    every ADD/CHANGE line so approving the diff and the Closer's live
+    behavior can't silently diverge (Phase 3, Task 8). The DTE window and
+    the valid/invalid check both call the exact same logic the live trader
+    uses (CLOSER_DTE_TOLERANCE_DAYS mirrors main.DTE_TOLERANCE_DAYS;
+    config.validate_live_delta is the SAME function main._resolve_target_delta
+    calls) -- never a separate approximation of either.
+
+    Display-only: this never gates --confirm. A warning here means the
+    Closer will silently substitute config.TARGET_DELTA for this symbol at
+    trade time, not that this watchlist entry is invalid or rejected.
+    """
+    dte = stats.get("dte")
+    if dte is None:
+        window_str = "unknown (no dte on this entry)"
+    else:
+        window_str = f"[{dte - CLOSER_DTE_TOLERANCE_DAYS}, {dte + CLOSER_DTE_TOLERANCE_DAYS}]"
+
+    watchlist_delta = stats.get("target_delta")
+    is_valid, reason, value = validate_live_delta(watchlist_delta)
+    if is_valid:
+        delta_str = f"{value:.2f} (source=watchlist)"
+    else:
+        delta_str = f"{TARGET_DELTA:.2f} (source=global -- watchlist value {reason})"
+
+    summary = f"Closer will use: DTE window {window_str}, delta={delta_str}"
+    if not is_valid:
+        summary += "  [!! Closer will fall back to the global delta for this symbol at trade time]"
+    summary += "  (intent does not affect live behavior -- it only selects the Oracle's delta band)"
+    return summary
 
 
 def _ex_div_warning(symbol: str, proposed_dte: int, ex_div_by_symbol: dict[str, date]) -> str:
@@ -408,6 +454,7 @@ def _diff(
                 print(f"      {ra_summary}")
             _print_empirical_summaries(stats)
             print(f"      {_capital_cap_summary(s, spot_price_by_symbol)}")
+            print(f"      {_closer_will_use_summary(stats)}")
             roll_warning = _roll_threshold_warning(stats["dte"])
             if roll_warning:
                 print(f"      {roll_warning}")
@@ -450,6 +497,7 @@ def _diff(
                 print(f"      {ra_summary}")
             _print_empirical_summaries(new)
             print(f"      {_capital_cap_summary(s, spot_price_by_symbol)}")
+            print(f"      {_closer_will_use_summary(new)}")
             roll_warning = _roll_threshold_warning(new["dte"])
             if roll_warning:
                 print(f"      {roll_warning}")

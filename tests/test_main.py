@@ -704,6 +704,200 @@ def test_sell_passes_lot_basis_as_min_strike(monkeypatch):
     assert ("clear", "AAPL") in logged["lot_flags"]
 
 
+# ── Per-symbol watchlist delta (Phase 3, Task 8) ─────────────────────────────
+
+def test_resolve_target_delta_valid_value_used():
+    value, source, reason = main._resolve_target_delta("AAPL", 0.30)
+    assert (value, source, reason) == (0.30, "watchlist", None)
+
+
+def test_resolve_target_delta_missing_falls_back_to_global():
+    value, source, reason = main._resolve_target_delta("AAPL", None)
+    assert value == main.TARGET_DELTA
+    assert source == "global"
+    assert reason == "missing"
+
+
+def test_resolve_target_delta_non_numeric_falls_back():
+    value, source, reason = main._resolve_target_delta("AAPL", "not-a-number")
+    assert value == main.TARGET_DELTA
+    assert source == "global"
+    assert "invalid" in reason
+
+
+def test_resolve_target_delta_out_of_bounds_falls_back():
+    value, source, reason = main._resolve_target_delta("AAPL", main.MAX_LIVE_DELTA + 0.10)
+    assert value == main.TARGET_DELTA
+    assert source == "global"
+    assert "out of bounds" in reason
+
+
+def test_sell_to_open_uses_watchlist_delta_when_valid(monkeypatch):
+    candidate = FakeCandidate(_far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.30)
+    pick_strike_calls = []
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+
+    def fake_pick_strike(*a, **k):
+        pick_strike_calls.append(a)
+        return candidate
+    monkeypatch.setattr(main, "pick_strike", fake_pick_strike)
+
+    main.run_symbol_cycle("AAPL", watchlist_delta=0.30)
+
+    assert pick_strike_calls[0][2] == 0.30
+
+
+def test_roll_uses_watchlist_delta_when_valid(monkeypatch):
+    old_occ = _far_occ_symbol("AAPL", dte=3)
+    new_candidate = FakeCandidate(_far_occ_symbol("AAPL", dte=35), 200.0, date.today() + timedelta(days=35), 2.5, 0.30)
+    short_call = FakeShortCallPosition(symbol=old_occ, cost_basis="-250.0", market_value="-240.0")
+    pick_strike_calls = []
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+        find_short_call=lambda symbol: short_call,
+    )
+
+    def fake_pick_strike(*a, **k):
+        pick_strike_calls.append(a)
+        return new_candidate
+    monkeypatch.setattr(main, "pick_strike", fake_pick_strike)
+
+    main.run_symbol_cycle("AAPL", watchlist_delta=0.30)
+
+    assert pick_strike_calls[0][2] == 0.30
+
+
+def test_sell_to_open_falls_back_to_global_when_delta_missing_no_alert(monkeypatch, caplog):
+    candidate = FakeCandidate(_far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.25)
+    pick_strike_calls = []
+    sent = []
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+
+    def fake_pick_strike(*a, **k):
+        pick_strike_calls.append(a)
+        return candidate
+    monkeypatch.setattr(main, "pick_strike", fake_pick_strike)
+    monkeypatch.setattr(main.notifier, "send_invalid_watchlist_delta", _capture_async_call(sent))
+
+    with caplog.at_level("WARNING"):
+        main.run_symbol_cycle("AAPL", watchlist_delta=None)
+
+    assert pick_strike_calls[0][2] == main.TARGET_DELTA
+    assert sent == []  # "missing" must never alert -- log only
+    assert any("no per-symbol target_delta" in r.message for r in caplog.records)
+
+
+def test_sell_to_open_falls_back_and_alerts_when_delta_invalid(monkeypatch):
+    candidate = FakeCandidate(_far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.25)
+    pick_strike_calls = []
+    sent = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+
+    def fake_pick_strike(*a, **k):
+        pick_strike_calls.append(a)
+        return candidate
+    monkeypatch.setattr(main, "pick_strike", fake_pick_strike)
+    monkeypatch.setattr(main.notifier, "send_invalid_watchlist_delta", _capture_async_call(sent))
+
+    main.run_symbol_cycle("AAPL", watchlist_delta="not-a-number")
+
+    assert pick_strike_calls[0][2] == main.TARGET_DELTA
+    assert len(sent) == 1
+    assert sent[0]["args"][0] == "AAPL"
+    assert "invalid" in sent[0]["args"][1]
+    assert len(logged["errors"]) == 1
+
+
+def test_sell_to_open_falls_back_and_alerts_when_delta_out_of_bounds(monkeypatch):
+    candidate = FakeCandidate(_far_occ_symbol("AAPL"), 200.0, date.today() + timedelta(days=35), 2.5, 0.25)
+    pick_strike_calls = []
+    sent = []
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+
+    def fake_pick_strike(*a, **k):
+        pick_strike_calls.append(a)
+        return candidate
+    monkeypatch.setattr(main, "pick_strike", fake_pick_strike)
+    monkeypatch.setattr(main.notifier, "send_invalid_watchlist_delta", _capture_async_call(sent))
+
+    main.run_symbol_cycle("AAPL", watchlist_delta=main.MAX_LIVE_DELTA + 0.25)
+
+    assert pick_strike_calls[0][2] == main.TARGET_DELTA
+    assert len(sent) == 1
+    assert "out of bounds" in sent[0]["args"][1]
+
+
+def test_load_watchlist_returns_dte_and_target_delta_tuple(monkeypatch, tmp_path):
+    path = tmp_path / "active_watchlist.json"
+    path.write_text(json.dumps({
+        "generated_at": "2026-01-01", "confirmed_at": "2026-01-01T00:00:00+00:00",
+        "symbols": {"AAPL": {"dte": 14, "target_delta": 0.22}},
+    }))
+    monkeypatch.setattr(main, "ACTIVE_WATCHLIST_PATH", str(path))
+
+    assert main._load_watchlist() == {"AAPL": (14, 0.22)}
+
+
+def test_load_watchlist_old_format_without_target_delta_still_works(monkeypatch, tmp_path):
+    """A watchlist written before this field existed has no "target_delta"
+    key at all -- must load as (dte, None), not raise."""
+    path = tmp_path / "active_watchlist.json"
+    path.write_text(json.dumps({
+        "generated_at": "2026-01-01", "confirmed_at": "2026-01-01T00:00:00+00:00",
+        "symbols": {"AAPL": {"dte": 30}},
+    }))
+    monkeypatch.setattr(main, "ACTIVE_WATCHLIST_PATH", str(path))
+
+    assert main._load_watchlist() == {"AAPL": (30, None)}
+
+
+def test_load_watchlist_falls_back_to_config_watchlist_when_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "ACTIVE_WATCHLIST_PATH", str(tmp_path / "does_not_exist.json"))
+    monkeypatch.setattr(main, "WATCHLIST", ["AAPL", "MSFT"])
+
+    assert main._load_watchlist() == {"AAPL": (None, None), "MSFT": (None, None)}
+
+
+def test_run_cycle_logs_missing_delta_summary_line_not_per_symbol_alert(monkeypatch, caplog):
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(main, "_load_watchlist", lambda: {
+        "AAPL": (14, 0.22), "MSFT": (30, None), "KO": (30, None),
+    })
+    monkeypatch.setattr(main, "_track_iv_history", lambda symbol: (None, None, None))
+    monkeypatch.setattr(main, "_print_open_needs_attention", lambda: None)
+    run_symbol_cycle_calls = []
+
+    def fake_run_symbol_cycle(symbol, dte, **k):
+        run_symbol_cycle_calls.append((symbol, dte, k))
+        return f"{symbol}: ok"
+    monkeypatch.setattr(main, "run_symbol_cycle", fake_run_symbol_cycle)
+
+    with caplog.at_level("INFO"):
+        main.run_cycle()
+
+    summary_lines = [r.message for r in caplog.records if "using global delta" in r.message]
+    assert len(summary_lines) == 1
+    assert "2 symbol(s)" in summary_lines[0]
+    assert "MSFT" in summary_lines[0] and "KO" in summary_lines[0]
+    assert "AAPL" not in summary_lines[0]
+
+    deltas_by_symbol = {sym: k["watchlist_delta"] for sym, _dte, k in run_symbol_cycle_calls}
+    assert deltas_by_symbol == {"AAPL": 0.22, "MSFT": None, "KO": None}
+
+
 def test_no_qualifying_call_above_basis_flags_lot_and_skips(monkeypatch):
     logged = _patch_common(
         monkeypatch,

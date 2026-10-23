@@ -29,6 +29,7 @@ from config import (
     CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET, MIN_IV_HISTORY_POINTS,
     DTE_MIN, DTE_MAX, OTHER_BOTS_SYMBOLS, WATCHLIST_MAX_AGE_DAYS,
     STALE_LOT_WEEKS, RECOVERY_EXIT_ENABLED_SYMBOLS, RECOVERY_EXIT_MIN_MARGIN_PCT,
+    MIN_LIVE_DELTA, MAX_LIVE_DELTA, validate_live_delta,
 )
 from greeks import delta_from_quote
 from iv_rank import iv_rank, iv_percentile
@@ -141,20 +142,26 @@ def _release_lock() -> None:
         pass
 
 
-def _load_watchlist() -> dict[str, int | None]:
+def _load_watchlist() -> dict[str, tuple[int | None, float | None]]:
     """
-    symbol -> recommended_dte, read from the human-approved
-    active_watchlist.json (written by apply_watchlist.py). Falls back to
-    config.WATCHLIST with the global DTE_MIN/DTE_MAX window (recommended_dte
-    None) if the pipeline hasn't been run yet, so the bot still does
-    something sensible rather than going idle.
+    symbol -> (recommended_dte, watchlist_target_delta), read from the
+    human-approved active_watchlist.json (written by apply_watchlist.py).
+    Falls back to config.WATCHLIST with the global DTE_MIN/DTE_MAX window
+    and no per-symbol delta (both None) if the pipeline hasn't been run
+    yet, so the bot still does something sensible rather than going idle.
+
+    watchlist_target_delta is the RAW value as read from the JSON --
+    validation (missing/invalid/out-of-bounds) and fallback to
+    config.TARGET_DELTA happen in _resolve_target_delta(), not here, so
+    this function stays a pure file read with no logging/alerting side
+    effects of its own.
     """
     if os.path.exists(ACTIVE_WATCHLIST_PATH):
         with open(ACTIVE_WATCHLIST_PATH) as f:
             payload = json.load(f)
         symbols = payload.get("symbols", {})
         if symbols:
-            return {sym: stats.get("dte") for sym, stats in symbols.items()}
+            return {sym: (stats.get("dte"), stats.get("target_delta")) for sym, stats in symbols.items()}
         logger.warning("%s exists but has no symbols — falling back to config.WATCHLIST", ACTIVE_WATCHLIST_PATH)
     else:
         logger.warning(
@@ -162,7 +169,25 @@ def _load_watchlist() -> dict[str, int | None]:
             "Run screener.py -> backtest.py -> apply_watchlist.py to populate it.",
             ACTIVE_WATCHLIST_PATH,
         )
-    return {sym: None for sym in WATCHLIST}
+    return {sym: (None, None) for sym in WATCHLIST}
+
+
+def _resolve_target_delta(symbol: str, watchlist_delta) -> tuple[float, str, str | None]:
+    """
+    (target_delta_to_use, source, fallback_reason). source is "watchlist"
+    or "global"; fallback_reason is None when the watchlist's own value was
+    used, else one of config.validate_live_delta()'s reason strings
+    ("missing", "invalid (...)" , "out of bounds (...)"). Callers branch on
+    fallback_reason == "missing" vs. anything else -- a watchlist that
+    simply predates this field is an expected, routine case (log only, no
+    alert); a present-but-bad value is a real data problem (log + alert).
+    Never raises -- config.validate_live_delta() is a pure function with no
+    way to throw on the inputs it's given here.
+    """
+    is_valid, reason, value = validate_live_delta(watchlist_delta)
+    if is_valid:
+        return value, "watchlist", None
+    return TARGET_DELTA, "global", reason
 
 
 def _watchlist_is_stale() -> bool:
@@ -322,7 +347,8 @@ def _ex_div_warning_text(candidate, spot: float | None) -> str | None:
 
 
 def run_symbol_cycle(
-    symbol: str, recommended_dte: int | None = None,
+    symbol: str, recommended_dte: int | None = None, *,
+    watchlist_delta: float | None = None,
     atm_iv: float | None = None, atm_iv_rank: float | None = None,
 ) -> str:
     """
@@ -333,6 +359,12 @@ def run_symbol_cycle(
     recommended_dte comes from the research pipeline (screener.py ->
     backtest.py -> apply_watchlist.py); None means the pipeline hasn't been
     run for this symbol yet and the global DTE_MIN/DTE_MAX window is used.
+
+    watchlist_delta (Phase 3, Task 8) is the SAME watchlist entry's raw
+    "target_delta" field, resolved+validated below via _resolve_target_delta
+    before either pick_strike() call site uses it. Keyword-only
+    deliberately, so inserting it can never shift atm_iv/atm_iv_rank into
+    the wrong positional slot for an existing caller.
 
     atm_iv/atm_iv_rank (Phase 3, Task 7) come from this same cycle's
     _track_iv_history() call in run_cycle(), computed once and handed down
@@ -357,6 +389,27 @@ def run_symbol_cycle(
         return f"{symbol}: SKIPPED — needs-attention flag set, needs manual review"
 
     dte_min, dte_max = _dte_window(recommended_dte)
+
+    # Phase 3, Task 8: resolve the delta to actually use for BOTH pick_strike
+    # call sites below (State 2 sell-to-open, State 3 roll), once, up front.
+    # "missing" (predates this field, or config.WATCHLIST fallback with no
+    # per-symbol data at all) is routine -- logged, never alerted; anything
+    # else (invalid/out-of-bounds) is a real data problem on an entry that
+    # DOES have the field -- logged AND alerted, same severity as any other
+    # needs-a-human signal in this module.
+    target_delta, delta_source, delta_fallback_reason = _resolve_target_delta(symbol, watchlist_delta)
+    if delta_fallback_reason == "missing":
+        logger.warning(
+            "%s: no per-symbol target_delta in watchlist — using global config.TARGET_DELTA=%.2f",
+            symbol, TARGET_DELTA,
+        )
+    elif delta_fallback_reason is not None:
+        msg = (
+            f"{symbol}: watchlist target_delta {delta_fallback_reason} — "
+            f"falling back to config.TARGET_DELTA={TARGET_DELTA:.2f}"
+        )
+        log_error("main.run_symbol_cycle", msg)
+        _run_async(notifier.send_invalid_watchlist_delta(symbol, delta_fallback_reason, TARGET_DELTA))
 
     share_pos = trader.get_share_position(symbol)
     share_qty = int(float(share_pos.qty)) if share_pos else 0
@@ -536,7 +589,7 @@ def run_symbol_cycle(
             return f"{symbol}: FAILED to get spot price"
 
         min_strike = float(lot["cost_basis_per_share"]) if lot is not None else None
-        candidate = pick_strike(symbol, spot, TARGET_DELTA, dte_min=dte_min, dte_max=dte_max, min_strike=min_strike)
+        candidate = pick_strike(symbol, spot, target_delta, dte_min=dte_min, dte_max=dte_max, min_strike=min_strike)
         if candidate is None:
             if lot is not None and min_strike is not None:
                 flag_lot_no_qualifying_call(symbol)
@@ -557,10 +610,14 @@ def run_symbol_cycle(
             logger.info(
                 "%s: sell_to_open_call blocked (%s) — not logging as a real trade", symbol, result["block_reason"]
             )
-            _alert_for_block_reason(symbol, f"sell {candidate.occ_symbol}", result["block_reason"])
+            _alert_for_block_reason(
+                symbol, f"sell {candidate.occ_symbol} (target_delta={target_delta:.2f}, source={delta_source})",
+                result["block_reason"],
+            )
             return (
                 f"{symbol}: would sell {candidate.occ_symbol} @ ${candidate.mid_price:.2f} "
-                f"(delta {candidate.delta:.2f}) ({result['block_reason']} — not submitted)"
+                f"(delta {candidate.delta:.2f}, target_delta={target_delta:.2f} source={delta_source}) "
+                f"({result['block_reason']} — not submitted)"
             )
 
         log_option_trade(
@@ -579,9 +636,13 @@ def run_symbol_cycle(
             logger.warning("%s: %s (%s)", symbol, ex_div_warning, candidate.occ_symbol)
         _run_async(notifier.send_call_sold(
             symbol, candidate.occ_symbol, candidate.strike, candidate.expiration,
-            candidate.mid_price, candidate.delta, ex_div_warning=ex_div_warning,
+            candidate.mid_price, candidate.delta, requested_delta=target_delta, delta_source=delta_source,
+            ex_div_warning=ex_div_warning,
         ))
-        result_str = f"{symbol}: sold {candidate.occ_symbol} @ ${candidate.mid_price:.2f} (delta {candidate.delta:.2f})"
+        result_str = (
+            f"{symbol}: sold {candidate.occ_symbol} @ ${candidate.mid_price:.2f} "
+            f"(delta {candidate.delta:.2f}, target_delta={target_delta:.2f} source={delta_source})"
+        )
         if ex_div_warning:
             result_str += f" [{ex_div_warning}]"
         return result_str
@@ -671,7 +732,7 @@ def run_symbol_cycle(
         spot = spot or _get_spot_price(symbol)
         min_strike = float(lot["cost_basis_per_share"]) if lot is not None else None
         new_candidate = (
-            pick_strike(symbol, spot, TARGET_DELTA, dte_min=dte_min, dte_max=dte_max, min_strike=min_strike)
+            pick_strike(symbol, spot, target_delta, dte_min=dte_min, dte_max=dte_max, min_strike=min_strike)
             if spot else None
         )
         if new_candidate is None:
@@ -729,8 +790,16 @@ def run_symbol_cycle(
             # leg wasn't real either, so checking the close leg is enough.
             block_reason = result["closed"]["block_reason"]
             logger.info("%s: roll_call blocked (%s) — not logging as a real trade", symbol, block_reason)
-            _alert_for_block_reason(symbol, f"roll {occ_symbol} -> {new_candidate.occ_symbol}", block_reason)
-            return f"{symbol}: would roll {occ_symbol} -> {new_candidate.occ_symbol} ({block_reason} — not submitted)"
+            _alert_for_block_reason(
+                symbol,
+                f"roll {occ_symbol} -> {new_candidate.occ_symbol} "
+                f"(target_delta={target_delta:.2f}, source={delta_source})",
+                block_reason,
+            )
+            return (
+                f"{symbol}: would roll {occ_symbol} -> {new_candidate.occ_symbol} "
+                f"(target_delta={target_delta:.2f} source={delta_source}) ({block_reason} — not submitted)"
+            )
 
         log_option_trade(symbol, new_candidate.occ_symbol, "ROLL",
                           strike=new_candidate.strike, expiration=new_candidate.expiration,
@@ -744,9 +813,13 @@ def run_symbol_cycle(
         if ex_div_warning:
             logger.warning("%s: %s (%s)", symbol, ex_div_warning, new_candidate.occ_symbol)
         _run_async(notifier.send_call_rolled(
-            symbol, occ_symbol, new_candidate.occ_symbol, 0.0, ex_div_warning=ex_div_warning,
+            symbol, occ_symbol, new_candidate.occ_symbol, 0.0, delta=new_candidate.delta,
+            requested_delta=target_delta, delta_source=delta_source, ex_div_warning=ex_div_warning,
         ))
-        result_str = f"{symbol}: rolled {occ_symbol} -> {new_candidate.occ_symbol}"
+        result_str = (
+            f"{symbol}: rolled {occ_symbol} -> {new_candidate.occ_symbol} "
+            f"(delta {new_candidate.delta:.2f}, target_delta={target_delta:.2f} source={delta_source})"
+        )
         if ex_div_warning:
             result_str += f" [{ex_div_warning}]"
         return result_str
@@ -786,8 +859,22 @@ def run_cycle() -> None:
     # apply_watchlist.py --confirm run takes effect on the very next
     # scheduled cycle without needing a restart.
     watchlist = _load_watchlist()
+    # Phase 3, Task 8: one summary line per cycle for the routine case (a
+    # watchlist entry simply predating the per-symbol delta field, or the
+    # config.WATCHLIST fallback, which never has one) -- not a per-symbol
+    # alert, since every symbol in that bucket will otherwise log/alert
+    # identically every single cycle. Computed directly from the watchlist
+    # dict itself, independent of each symbol's own _resolve_target_delta
+    # call inside run_symbol_cycle, so this doesn't require threading
+    # anything back out of that function.
+    missing_delta_symbols = [sym for sym, (_, delta) in watchlist.items() if delta is None]
+    if missing_delta_symbols:
+        logger.info(
+            "%d symbol(s) using global delta %.2f (no per-symbol delta in watchlist): %s",
+            len(missing_delta_symbols), TARGET_DELTA, ", ".join(missing_delta_symbols),
+        )
     actions = []
-    for symbol, recommended_dte in watchlist.items():
+    for symbol, (recommended_dte, watchlist_delta) in watchlist.items():
         atm_iv_for_logging = None
         iv_rank_for_logging = None
         try:
@@ -802,7 +889,8 @@ def run_cycle() -> None:
 
         try:
             actions.append(run_symbol_cycle(
-                symbol, recommended_dte, atm_iv=atm_iv_for_logging, atm_iv_rank=iv_rank_for_logging,
+                symbol, recommended_dte, watchlist_delta=watchlist_delta,
+                atm_iv=atm_iv_for_logging, atm_iv_rank=iv_rank_for_logging,
             ))
         except Exception as e:
             # Last-resort guard: even if a symbol's cycle has a bug we didn't
@@ -857,15 +945,16 @@ def _main(argv: list[str] | None = None) -> int:
 
         if args.once:
             logger.info(
-                "Covered call bot started | --once | %d symbols | target_delta=%.2f",
-                len(startup_watchlist), TARGET_DELTA,
+                "Covered call bot started | --once | %d symbols | target_delta=%.2f | "
+                "live_delta_bounds=[%.2f, %.2f]",
+                len(startup_watchlist), TARGET_DELTA, MIN_LIVE_DELTA, MAX_LIVE_DELTA,
             )
             run_cycle()
             return 0
 
         logger.info(
-            "Covered call bot started | %d symbols | target_delta=%.2f | %s %s ET",
-            len(startup_watchlist), TARGET_DELTA, CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET,
+            "Covered call bot started | %d symbols | target_delta=%.2f | live_delta_bounds=[%.2f, %.2f] | %s %s ET",
+            len(startup_watchlist), TARGET_DELTA, MIN_LIVE_DELTA, MAX_LIVE_DELTA, CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET,
         )
         while True:
             try:

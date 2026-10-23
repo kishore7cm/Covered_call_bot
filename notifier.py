@@ -40,7 +40,8 @@ async def send_shares_bought(symbol: str, qty: int, order_id: str) -> None:
 
 
 async def send_call_sold(symbol: str, occ_symbol: str, strike: float, expiration: date,
-                          premium: float, delta: float, ex_div_warning: str | None = None) -> None:
+                          premium: float, delta: float, requested_delta: float | None = None,
+                          delta_source: str | None = None, ex_div_warning: str | None = None) -> None:
     text = (
         f"🟢 <b>CALL SOLD — {symbol}</b>\n"
         f"Contract:  {occ_symbol}\n"
@@ -49,6 +50,8 @@ async def send_call_sold(symbol: str, occ_symbol: str, strike: float, expiration
         f"Premium:   ${premium:.2f}/share (${premium * 100:.2f}/contract)\n"
         f"Delta:     {delta:.2f}"
     )
+    if requested_delta is not None:
+        text += f" (target {requested_delta:.2f}, source={delta_source})"
     if ex_div_warning:
         text += f"\n{ex_div_warning}"
     await _send(text)
@@ -64,13 +67,18 @@ async def send_call_closed(symbol: str, occ_symbol: str, reason: str, pnl: float
 
 
 async def send_call_rolled(symbol: str, old_occ: str, new_occ: str, net_credit: float,
-                            ex_div_warning: str | None = None) -> None:
+                            delta: float | None = None, requested_delta: float | None = None,
+                            delta_source: str | None = None, ex_div_warning: str | None = None) -> None:
     text = (
         f"🔄 <b>CALL ROLLED — {symbol}</b>\n"
         f"From: {old_occ}\n"
         f"To:   {new_occ}\n"
         f"Net:  {'credit' if net_credit >= 0 else 'debit'} ${abs(net_credit):.2f}"
     )
+    if delta is not None:
+        text += f"\nDelta: {delta:.2f}"
+        if requested_delta is not None:
+            text += f" (target {requested_delta:.2f}, source={delta_source})"
     if ex_div_warning:
         text += f"\n{ex_div_warning}"
     await _send(text)
@@ -127,3 +135,18 @@ async def send_kill_switch_trip(message: str) -> None:
 async def send_db_unavailable(message: str) -> None:
     alerts.notify("db_unavailable", message)
     await _send(f"🛑 <b>DATABASE UNAVAILABLE</b>\n{message}")
+
+
+async def send_invalid_watchlist_delta(symbol: str, reason: str, fallback_delta: float) -> None:
+    """
+    Fires only for a PRESENT-but-bad watchlist target_delta (invalid or
+    out-of-bounds) -- never for "missing," which main.py logs but
+    deliberately does not alert on (see main._resolve_target_delta /
+    run_symbol_cycle's missing-vs-other branch). Also fires the local alert
+    sink unconditionally, same as send_needs_attention/send_db_unavailable
+    above -- this is a real data problem on an entry a human approved,
+    worth seeing immediately, not buried in the log stream.
+    """
+    message = f"{symbol}: watchlist target_delta {reason} — using config.TARGET_DELTA={fallback_delta:.2f} instead"
+    alerts.notify("invalid_delta", message)
+    await _send(f"⚠️ <b>INVALID WATCHLIST DELTA — {symbol}</b>\n{reason}\nFalling back to {fallback_delta:.2f}")

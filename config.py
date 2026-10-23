@@ -145,6 +145,45 @@ SHARES_PER_LOT      = 100     # one contract covers 100 shares
 TARGET_DELTA        = 0.25    # sell calls near this delta (0.20-0.30 band)
 DELTA_TOLERANCE      = 0.10    # acceptable +/- band when no exact match exists
 
+# ── Live per-symbol delta bounds (Phase 3, Task 8) ───────────────────────────
+# A per-symbol target_delta can now come from active_watchlist.json (Oracle's
+# own pick), not just this global TARGET_DELTA -- these bounds are the live
+# trader's own sanity check on that value before main.py ever hands it to
+# options_data.pick_strike(), independent of whatever Oracle's own sweep
+# bands (INTENT_DELTA_BANDS, below) already constrain research-time picks to.
+# Defaults (0.10, 0.50) are deliberately wide enough that every real
+# INTENT_DELTA_BANDS edge (0.15-0.25 hold, 0.35-0.50 exit) already clears them
+# with room on both sides -- see test_config.py's band-edge validation test.
+MIN_LIVE_DELTA = float(os.getenv("MIN_LIVE_DELTA", "0.10"))
+MAX_LIVE_DELTA = float(os.getenv("MAX_LIVE_DELTA", "0.50"))
+assert 0 < MIN_LIVE_DELTA < MAX_LIVE_DELTA < 1, (
+    f"MIN_LIVE_DELTA ({MIN_LIVE_DELTA}) and MAX_LIVE_DELTA ({MAX_LIVE_DELTA}) must satisfy "
+    f"0 < MIN_LIVE_DELTA < MAX_LIVE_DELTA < 1"
+)
+
+
+def validate_live_delta(value) -> tuple[bool, str | None, float | None]:
+    """
+    (is_valid, reason_if_invalid, parsed_value_if_valid) for a watchlist
+    entry's raw "target_delta" field -- anything from a real float to None
+    (missing) to a malformed hand-edit. The SOLE place this bounds/reason
+    logic lives: main.py (resolving a per-symbol delta before a real order,
+    with fallback + alerting) and apply_watchlist.py (a review-time warning,
+    display only, never gates --confirm) both call this directly rather
+    than each re-implementing the same check, so the two can never drift
+    apart on what counts as valid.
+    """
+    if value is None:
+        return False, "missing", None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False, f"invalid (not a number: {value!r})", None
+    if not (MIN_LIVE_DELTA <= v <= MAX_LIVE_DELTA):
+        return False, f"out of bounds ({v:.2f} not in [{MIN_LIVE_DELTA:.2f}, {MAX_LIVE_DELTA:.2f}])", None
+    return True, None, v
+
+
 DTE_MIN              = 30      # days-to-expiration screening window
 DTE_MAX              = 45
 

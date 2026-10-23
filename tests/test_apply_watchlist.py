@@ -2,7 +2,7 @@ import json
 from datetime import date, timedelta
 
 import apply_watchlist as aw
-from config import MAX_CAPITAL_PER_SYMBOL, ROLL_MIN_DTE, SHARES_PER_LOT
+from config import MAX_CAPITAL_PER_SYMBOL, MAX_LIVE_DELTA, MIN_LIVE_DELTA, ROLL_MIN_DTE, SHARES_PER_LOT, TARGET_DELTA
 
 
 # ── _intent_summary ───────────────────────────────────────────────────────────
@@ -670,3 +670,70 @@ def test_diff_change_also_shows_roll_threshold_warning(capsys):
     aw._diff(active, proposed)
     out = capsys.readouterr().out
     assert "within the roll threshold" in out
+
+
+# ── _closer_will_use_summary (Phase 3, Task 8) ───────────────────────────────
+
+def test_closer_will_use_summary_shows_watchlist_delta_and_dte_window():
+    summary = aw._closer_will_use_summary({"dte": 14, "target_delta": 0.22})
+    assert "Closer will use" in summary
+    assert "[9, 19]" in summary  # 14 -/+ CLOSER_DTE_TOLERANCE_DAYS (5)
+    assert "0.22 (source=watchlist)" in summary
+    assert "Closer will fall back" not in summary
+    assert "intent does not affect live behavior" in summary
+
+
+def test_closer_will_use_summary_warns_when_target_delta_missing():
+    summary = aw._closer_will_use_summary({"dte": 30})
+    assert f"{TARGET_DELTA:.2f} (source=global -- watchlist value missing)" in summary
+    assert "Closer will fall back" in summary
+
+
+def test_closer_will_use_summary_warns_when_target_delta_out_of_bounds():
+    # Uses config.validate_live_delta directly -- same bounds the live
+    # trader checks, no duplicated threshold here.
+    bad_delta = MAX_LIVE_DELTA + 0.10
+    summary = aw._closer_will_use_summary({"dte": 30, "target_delta": bad_delta})
+    assert "out of bounds" in summary
+    assert f"{TARGET_DELTA:.2f} (source=global" in summary
+    assert "Closer will fall back" in summary
+
+
+def test_closer_will_use_summary_warns_when_target_delta_non_numeric():
+    summary = aw._closer_will_use_summary({"dte": 30, "target_delta": "not-a-number"})
+    assert "invalid" in summary
+    assert "Closer will fall back" in summary
+
+
+def test_closer_will_use_summary_unknown_dte_window_when_dte_missing():
+    summary = aw._closer_will_use_summary({"target_delta": MIN_LIVE_DELTA})
+    assert "unknown (no dte on this entry)" in summary
+
+
+def test_diff_add_shows_closer_will_use_summary(capsys):
+    active = _watchlist({})
+    proposed = _watchlist({"AAPL": {"dte": 14, "target_delta": 0.22, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed)
+    out = capsys.readouterr().out
+    assert "Closer will use" in out
+    assert "0.22 (source=watchlist)" in out
+    assert "intent does not affect live behavior" in out
+
+
+def test_diff_add_warns_in_output_when_proposed_delta_out_of_bounds(capsys):
+    active = _watchlist({})
+    bad_delta = MIN_LIVE_DELTA - 0.05
+    proposed = _watchlist({"AAPL": {"dte": 14, "target_delta": bad_delta, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed)
+    out = capsys.readouterr().out
+    assert "out of bounds" in out
+    assert "Closer will fall back" in out
+
+
+def test_diff_change_also_shows_closer_will_use_summary(capsys):
+    active = _watchlist({"AAPL": {"dte": 30, "target_delta": 0.25, "avg_annualized_yield": 0.10}})
+    proposed = _watchlist({"AAPL": {"dte": 14, "target_delta": 0.35, "avg_annualized_yield": 0.18}})
+    aw._diff(active, proposed)
+    out = capsys.readouterr().out
+    assert "Closer will use" in out
+    assert "0.35 (source=watchlist)" in out
