@@ -55,23 +55,33 @@ the pipeline because they change at different speeds:
 |---|---|
 | Language | Python 3.11+ |
 | Broker / options data | Alpaca Markets API (paper trading, options level 3), via `alpaca-py` SDK |
-| Database | PostgreSQL on Railway |
-| Notifications | Telegram Bot |
-| Deployment | Railway App |
+| Database | PostgreSQL on Railway (optional — see Phase 3 Safety Hardening; every DB-backed feature degrades to a documented no-op or fail-closed behavior when `DATABASE_URL` is unset) |
+| Notifications | Local (console + `alerts.log` + macOS notification) is the channel that actually reaches a human today. Telegram is wired (`notifier.py`) but currently unconfigured (`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` empty) |
+| Deployment | Railway App (`Procfile`/`railway.toml`: `python main.py`, continuous scheduler mode, `restartPolicyType="always"`) |
 
 ## Project Structure
 
 ```
 covered_call_bot/
-  main.py          ← Orchestrator: weekly scheduler, cycle loop, try/except guard
-  config.py        ← Env vars, watchlist, strategy constants, Filter 2 thresholds
-  greeks.py        ← Black-Scholes pricing, IV solve, delta, theta
-  options_data.py  ← Alpaca option contract + chain snapshot fetching, Filter 2/3 screening
-  calendar_data.py ← Earnings date / ex-dividend date lookups (yfinance)
-  iv_rank.py       ← IV rank / IV percentile from accumulated history
-  trader.py        ← Buy shares, sell-to-open, buy-to-close, roll, assignment handling
-  notifier.py      ← Telegram alerts
-  logger.py        ← Structured logging to PostgreSQL + stdout, IV history
+  main.py              ← Closer: --once/scheduler entrypoint, lockfile, weekly cycle loop, per-symbol state machine
+  config.py            ← Env vars, watchlist, strategy constants, Filter 2 thresholds, Phase 3 safety constants
+  greeks.py            ← Black-Scholes pricing, IV solve, delta, theta
+  options_data.py      ← Alpaca option contract + chain snapshot fetching, Filter 2/3 screening, quote integrity
+  calendar_data.py     ← Earnings date / ex-dividend date lookups (yfinance), fail-soft + fail-closed variants
+  iv_rank.py           ← IV rank / IV percentile from accumulated history
+  trader.py            ← Buy shares, sell-to-open, buy-to-close, roll, the order guard, limit-order walk, needs-attention
+  notifier.py          ← Telegram alerts (currently unconfigured) + delegates to alerts.py for local channels
+  alerts.py            ← Local alert sink: console, alerts.log, macOS notification — the channel that's actually live
+  logger.py            ← Structured logging to PostgreSQL + stdout; option_trades/share_trades/lots/errors/iv_history schema
+  screener.py           ← Scout: liquidity/timing screen against the live options chain, writes screened_symbols.json
+  sizer.py              ← Sizer: position sizing against budget/price/weight caps, writes sizing_plan.json (informational only)
+  orchestrator.py       ← Foreman: sequences screener.py -> sizer.py -> capital-cap filter -> backtest.py -> apply_watchlist.py (no --confirm)
+  backtest.py           ← Oracle: single-symbol walk-forward DTE/delta backtest, writes proposed_watchlist.json
+  apply_watchlist.py    ← Human approval gate: diffs active vs. proposed watchlist; only --confirm writes active_watchlist.json
+  analysis.py           ← Auditor: realized-vs-predicted yield, P&L, loss-factor review, IVR-tier breakdown, wash-sale risk report
+  portfolio_backtest.py ← Multi-symbol capital-constrained "what-if" simulation, reuses Oracle's pricing + Auditor's loss-factor code
+  iv_logger.py          ← Daily ATM IV + underlying close logger, separate cadence from the weekly iv_history table
+  clear_attention.py    ← Human-operated CLI to clear a needs-attention flag, with a logged reason
   requirements.txt
   .env.example
   CLAUDE.md
@@ -118,11 +128,23 @@ covered_call_bot/
 ## Schedule
 
 ```
-Weekly, e.g. Mon 09:45 ET (after open, once spreads settle)
+Weekly, Mon 10:15 ET (config.CYCLE_DAY_OF_WEEK / CYCLE_TIME_ET)
   → run_cycle() for every watchlist symbol
-  → log every decision (including "held, no action") to Postgres
-  → Telegram summary at the end of the cycle
+  → log every decision (including "held, no action") to Postgres (if configured)
+  → local alert (console/alerts.log/macOS notify) + Telegram summary (currently unconfigured, no-op) at the end
 ```
+
+10:15 ET, not 09:45 — `CYCLE_TIME_ET` must stay safely after `MARKET_OPEN_BUFFER_MINUTES`
+(30 min past the 9:30 open = 10:00 at the earliest); 10:15 leaves a margin rather than landing
+exactly on the boundary. An earlier 09:45 schedule was moved specifically because the
+market-hours gate (see Phase 3 Safety Hardening below) would otherwise block every single
+scheduled run.
+
+Running modes: `python main.py --once` runs exactly one cycle and exits (used for manual/dry
+runs); `python main.py` with no flag registers the weekly job and loops forever
+(`schedule.run_pending()` every 30s) — this is what `Procfile`/`railway.toml` run continuously
+on Railway. A file-based lockfile (`pipeline_state/main.lock`) prevents two instances from
+running a cycle concurrently; a lock held by a dead PID is detected and cleared automatically.
 
 ## Environment Variables
 
@@ -130,11 +152,21 @@ Weekly, e.g. Mon 09:45 ET (after open, once spreads settle)
 ALPACA_API_KEY=
 ALPACA_SECRET_KEY=
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
+ALLOW_LIVE=                      # must be "true" to run against any non-paper ALPACA_BASE_URL;
+                                  # enforced at Alpaca client construction time (trader.py/options_data.py),
+                                  # not just at main.py's entrypoint
 
-TELEGRAM_BOT_TOKEN=
+TELEGRAM_BOT_TOKEN=               # currently unset — Telegram is wired but inert; see Notifications
 TELEGRAM_CHAT_ID=
 
-DATABASE_URL=postgresql://...
+DATABASE_URL=postgresql://...     # optional — unset means every Postgres-backed feature no-ops
+                                   # (history isn't recorded) or fails closed (caps/lot lookups
+                                   # block rather than guess); see Phase 3 Safety Hardening
+
+DRY_RUN=true                      # default true — simulates every order instead of submitting it;
+                                   # must be set to false deliberately once ready for real paper orders
+KILL_SWITCH_ENABLED=false         # OR the presence of pipeline_state/kill_switch (a plain sentinel file)
+                                   # blocks every order type, independent of DRY_RUN
 ```
 
 ## Module Responsibilities
@@ -200,21 +232,55 @@ DATABASE_URL=postgresql://...
   reads differently.
 
 ### `trader.py`
-- `buy_shares(symbol, qty=100)`.
-- `sell_to_open_call(occ_symbol, qty=1)`.
-- `buy_to_close_call(occ_symbol, qty=1)`.
-- `roll_call(old_occ_symbol, new_occ_symbol, qty=1)` — close + open, logged
-  as one roll event.
-- `check_assignment(symbol)` — reconcile expected vs. actual share count
-  after an expiration Friday; log clearly if assigned.
-- Every public function wrapped in try/except; failures notify + log, never
-  raise out of the cycle loop.
+- `buy_shares(symbol, qty)`, `sell_to_open_call(symbol, occ_symbol, qty=1)`,
+  `buy_to_close_call(symbol, occ_symbol, qty=1)`,
+  `roll_call(symbol, old_occ_symbol, new_occ_symbol, qty=1)` — close + open,
+  logged as one roll event; asserts `qty == 1` (raises `ValueError`
+  otherwise — this bot never rolls more than one contract at a time).
+- `_guard(description, order_symbol, symbol, estimated_dollars,
+  opens_new_position)` — the single chokepoint every order above runs
+  through before submission, in this exact order: `MAX_ORDERS_PER_CYCLE` →
+  kill switch → DB-availability (only when `DRY_RUN=False`) → market hours →
+  existing-open-order check → hard capital/position caps (`buy_shares` only)
+  → `DRY_RUN` (checked last, so every other guard still runs and is visible
+  even in dry-run mode). See Phase 3 Safety Hardening below.
+- `_walk_limit_order(...)` — every order is a LIMIT order starting at the
+  quote's mid and walking toward the natural price over
+  `LIMIT_ORDER_MAX_STEPS`; refuses to walk past `MAX_SLIPPAGE_FROM_MID_PCT`
+  from the mid; never trusts a cancel response on its own — always
+  re-fetches order state afterward (Alpaca's cancel response can say
+  "success" for an order that actually already filled).
+- There is **no `check_assignment(symbol)` function** — assignment is
+  detected inline in `main.run_symbol_cycle`'s per-symbol state machine, via
+  `logger.get_last_open_occ_symbol()` plus `trader.get_option_activities()`
+  (Alpaca's OPASN/OPEXP/OPEXC account-activities codes, reached through the
+  untyped `RESTClient.get()` since alpaca-py has no typed method for this
+  endpoint — **not yet verified against a live OPASN row**, since no real
+  assignment has happened on this account).
+- `mark_needs_attention` / `check_needs_attention` / `get_all_needs_attention`
+  / `clear_needs_attention` — file-based (`pipeline_state/needs_attention.json`),
+  not DB-dependent, so a flag can still be set and read even when Postgres is
+  down. Deliberately one-directional: the only sanctioned way to clear a flag
+  is the `clear_attention.py` CLI, which logs who cleared what and why.
+- Every public function that submits an order routes through `_guard`;
+  failures are reported as a structured `{status, block_reason}` result, not
+  a raised exception out of the cycle loop — `main.py`'s own try/except is
+  the last line of defense for anything else.
 
-### `notifier.py`
-- Telegram messages for: position opened, call sold, call closed/rolled,
-  assignment, errors. Mirror the formatting style already used in
-  `~/Documents/stock_bot/notifier.py` and
-  `~/Documents/alpaca_trading_bot/notifier.py` for consistency across bots.
+### `notifier.py` + `alerts.py`
+- `notifier.py`: Telegram messages for position opened, call sold,
+  call closed/rolled, assignment, errors, needs-attention, partial fill,
+  kill-switch trip, DB-unavailable. Mirrors the formatting style used in
+  `~/Documents/stock_bot/notifier.py` for consistency across bots — but
+  **currently a no-op**: `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are unset,
+  so every send falls through to a logged `[telegram disabled]` line.
+- `alerts.py`: the channel that's actually live today. For the four
+  actionable categories (`needs_attention`, `partial_fill`, `kill_switch`,
+  `db_unavailable`), `notifier.py` calls `alerts.notify(category, message)`
+  **in addition to** the Telegram attempt — console print, append to
+  `alerts.log`, and a best-effort macOS `osascript` desktop notification
+  (never blocks a cycle if `osascript` fails or isn't available, e.g. on
+  Railway's Linux containers).
 
 ### `logger.py`
 - Write structured logs to PostgreSQL. Suggested schema (create via a
@@ -262,7 +328,154 @@ CREATE TABLE iv_history (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (symbol, date)              -- one snapshot/symbol/day; re-runs upsert, don't duplicate
 );
+
+-- Phase 3, Task 6 (Lot Manager). Alpaca's Trading API has no per-lot
+-- cost-basis endpoint (confirmed live — GET /positions/{symbol}/lots -> 404),
+-- so this table is the SOLE source of truth for per-lot basis. This bot only
+-- ever holds one open lot per symbol at a time, but lots are logged as
+-- independent rows (closed_at IS NULL = currently open) so history survives
+-- assignment/recovery-exit/re-buy cycles instead of being overwritten.
+CREATE TABLE lots (
+  id SERIAL PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  qty INTEGER NOT NULL,
+  cost_basis_per_share NUMERIC NOT NULL,
+  opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at TIMESTAMPTZ,
+  close_reason TEXT,                 -- 'ASSIGNED', 'RECOVERY_EXIT'
+  close_price_per_share NUMERIC,
+  no_qualifying_call_flagged_at TIMESTAMPTZ
+);
 ```
+
+`get_open_lot(symbol)` raises `DBUnavailable` whenever `DATABASE_URL` isn't
+configured or a real query fails — unlike every other reader in this module,
+it never returns `None` for "can't verify," since a caller using this for the
+cost-basis floor must never silently treat "unknown" as "no lot exists."
+`get_own_symbols()` similarly returns `None` (not `set()`) on failure, so
+`trader._check_hard_limits()` fails **closed** on a DB outage rather than
+treating it as "this bot owns nothing."
+
+A separate `iv_daily` table/schema (Postgres, or a local SQLite file under
+`pipeline_state/` as a dev fallback) is maintained by `iv_logger.py`, not
+`logger.py` — a different cadence (daily, external cron) from the weekly
+`iv_history` table above; the two never share a schema or a connection.
+
+### Research pipeline: `screener.py` → `sizer.py` → `orchestrator.py` → `backtest.py` → `apply_watchlist.py`
+
+Per-project naming convention: Scout / Sizer / Foreman / Oracle / (human approval). Run via
+`python orchestrator.py research SYM1 SYM2 ...` — screener.py → sizer.py → a capital-cap
+filter → backtest.py → prints (never applies) the pending diff. Nothing in this chain ever
+calls `apply_watchlist.py --confirm` or touches `trader.py`/Alpaca order endpoints — approving
+a watchlist change is always a separate, deliberate human step.
+
+- **`screener.py` (Scout)** — `screen_symbols(candidates)`: automates Filter 2 (liquidity/
+  timing) against today's live options chain; also reports (never gates on) IV rank and an
+  earnings-in-window flag. Writes `pipeline_state/screened_symbols.json`.
+- **`sizer.py` (Sizer)** — `compute_sizing_plan()`: cheapest-first round-robin lot allocation
+  against `SIZER_BUDGET`/`SIZER_MAX_PRICE_PER_SHARE`/`SIZER_MAX_WEIGHT_PER_NAME`. Purely
+  informational — never gates anything downstream. Writes `pipeline_state/sizing_plan.json`.
+- **`orchestrator.py` (Foreman)** — `filter_by_capital_caps()`: drops any symbol that passed
+  Scout but whose 100-share lot cost exceeds `MAX_CAPITAL_PER_SYMBOL` or whose price exceeds
+  `SIZER_MAX_PRICE_PER_SHARE`, **before** Oracle spends a backtest cycle on it. Writes
+  `pipeline_state/capital_filtered_symbols.json`.
+- **`backtest.py` (Oracle)** — single-symbol walk-forward backtest: sweeps DTE buckets
+  (floored at `ORACLE_MIN_DTE=14`, strictly above `ROLL_MIN_DTE=7` by design — see
+  `config.py`'s own comment) × delta buckets, selects by risk-adjusted total return (or
+  turnover score for exit-intent symbols, from `pipeline_state/intents.json`), validates
+  out-of-sample, shrinks thin-evidence picks toward a cross-symbol consensus DTE. All premiums
+  are **synthetic** (Black-Scholes fed realized vol, not real historical options IV — this
+  account has no OPRA history) — a plausible lower bound, not a prediction. Writes
+  `pipeline_state/proposed_watchlist.json`.
+- **`apply_watchlist.py` (human gate)** — diffs active vs. proposed, printing lot-cost-vs-cap,
+  roll-threshold, earnings, and ex-dividend warnings on every ADD/CHANGE line. Only
+  `--confirm` writes `pipeline_state/active_watchlist.json` (the **only** file `main.py`
+  actually reads for its live watchlist) with a fresh `confirmed_at` timestamp.
+
+### Auditor & simulation: `analysis.py`, `portfolio_backtest.py`, `iv_logger.py`
+
+- **`analysis.py` (Auditor)** — compares realized trade history (`logger.get_option_trades`/
+  `get_share_trades`) against Oracle's predicted yield/assignment rate, computes real P&L
+  (premium + stock leg), flags data-backed loss contributing factors (tail event, earnings
+  coincidence, market-wide vs. stock-specific), an IVR-tier realized-vs-predicted breakdown,
+  and a wash-sale-risk report. **Report only** — never re-runs research or touches a live
+  position.
+- **`portfolio_backtest.py`** — multi-symbol, capital-constrained "what-if" simulation
+  (Scout → dynamic IVR-driven DTE pick → simulated Closer loop → Auditor's actual
+  `_contributing_factors()` reused verbatim). Zero Alpaca calls, zero `trader.py` imports —
+  pure historical replay. Does **not** model `MAX_CAPITAL_PER_SYMBOL`, `OTHER_BOTS_SYMBOLS`
+  overlap, the kill switch, `DRY_RUN`, or any guard check — a sim result says nothing about
+  whether the live guard stack would have allowed the trade.
+- **`iv_logger.py`** — daily ATM IV + underlying close snapshot, meant to run from an
+  **external** scheduler (cron/Railway scheduled job), not as a second always-running process
+  alongside `main.py`. Postgres (`iv_daily` table) when `DATABASE_URL` is set, else a local
+  SQLite file under `pipeline_state/` (gitignored; does **not** survive a Railway redeploy —
+  the filesystem there is ephemeral).
+
+### `clear_attention.py`
+
+Human-operated CLI, the **only** sanctioned way to clear a `needs_attention.json` flag
+without hand-editing the file — `python clear_attention.py SYMBOL "reason"`. Every clear is
+logged via `logger.log_error`, so there's a durable record of who cleared what and why.
+
+## Phase 3 Safety Hardening
+
+None of the following existed in this project's original ("Phase 1") design — all are real,
+implemented, tested features, not aspirational notes:
+
+- **`DRY_RUN`** (env, default `true`) — the last check in `trader._guard`, by design: every
+  other guard still runs (and is visible in logs) even when an order will ultimately be
+  simulated, not submitted.
+- **Kill switch** — `KILL_SWITCH_ENABLED` (env) OR the presence of `pipeline_state/kill_switch`
+  (a plain sentinel file) blocks every order type, independent of `DRY_RUN`. The file form
+  survives a restart and can be engaged by hand with no code/env change.
+- **Paper-mode guard** — `config.assert_paper_mode()` runs at **import time** of `trader.py`
+  and `options_data.py` (the exact point each constructs its Alpaca `TradingClient`), not just
+  from `main.py`'s entrypoint — any script that imports either module enforces this before any
+  client object exists to call an order method on. Exact-host-match against
+  `ALPACA_PAPER_HOST`, not a substring check; requires `ALLOW_LIVE=true` to proceed against
+  anything else.
+- **Hard capital/position caps** (`MAX_CAPITAL_PER_SYMBOL`, `MAX_TOTAL_CAPITAL`,
+  `MAX_CONCURRENT_POSITIONS`, `MIN_ACCOUNT_BUYING_POWER`) — checked only for `buy_shares` (new
+  capital deployment), scoped to symbols **this bot's own trade log** has bought
+  (`logger.get_own_symbols()`), since the Alpaca account is shared with other bots. Fails
+  **closed** (blocks the buy) if the DB can't confirm what this bot owns, rather than treating
+  an outage as "owns nothing."
+- **`OTHER_BOTS_SYMBOLS`** — a hand-maintained list (currently `SPY, QQQ, AAPL, MSFT`, mirroring
+  `~/Documents/alpaca_trading_bot/config.py`'s `STOCK_SYMBOLS`) of symbols known to be traded
+  by other bots on this shared account; any watchlist symbol on this list is skipped entirely,
+  checked before any broker read for that symbol. Not auto-synced — re-check the sibling repo
+  by hand if its list changes.
+- **DB-unavailable guard** — `logger.is_db_available()` is checked by `trader._guard` before
+  **every** order type whenever `DRY_RUN=False`, independent of the capital-cap check above;
+  `logger.DBUnavailable` is raised (not swallowed) by `log_share_trade`/`open_lot`/`get_open_lot`
+  when `DATABASE_URL` is configured but a real write/read just failed — callers (`main.py`'s
+  buy-success and lot-lookup paths) catch this and flag the symbol `needs_attention` rather than
+  silently proceeding on an unverifiable assumption.
+- **`needs_attention.json`** — file-based (not DB-dependent), one-directional: `trader.py` can
+  set a flag, only `clear_attention.py` can clear one. A flagged symbol is skipped at the very
+  top of `main.run_symbol_cycle`, before any broker read.
+- **Market-hours gate** — no orders in the first `MARKET_OPEN_BUFFER_MINUTES` (30) after open
+  or the last `MARKET_CLOSE_BUFFER_MINUTES` (15) before close, or outside market hours
+  entirely. Uses the broker's own live clock (`TradingClient.get_clock()`), not a local
+  trading-calendar guess, so holidays/early closes are handled correctly.
+- **Slippage cap** — `_walk_limit_order` refuses to walk a quote whose natural price is more
+  than `MAX_SLIPPAGE_FROM_MID_PCT` (5%) from the mid, before attempting any fill.
+- **Order dedup** — a deterministic `client_order_id` (prefix `CLIENT_ORDER_ID_PREFIX`) is a
+  secondary protection against a network-retry double-submit; the primary guard is querying
+  the broker for an existing open order on the symbol before submitting (`_check_open_orders`).
+- **Roll limits** — `MAX_ROLLS_PER_LOT` (4) and `ROLL_OPEN_LEG_MAX_RETRIES` (3, after which the
+  symbol is marked `needs_attention` rather than left with an uncovered position after a failed
+  roll).
+- **Watchlist expiry** — `active_watchlist.json`'s `confirmed_at` older than
+  `WATCHLIST_MAX_AGE_DAYS` (10), or the file missing entirely, blocks **new** buys only;
+  managing an already-open position is unaffected.
+- **`--once` / lockfile** — `main.py --once` runs one cycle and exits (used for manual/CI/dry
+  runs); the scheduler mode's lockfile (`pipeline_state/main.lock`) prevents two concurrent
+  cycles, auto-clearing a lock held by a dead PID.
+- **`ORACLE_MIN_DTE`** (14, must exceed `ROLL_MIN_DTE` by the `assert` in `config.py`) — floors
+  Oracle's DTE bucket sweep after a real backtest run once picked `dte=7`, exactly the roll
+  trigger, leaving zero runway before a roll would fire on a freshly-opened call.
 
 ## Development Notes
 
