@@ -58,6 +58,13 @@ def _patch_broker_only(monkeypatch, **overrides):
     monkeypatch.setattr(main, "_get_spot_price", lambda symbol: 123.45)
     monkeypatch.setattr(main, "_watchlist_is_stale", lambda: False)
     monkeypatch.setattr(main, "_run_async", lambda coro: coro.close())
+    # AAPL is a generic test symbol here, not a reference to the real
+    # OTHER_BOTS_SYMBOLS overlap list (config.py populated it with AAPL
+    # this phase) -- same fix test_main.py's own _patch_common already
+    # applies, just never ported here since this file predates that change
+    # and nobody had run the integration suite since (requires
+    # TEST_DATABASE_URL, not part of the default `pytest tests/` run).
+    monkeypatch.setattr(main, "OTHER_BOTS_SYMBOLS", [])
 
 
 def test_one_cycle_buy_writes_expected_share_trade_and_lot_rows(monkeypatch):

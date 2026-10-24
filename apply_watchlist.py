@@ -38,6 +38,11 @@ using the same informational-only window approved for options_data.py's
 ex_div_before_expiration flag (today <= ex-div date <= implied
 expiration, both ends inclusive). See _ex_div_warning's docstring.
 
+PAPER AUTOPILOT: `--confirm --approved-by autopilot` is how orchestrator.py
+auto-approves under config.PAPER_AUTOPILOT (paper-only, refused otherwise).
+Either way, any HANDS_OFF_SYMBOLS entry (OTHER_BOTS_SYMBOLS + MANUAL_SYMBOLS)
+in the proposed file is stripped before it can reach active_watchlist.json.
+
 Usage:
     python apply_watchlist.py                 # show the diff, change nothing
     python apply_watchlist.py --confirm       # show the diff, then apply it
@@ -47,7 +52,10 @@ import json
 import os
 from datetime import date, datetime, timedelta, timezone
 
-from config import MAX_CAPITAL_PER_SYMBOL, ROLL_MIN_DTE, SHARES_PER_LOT, TARGET_DELTA, validate_live_delta
+from config import (
+    HANDS_OFF_SYMBOLS, MAX_CAPITAL_PER_SYMBOL, PAPER_AUTOPILOT, ROLL_MIN_DTE, SHARES_PER_LOT,
+    TARGET_DELTA, validate_live_delta,
+)
 
 PROPOSED_PATH = "pipeline_state/proposed_watchlist.json"
 ACTIVE_PATH = "pipeline_state/active_watchlist.json"
@@ -518,7 +526,13 @@ if __name__ == "__main__":
     parser.add_argument("--active", default=ACTIVE_PATH)
     parser.add_argument("--screened", default=SCREENED_PATH,
                          help="screener.py's output, used only for the earnings-vs-proposed-dte warning")
+    parser.add_argument("--approved-by", choices=("human", "autopilot"), default="human",
+                        help="recorded on active_watchlist.json; 'autopilot' requires PAPER_AUTOPILOT")
     args = parser.parse_args()
+
+    if args.approved_by == "autopilot" and not PAPER_AUTOPILOT:
+        print("--approved-by autopilot requires PAPER_AUTOPILOT=true (paper only) — refusing.")
+        raise SystemExit(1)
 
     if not os.path.exists(args.proposed):
         print(f"No proposed watchlist at {args.proposed} — run backtest.py --from-screener first.")
@@ -526,6 +540,10 @@ if __name__ == "__main__":
 
     active = _load(args.active)
     proposed = _load(args.proposed)
+    hands_off = sorted(set(proposed.get("symbols", {})) & HANDS_OFF_SYMBOLS)
+    if hands_off:
+        print(f"Stripping hands-off symbol(s) from the proposal: {', '.join(hands_off)}")
+        proposed["symbols"] = {s: v for s, v in proposed["symbols"].items() if s not in HANDS_OFF_SYMBOLS}
     screened = _load(args.screened)
     earnings_by_symbol = _load_earnings_by_symbol(screened)
     ex_div_by_symbol = _load_ex_div_by_symbol(screened)
@@ -544,6 +562,7 @@ if __name__ == "__main__":
         # positions on; re-running --confirm always resets it to now.
         payload = dict(proposed)
         payload["confirmed_at"] = datetime.now(timezone.utc).isoformat()
+        payload["approved_by"] = args.approved_by
         with open(args.active, "w") as f:
             json.dump(payload, f, indent=2)
         print(f"\nApplied — {args.active} updated (confirmed_at={payload['confirmed_at']}). "

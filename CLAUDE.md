@@ -105,7 +105,11 @@ covered_call_bot/
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `TARGET_DELTA` | 0.25 | Sell calls near this delta (0.20–0.30 band is the standard income tilt) |
+| `STRIKE_SELECTION` | `edge` | `edge`: `strike_advisor.pick_strike_by_edge()` — every expiration in `ADVISOR_DTE_MIN..MAX` (6–34), delta 0.10–0.35, ranked by volatility edge (expected fill − fair value under forecast realized vol), earnings-spanning expirations allowed above `spot·exp(EARNINGS_MOVE_BUFFER·max(implied, historical move))`, cost-basis floor. `delta`: legacy `pick_strike()` below |
+| `ROLL_RULE` | `danger` | `danger`: roll only on delta ≥ `ROLL_TRIGGER_DELTA`, or ITM with ≤ `ROLL_LAST_DAYS` (2) left; OTM calls just expire. `dte`: legacy, also roll at DTE ≤ `ROLL_MIN_DTE` (config asserts `edge` isn't paired with `dte`) |
+| `PAPER_AUTOPILOT` | false | Paper-only: weekly research + self-approval (Mon 10:05 ET) before the 10:15 ET cycle, `DRY_RUN` defaults False. Refused against a non-paper host |
+| `MANUAL_SYMBOLS` | `SPCX` | Kishore's own hand-traded symbols — hands-off everywhere, like `OTHER_BOTS_SYMBOLS` |
+| `TARGET_DELTA` | 0.25 | Legacy (`STRIKE_SELECTION=delta`): sell calls near this delta (0.20–0.30 band is the standard income tilt) |
 | `DTE_MIN` / `DTE_MAX` | 30 / 45 | Expiration window to screen |
 | `PROFIT_TAKE_PCT` | 0.60 | Buy-to-close early once this fraction of max premium is captured |
 | `ROLL_TRIGGER_DELTA` | 0.70 | Roll out/up if short call's delta rises above this (being tested) |

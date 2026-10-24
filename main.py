@@ -27,7 +27,9 @@ from config import (
     WATCHLIST, SHARES_PER_LOT, TARGET_DELTA,
     PROFIT_TAKE_PCT, ROLL_TRIGGER_DELTA, ROLL_MIN_DTE, RISK_FREE_RATE,
     CYCLE_DAY_OF_WEEK, CYCLE_TIME_ET, MIN_IV_HISTORY_POINTS,
-    DTE_MIN, DTE_MAX, OTHER_BOTS_SYMBOLS, WATCHLIST_MAX_AGE_DAYS,
+    DTE_MIN, DTE_MAX, OTHER_BOTS_SYMBOLS, MANUAL_SYMBOLS, WATCHLIST_MAX_AGE_DAYS,
+    PAPER_AUTOPILOT, AUTOPILOT_RESEARCH_TIME_ET, AUTOPILOT_UNIVERSE, DRY_RUN,
+    STRIKE_SELECTION, ROLL_RULE, ROLL_LAST_DAYS,
     STALE_LOT_WEEKS, RECOVERY_EXIT_ENABLED_SYMBOLS, RECOVERY_EXIT_MIN_MARGIN_PCT,
     MIN_LIVE_DELTA, MAX_LIVE_DELTA, validate_live_delta,
 )
@@ -41,6 +43,7 @@ from logger import (
     DBUnavailable,
 )
 from options_data import pick_strike, get_chain_snapshot, parse_occ_symbol, get_atm_iv
+from strike_advisor import pick_strike_by_edge
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -213,6 +216,37 @@ def _watchlist_is_stale() -> bool:
     return datetime.now(timezone.utc) - confirmed_at > timedelta(days=WATCHLIST_MAX_AGE_DAYS)
 
 
+def _select_call(symbol: str, spot: float, target_delta: float, dte_min: int, dte_max: int,
+                 min_strike: float | None):
+    """
+    The single strike-selection call for both State 2 (sell-to-open) and
+    State 3 (roll target), per config.STRIKE_SELECTION. Both selectors
+    return an options_data.CallCandidate or None, and both honor the
+    cost-basis floor (min_strike).
+    """
+    if STRIKE_SELECTION == "edge":
+        return pick_strike_by_edge(symbol, spot, min_strike=min_strike)
+    return pick_strike(symbol, spot, target_delta, dte_min=dte_min, dte_max=dte_max, min_strike=min_strike)
+
+
+def _roll_reason(dte: int, cur_delta: float | None, spot: float | None, strike: float) -> str | None:
+    """
+    Why the open short call should be rolled, or None to keep holding.
+    "danger" (default): delta >= ROLL_TRIGGER_DELTA, or ITM with
+    <= ROLL_LAST_DAYS left -- an OTM call near expiry just expires.
+    "dte" (legacy): additionally any DTE <= ROLL_MIN_DTE.
+    """
+    if cur_delta is not None and cur_delta >= ROLL_TRIGGER_DELTA:
+        return f"delta {cur_delta:.2f} >= {ROLL_TRIGGER_DELTA:.2f}"
+    if ROLL_RULE == "dte":
+        if dte <= ROLL_MIN_DTE:
+            return f"dte {dte} <= ROLL_MIN_DTE {ROLL_MIN_DTE}"
+        return None
+    if dte <= ROLL_LAST_DAYS and spot is not None and spot > strike:
+        return f"in the money (spot {spot:.2f} > strike {strike:.2f}) with {dte}d left"
+    return None
+
+
 def _dte_window(recommended_dte: int | None) -> tuple[int, int]:
     if recommended_dte is None:
         return DTE_MIN, DTE_MAX
@@ -377,6 +411,11 @@ def run_symbol_cycle(
         log_error("main.run_symbol_cycle", msg)
         _run_async(notifier.send_error(symbol, msg))
         return f"{symbol}: SKIPPED — symbol overlap with another bot"
+    if symbol in MANUAL_SYMBOLS:
+        msg = f"{symbol}: listed in MANUAL_SYMBOLS (held/traded by hand on this account)"
+        log_error("main.run_symbol_cycle", msg)
+        _run_async(notifier.send_error(symbol, msg))
+        return f"{symbol}: SKIPPED — manual (hands-off) symbol"
 
     # Set by trader.roll_call when a roll's open leg never went through
     # for real after the close leg already did (shares left genuinely
@@ -410,6 +449,11 @@ def run_symbol_cycle(
         )
         log_error("main.run_symbol_cycle", msg)
         _run_async(notifier.send_invalid_watchlist_delta(symbol, delta_fallback_reason, TARGET_DELTA))
+    if STRIKE_SELECTION == "edge":
+        # The edge selector ranks its own delta band (ADVISOR_MIN/MAX_DELTA);
+        # target_delta is carried through only for logging -- label it so a
+        # log line never implies the contract was picked by it.
+        delta_source = "unused:edge-selector"
 
     share_pos = trader.get_share_position(symbol)
     share_qty = int(float(share_pos.qty)) if share_pos else 0
@@ -589,7 +633,7 @@ def run_symbol_cycle(
             return f"{symbol}: FAILED to get spot price"
 
         min_strike = float(lot["cost_basis_per_share"]) if lot is not None else None
-        candidate = pick_strike(symbol, spot, target_delta, dte_min=dte_min, dte_max=dte_max, min_strike=min_strike)
+        candidate = _select_call(symbol, spot, target_delta, dte_min, dte_max, min_strike)
         if candidate is None:
             if lot is not None and min_strike is not None:
                 flag_lot_no_qualifying_call(symbol)
@@ -709,15 +753,14 @@ def run_symbol_cycle(
         _run_async(notifier.send_call_closed(symbol, occ_symbol, "profit_take", pnl))
         return f"{symbol}: closed {occ_symbol} — {profit_captured_pct:.0%} of max profit captured"
 
-    # Check if the short call is being tested (delta risen) or running low on DTE.
+    # Check whether the short call needs rolling (see _roll_reason / ROLL_RULE).
     # Position objects carry no strike/expiration fields for options — both
     # have to be parsed out of the OCC symbol itself.
     parsed = parse_occ_symbol(occ_symbol)
     dte = (parsed.expiration - date.today()).days
-    needs_roll_dte = dte <= ROLL_MIN_DTE
 
     spot = _get_spot_price(symbol)
-    needs_roll_delta = False
+    cur_delta = None
 
     if spot is not None and dte > 0:
         snapshots = get_chain_snapshot(symbol)
@@ -725,14 +768,14 @@ def run_symbol_cycle(
         if snap is not None and snap.latest_quote and snap.latest_quote.bid_price and snap.latest_quote.ask_price:
             mid = (snap.latest_quote.bid_price + snap.latest_quote.ask_price) / 2.0
             cur_delta = delta_from_quote(mid, spot, parsed.strike, dte / 365.0, RISK_FREE_RATE)
-            if cur_delta is not None and cur_delta >= ROLL_TRIGGER_DELTA:
-                needs_roll_delta = True
 
-    if needs_roll_dte or needs_roll_delta:
+    roll_reason = _roll_reason(dte, cur_delta, spot, parsed.strike)
+    if roll_reason:
+        logger.info("%s: roll triggered for %s — %s (ROLL_RULE=%s)", symbol, occ_symbol, roll_reason, ROLL_RULE)
         spot = spot or _get_spot_price(symbol)
         min_strike = float(lot["cost_basis_per_share"]) if lot is not None else None
         new_candidate = (
-            pick_strike(symbol, spot, target_delta, dte_min=dte_min, dte_max=dte_max, min_strike=min_strike)
+            _select_call(symbol, spot, target_delta, dte_min, dte_max, min_strike)
             if spot else None
         )
         if new_candidate is None:
@@ -917,7 +960,30 @@ def scheduled_run() -> None:
         _run_async(notifier.send_error("SCHEDULER", str(e)))
 
 
-getattr(schedule.every(), CYCLE_DAY_OF_WEEK).at(CYCLE_TIME_ET).do(scheduled_run)
+def scheduled_research() -> None:
+    """
+    PAPER_AUTOPILOT only: weekly research + auto-approval, scheduled ahead
+    of the trading cycle on the same day. A failed/empty research run
+    leaves the previous active watchlist untouched (it just ages toward
+    WATCHLIST_MAX_AGE_DAYS, which then blocks new buys -- fail safe).
+    """
+    import orchestrator
+    try:
+        if not orchestrator.run_research(AUTOPILOT_UNIVERSE, dte=None, auto_confirm=True):
+            log_error("main.scheduled_research", "autopilot research did not approve a new watchlist")
+    except Exception as e:
+        logger.exception("Unhandled error in scheduled_research")
+        log_error("main.scheduled_research", str(e))
+        _run_async(notifier.send_error("AUTOPILOT", str(e)))
+
+
+# Explicit tz: without it, schedule reads "10:15" in the HOST's local time --
+# on Railway (UTC) that's 6:15 ET, before the open, so the market-hours
+# guard would block every order of every scheduled cycle.
+SCHEDULE_TZ = "America/New_York"
+if PAPER_AUTOPILOT:
+    getattr(schedule.every(), CYCLE_DAY_OF_WEEK).at(AUTOPILOT_RESEARCH_TIME_ET, SCHEDULE_TZ).do(scheduled_research)
+getattr(schedule.every(), CYCLE_DAY_OF_WEEK).at(CYCLE_TIME_ET, SCHEDULE_TZ).do(scheduled_run)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -942,6 +1008,12 @@ def _main(argv: list[str] | None = None) -> int:
             )
 
         init_schema()
+        logger.info(
+            "Mode: %s | DRY_RUN=%s | hands-off symbols: %s",
+            "PAPER AUTOPILOT (research %s ET, auto-approve)" % AUTOPILOT_RESEARCH_TIME_ET if PAPER_AUTOPILOT
+            else "manual approval",
+            DRY_RUN, ", ".join(sorted(set(OTHER_BOTS_SYMBOLS) | set(MANUAL_SYMBOLS))),
+        )
 
         if args.once:
             logger.info(

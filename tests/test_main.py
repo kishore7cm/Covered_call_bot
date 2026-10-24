@@ -87,6 +87,16 @@ def _patch_common(monkeypatch, **overrides):
 
     logged = {"option_trades": [], "share_trades": [], "errors": [], "lot_flags": []}
     monkeypatch.setattr(main, "get_last_open_occ_symbol", lambda symbol: None)
+    # Default to "can't verify" (None), the exact behavior every test here
+    # implicitly relied on when DATABASE_URL was unset in this dev env --
+    # NOT 0 or SHARES_PER_LOT, either of which would wrongly trigger (or
+    # wrongly suppress) the share-count-mismatch overlap check for tests
+    # that aren't about that check at all (confirmed: setting a real
+    # DATABASE_URL surfaced this gap -- get_expected_share_qty() started
+    # hitting a real, empty DB and returning 0, tripping the mismatch
+    # check against every faked-held-share test in this file). The
+    # dedicated overlap tests above override this explicitly.
+    monkeypatch.setattr(main, "get_expected_share_qty", lambda symbol: None)
     monkeypatch.setattr(main, "log_option_trade", lambda *a, **k: logged["option_trades"].append((a, k)))
     monkeypatch.setattr(main, "log_share_trade", lambda *a, **k: logged["share_trades"].append((a, k)))
     monkeypatch.setattr(main, "log_error", lambda *a, **k: logged["errors"].append((a, k)))
@@ -99,6 +109,11 @@ def _patch_common(monkeypatch, **overrides):
     # in that list today. Defaulted empty; the dedicated overlap test
     # overrides this explicitly.
     monkeypatch.setattr(main, "OTHER_BOTS_SYMBOLS", [])
+    monkeypatch.setattr(main, "MANUAL_SYMBOLS", [])
+    # These tests exercise the legacy selector/roll rule they were written
+    # against (pick_strike + DTE roll); edge/danger have their own tests.
+    monkeypatch.setattr(main, "STRIKE_SELECTION", "delta")
+    monkeypatch.setattr(main, "ROLL_RULE", "dte")
     # Lot Manager (Task 6) -- DATABASE_URL is unset in dev, so these all
     # silently no-op there, but must still be mocked explicitly: a real
     # DATABASE_URL (CI, Railway) would otherwise make every test in this
@@ -361,6 +376,22 @@ def test_other_bots_symbol_is_skipped_before_any_broker_read(monkeypatch):
     assert "SKIPPED" in result
     assert "overlap" in result.lower()
     assert share_pos_calls == []  # never even looked at broker state
+    assert len(logged["errors"]) == 1
+
+
+def test_manual_symbol_is_skipped_before_any_broker_read(monkeypatch):
+    share_pos_calls = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: share_pos_calls.append(symbol),
+    )
+    monkeypatch.setattr(main, "MANUAL_SYMBOLS", ["SPCX"])
+
+    result = main.run_symbol_cycle("SPCX")
+
+    assert "SKIPPED" in result
+    assert "manual" in result.lower()
+    assert share_pos_calls == []
     assert len(logged["errors"]) == 1
 
 
@@ -1550,3 +1581,82 @@ def test_main_refuses_before_touching_the_lock_when_paper_check_fails(monkeypatc
         main._main(["--once"])
 
     assert calls == []
+
+
+# ── STRIKE_SELECTION="edge" + ROLL_RULE="danger" (2026-10-23) ────────────────
+
+@pytest.mark.parametrize("rule, dte, delta, spot, strike, expect_roll", [
+    ("danger", 20, 0.75, 100.0, 95.0, True),    # tested: delta over trigger
+    ("danger", 3, 0.30, 100.0, 110.0, False),   # short DTE but OTM -> let it expire
+    ("danger", 6, 0.20, 100.0, 105.0, False),   # freshly opened 6-DTE call is NOT rolled
+    ("danger", 2, 0.60, 105.0, 100.0, True),    # ITM in the last ROLL_LAST_DAYS
+    ("danger", 2, None, None, 100.0, False),    # no spot -> can't tell ITM, hold
+    ("dte", 6, 0.20, 100.0, 105.0, True),       # legacy: any DTE <= ROLL_MIN_DTE
+    ("dte", 20, 0.20, 100.0, 105.0, False),
+])
+def test_roll_reason(monkeypatch, rule, dte, delta, spot, strike, expect_roll):
+    monkeypatch.setattr(main, "ROLL_RULE", rule)
+    assert (main._roll_reason(dte, delta, spot, strike) is not None) == expect_roll
+
+
+def test_edge_mode_sells_edge_pick_with_basis_floor(monkeypatch):
+    candidate = FakeCandidate(_far_occ_symbol("AAPL", dte=13), 110.0, date.today() + timedelta(days=13), 0.8, 0.2, iv=0.5)
+    calls = []
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+    )
+    monkeypatch.setattr(main, "STRIKE_SELECTION", "edge")
+    monkeypatch.setattr(main, "get_open_lot", lambda symbol: {
+        "qty": SHARES_PER_LOT, "cost_basis_per_share": 97.5, "opened_at": datetime.now(timezone.utc)})
+    monkeypatch.setattr(main, "pick_strike", lambda *a, **k: pytest.fail("legacy pick_strike used in edge mode"))
+    monkeypatch.setattr(main, "pick_strike_by_edge",
+                        lambda symbol, spot, min_strike=None: calls.append((symbol, spot, min_strike)) or candidate)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert calls == [("AAPL", 100.0, 97.5)]
+    assert "sold" in result and candidate.occ_symbol in result
+    assert "unused:edge-selector" in result
+    assert logged["option_trades"][0][0][2] == "SELL_TO_OPEN"
+
+
+def test_danger_rule_holds_short_dated_otm_call(monkeypatch):
+    # 3 DTE, strike 200 vs spot 100: far OTM -- legacy rule would roll, danger holds
+    short_call = FakeShortCallPosition(symbol=_far_occ_symbol("AAPL", dte=3), cost_basis="-250.0", market_value="-240.0")
+    logged = _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+        find_short_call=lambda symbol: short_call,
+        roll_call=lambda *a, **k: pytest.fail("rolled an OTM call under ROLL_RULE=danger"),
+    )
+    monkeypatch.setattr(main, "ROLL_RULE", "danger")
+    monkeypatch.setattr(main, "STRIKE_SELECTION", "edge")
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert "holding" in result
+    assert logged["option_trades"] == []
+
+
+def test_danger_rule_rolls_itm_call_in_last_days_via_edge(monkeypatch):
+    old_occ = _far_occ_symbol("AAPL", dte=1, strike=95.0)  # spot 100 > 95 -> ITM
+    short_call = FakeShortCallPosition(symbol=old_occ, cost_basis="-250.0", market_value="-600.0")
+    new_candidate = FakeCandidate(_far_occ_symbol("AAPL", dte=20, strike=105.0), 105.0,
+                                  date.today() + timedelta(days=20), 1.5, 0.3, iv=0.5)
+    rolled = []
+    _patch_common(
+        monkeypatch,
+        get_share_position=lambda symbol: FakeSharePosition(qty=str(SHARES_PER_LOT)),
+        find_short_call=lambda symbol: short_call,
+        roll_call=lambda symbol, old, new, qty=1: rolled.append((old, new)) or {
+            "closed": {"order_id": "o-rc", "submitted": True}, "opened": {"order_id": "o-ro", "submitted": True}},
+    )
+    monkeypatch.setattr(main, "ROLL_RULE", "danger")
+    monkeypatch.setattr(main, "STRIKE_SELECTION", "edge")
+    monkeypatch.setattr(main, "pick_strike_by_edge", lambda symbol, spot, min_strike=None: new_candidate)
+
+    result = main.run_symbol_cycle("AAPL")
+
+    assert rolled == [(old_occ, new_candidate.occ_symbol)]
+    assert "rolled" in result

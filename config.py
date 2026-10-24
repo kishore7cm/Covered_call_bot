@@ -75,14 +75,48 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
+# ── Paper autopilot ───────────────────────────────────────────────────────────
+# PAPER_AUTOPILOT=true (Kishore's decision, 2026-10-23) removes the human
+# steps for PAPER trading only:
+#   - main.py's scheduler runs the research pipeline weekly
+#     (AUTOPILOT_RESEARCH_TIME_ET, before the trading cycle) and the
+#     orchestrator auto-approves its own proposed watchlist
+#     (apply_watchlist.py --confirm --approved-by autopilot)
+#   - DRY_RUN defaults to False, so the Closer places real PAPER orders
+# Every other guard (kill switch, caps, market hours, OTHER_BOTS_SYMBOLS,
+# MANUAL_SYMBOLS, paper-host check) is unchanged. Refused outright against
+# any non-paper ALPACA_BASE_URL -- even with ALLOW_LIVE -- so turning it on
+# can never remove the human gate from a live account.
+PAPER_AUTOPILOT = os.getenv("PAPER_AUTOPILOT", "false").lower() in ("true", "1", "yes")
+if PAPER_AUTOPILOT and not PAPER:
+    raise RuntimeError(
+        f"PAPER_AUTOPILOT=true is only allowed against the paper host ({ALPACA_PAPER_HOST}), "
+        f"not {ALPACA_BASE_URL}. Unset PAPER_AUTOPILOT before running against a live account."
+    )
+AUTOPILOT_RESEARCH_TIME_ET = "10:05"   # weekly, same day as CYCLE_DAY_OF_WEEK, before CYCLE_TIME_ET
+AUTOPILOT_APPROVALS_LOG = "pipeline_state/autopilot_approvals.jsonl"
+# Symbols the weekly autopilot research run screens. Cheap, liquid-ish
+# names (a 100-share lot has to fit SIZER_MAX_PRICE_PER_SHARE /
+# MAX_CAPITAL_PER_SYMBOL) -- the same universe portfolio_backtest.py uses.
+# Override with AUTOPILOT_UNIVERSE="SOFI,F,T" (comma-separated).
+_DEFAULT_AUTOPILOT_UNIVERSE = (
+    "INTC,T,VZ,PFE,CSCO,BAC,WFC,F,SOFI,PYPL,KO,SNAP,WBD,NIO,GM,MRK,XOM,CVX,C,SCHW,MO,GE,"
+    "CMCSA,HBAN,KEY,RF,DAL,AAL,UAL,LUV,TFC,USB,OXY,KHC,VTRS,HPQ,DELL"
+)
+AUTOPILOT_UNIVERSE: list[str] = [
+    s.strip().upper() for s in os.getenv("AUTOPILOT_UNIVERSE", _DEFAULT_AUTOPILOT_UNIVERSE).split(",") if s.strip()
+]
+
 # ── Closer safety (Phase 3) ───────────────────────────────────────────────────
 # Checked by trader.py's shared _guard() before EVERY order this bot submits
 # (buy_shares, sell_to_open_call, buy_to_close_call -- roll_call composes the
 # latter two, so both legs are covered automatically). DRY_RUN defaults to
 # True deliberately: a fresh checkout of this repo must never place a real
 # order just because it was run. Only set DRY_RUN=False yourself, deliberately,
-# once you're ready for the Closer to actually submit orders.
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() not in ("false", "0", "no")
+# once you're ready for the Closer to actually submit orders. Exception:
+# PAPER_AUTOPILOT (paper-only, above) flips the DEFAULT to False -- an
+# explicit DRY_RUN env var still wins either way.
+DRY_RUN = os.getenv("DRY_RUN", "false" if PAPER_AUTOPILOT else "true").lower() not in ("false", "0", "no")
 # Belt-and-suspenders kill switch: EITHER this flag OR the presence of the
 # KILL_SWITCH_PATH file blocks every order, independent of DRY_RUN. The file
 # form means you can engage it by hand (touch the file) without touching code
@@ -98,8 +132,11 @@ KILL_SWITCH_PATH = "pipeline_state/kill_switch"
 # returns everyone's positions -- these caps are scoped to symbols THIS bot's
 # own trade log has actually bought (logger.get_own_symbols()), so the other
 # bots' activity never trips (or silently satisfies) this bot's own budget.
-MAX_CAPITAL_PER_SYMBOL = float(os.getenv("MAX_CAPITAL_PER_SYMBOL", "4000"))   # tracks SIZER_BUDGET * SIZER_MAX_WEIGHT_PER_NAME
-MAX_TOTAL_CAPITAL = float(os.getenv("MAX_TOTAL_CAPITAL", "20000"))            # tracks SIZER_BUDGET
+MAX_CAPITAL_PER_SYMBOL = float(os.getenv("MAX_CAPITAL_PER_SYMBOL", "26000"))  # raised ad hoc for AMZN (2026-10-23) --
+                                                                               # no longer == SIZER_BUDGET * SIZER_MAX_WEIGHT_PER_NAME ($15,000);
+                                                                               # that pair still governs Sizer's own diversification math below,
+                                                                               # this is the real enforced ceiling trader.py's guard checks
+MAX_TOTAL_CAPITAL = float(os.getenv("MAX_TOTAL_CAPITAL", "100000"))           # tracks SIZER_BUDGET
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "10"))
 # Applies to every order this bot submits (buy/sell/close/roll), not just
 # buy_shares -- a runaway loop submitting far more orders than one weekly
@@ -123,6 +160,16 @@ MAX_ORDERS_PER_CYCLE = int(os.getenv("MAX_ORDERS_PER_CYCLE", "20"))
 OTHER_BOTS_SYMBOLS: list[str] = [
     "SPY", "QQQ", "AAPL", "MSFT",
 ]
+
+# Symbols Kishore holds/trades by hand on this same account. Hands-off,
+# exactly like OTHER_BOTS_SYMBOLS: never screened by autopilot research,
+# never auto-approved onto the watchlist, skipped by main.py every cycle --
+# so the bot can never sell calls against (or count as its own lot) shares
+# it didn't buy. Add a symbol here before manually buying it.
+MANUAL_SYMBOLS: list[str] = [
+    "SPCX",
+]
+HANDS_OFF_SYMBOLS: frozenset[str] = frozenset(OTHER_BOTS_SYMBOLS) | frozenset(MANUAL_SYMBOLS)
 
 # Account-level backstop, separate from MAX_TOTAL_CAPITAL above -- reads the
 # WHOLE account's buying power regardless of which bot is using it. Below
@@ -184,8 +231,57 @@ def validate_live_delta(value) -> tuple[bool, str | None, float | None]:
     return True, None, v
 
 
-DTE_MIN              = 30      # days-to-expiration screening window
-DTE_MAX              = 45
+DTE_MIN              = 6       # days-to-expiration screening window -- lowered 2026-10-23 to match
+DTE_MAX              = 30      # ADVISOR_DTE_MIN/MAX's live window (see Strike advisor below): surface
+                                # the best opportunity as soon as possible, not just 30-45 days out
+
+# ── Strike selection + roll rule (live bot) ──────────────────────────────────
+# STRIKE_SELECTION (Kishore's decision, 2026-10-23):
+#   "edge"  -- strike_advisor.pick_strike_by_edge(): every expiration in
+#              [ADVISOR_DTE_MIN, ADVISOR_DTE_MAX], ranked by volatility edge,
+#              earnings-spanning expirations allowed above the expected-move
+#              floor. Ignores the watchlist's per-symbol dte/target_delta
+#              (Oracle still decides WHICH symbols; the advisor picks the contract).
+#   "delta" -- legacy options_data.pick_strike(): nearest target_delta inside
+#              the watchlist's DTE window, earnings-spanning contracts dropped.
+STRIKE_SELECTION = os.getenv("STRIKE_SELECTION", "edge").lower()
+assert STRIKE_SELECTION in ("edge", "delta"), f"STRIKE_SELECTION must be 'edge' or 'delta', got {STRIKE_SELECTION!r}"
+# ROLL_RULE:
+#   "danger" -- roll only when the short call is in trouble: delta >=
+#               ROLL_TRIGGER_DELTA, or ITM with <= ROLL_LAST_DAYS left.
+#               An OTM call near expiry is simply left to expire worthless.
+#               Required for "edge": a 6-DTE call would otherwise trip the
+#               DTE rule the moment it was sold.
+#   "dte"    -- legacy: also roll whenever DTE <= ROLL_MIN_DTE.
+ROLL_RULE = os.getenv("ROLL_RULE", "danger").lower()
+assert ROLL_RULE in ("danger", "dte"), f"ROLL_RULE must be 'danger' or 'dte', got {ROLL_RULE!r}"
+ROLL_LAST_DAYS = 2
+
+# ── Strike advisor (strike_advisor.py) ───────────────────────────────────────
+# Shorter window than DTE_MIN/DTE_MAX on purpose: the advisor ranks every
+# expiration in [6, 34] days by volatility edge rather than fixing one tenor.
+ADVISOR_DTE_MIN = 6
+ADVISOR_DTE_MAX = 30    # lowered from 34 on 2026-10-23 (Kishore's decision: "minimum of 6 days and max of 30 days on all")
+ADVISOR_MIN_DELTA = 0.10
+ADVISOR_MAX_DELTA = 0.35       # caps assignment risk -- edge alone would happily pick near-the-money
+# Forecast vol = weighted blend of trailing realized vols (trading-day
+# windows), computed on returns with earnings days removed -- the
+# earnings jump is modeled separately, only for expirations that span it.
+ADVISOR_VOL_BLEND = ((20, 0.5), (60, 0.3), (252, 0.2))
+# Strike floor for an expiration spanning earnings:
+#   strike >= spot * exp(EARNINGS_MOVE_BUFFER * max(implied move, historical move))
+# where both moves are 1-standard-deviation log moves. 1.0 = one expected move.
+EARNINGS_MOVE_BUFFER = 1.0
+EARNINGS_HISTORY_YEARS = 3
+EARNINGS_MIN_HISTORY = 4       # fewer past earnings than this -> skip earnings expirations (fail closed)
+
+assert 0 < ADVISOR_DTE_MIN < ADVISOR_DTE_MAX
+assert 0 < ADVISOR_MIN_DELTA < ADVISOR_MAX_DELTA < 1
+assert abs(sum(w for _, w in ADVISOR_VOL_BLEND) - 1.0) < 1e-9
+assert not (STRIKE_SELECTION == "edge" and ROLL_RULE == "dte" and ADVISOR_DTE_MIN <= 7), (
+    "STRIKE_SELECTION=edge can open calls at ADVISOR_DTE_MIN days, which the legacy ROLL_RULE=dte "
+    "(ROLL_MIN_DTE=7) would roll immediately -- use ROLL_RULE=danger"
+)
 
 PROFIT_TAKE_PCT      = 0.60    # buy-to-close once this fraction of max premium is captured
 ROLL_TRIGGER_DELTA   = 0.70    # roll if short call's delta rises above this (being tested)
@@ -249,22 +345,28 @@ DAILY_IVR_MIN_HISTORY_POINTS = 252  # ~1 trading year of daily snapshots before 
 
 # ── Oracle research tuning (backtest.py, Task 2) ─────────────────────────────
 # Floor on Oracle's DTE bucket sweep (backtest.py's DEFAULT_DTE_BUCKETS, and
-# any --dte override) -- added after a real backtest run picked dte=7 for
-# two symbols, exactly equal to ROLL_MIN_DTE, with zero runway before the
-# roll trigger fires. A SEPARATE constant from ROLL_MIN_DTE on purpose:
-# Oracle's margin above the roll trigger is a research-time editorial
-# choice (how much runway a cycle should have before a roll even becomes
-# possible), not the roll trigger itself -- main.py's
-# needs_roll_dte = dte <= ROLL_MIN_DTE stays exactly as it is. The assert
-# below only checks ORACLE_MIN_DTE is strictly greater than ROLL_MIN_DTE
-# (a "margin" by definition, not just >=) -- it does not decide HOW big
-# that margin should be; see apply_watchlist.py's diff warning and
-# main.py's own DTE_TOLERANCE_DAYS (+/-5) for how thin 14 vs. 7 actually
-# leaves it (2 days, at main._dte_window's own floor).
-ORACLE_MIN_DTE = 14
-assert ORACLE_MIN_DTE > ROLL_MIN_DTE, (
-    f"ORACLE_MIN_DTE ({ORACLE_MIN_DTE}) must exceed ROLL_MIN_DTE ({ROLL_MIN_DTE}) by a margin"
-)
+# any --dte override). Originally held strictly above ROLL_MIN_DTE so a
+# freshly-opened call under the LEGACY dte-based roll rule (ROLL_RULE="dte",
+# needs_roll_dte = dte <= ROLL_MIN_DTE) would never have zero runway before
+# rolling. Lowered to 6 on 2026-10-23 (Kishore's explicit decision, after
+# being told this requires weakening the assert below: "minimum of 6 days
+# and max of 30 days on all") now that ROLL_RULE="danger" is the active
+# rule -- danger mode never looks at ROLL_MIN_DTE at all (it rolls on
+# delta >= ROLL_TRIGGER_DELTA or ITM with <= ROLL_LAST_DAYS left), so the
+# original zero-runway risk this floor guarded against doesn't apply under
+# it. The assert is now scoped to ROLL_RULE="dte" specifically, so it
+# still protects that legacy path if anyone switches back to it. Oracle's
+# own recommended DTE doesn't drive live trading under STRIKE_SELECTION=
+# "edge" anyway (strike_advisor.py sweeps ADVISOR_DTE_MIN/MAX on its own,
+# ignoring the watchlist's dte field) -- this floor only affects the
+# research/backtest numbers shown in the approval diff.
+ORACLE_MIN_DTE = 6
+if ROLL_RULE == "dte":
+    assert ORACLE_MIN_DTE > ROLL_MIN_DTE, (
+        f"ORACLE_MIN_DTE ({ORACLE_MIN_DTE}) must exceed ROLL_MIN_DTE ({ROLL_MIN_DTE}) by a margin "
+        f"under the legacy ROLL_RULE='dte' -- otherwise a freshly-opened call has zero runway "
+        f"before the roll trigger fires. Use ROLL_RULE='danger' to allow ORACLE_MIN_DTE this low."
+    )
 
 # Delta sweep, alongside the existing DTE sweep (DEFAULT_DTE_BUCKETS, in
 # backtest.py — it's symbol/options-chain-specific, not a global constant).
@@ -349,10 +451,11 @@ INTENT_BAND_SWEEP_POINTS = 3
 # ── Sizer (sizer.py, Task 1) — position sizing against Scout's screened
 # universe, before Oracle ever runs. Independent of Oracle/backtest.py: it
 # only needs price (from screened_symbols.json), never yield/return data.
-SIZER_BUDGET = 20_000.0
-SIZER_MAX_PRICE_PER_SHARE = 35.0       # a single 100-share lot above this is too expensive to size at all
+SIZER_BUDGET = 100_000.0
+SIZER_MAX_PRICE_PER_SHARE = 260.0      # a single 100-share lot above this is too expensive to size at all --
+                                        # raised ad hoc for AMZN (~$249/share, 2026-10-23)
 SIZER_MIN_NAMES = 6                    # diversification floor -- sizer.py reports clearly if it can't hit this
-SIZER_MAX_WEIGHT_PER_NAME = 0.20       # cap on capital (of SIZER_BUDGET, not just the investable portion) per symbol
+SIZER_MAX_WEIGHT_PER_NAME = 0.30       # cap on capital (of SIZER_BUDGET, not just the investable portion) per symbol
 SIZER_CASH_RESERVE_PCT = 0.10          # fraction of SIZER_BUDGET sizer.py never allocates
 
 # ── Schedule ──────────────────────────────────────────────────────────────────

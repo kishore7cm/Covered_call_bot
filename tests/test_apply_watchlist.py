@@ -240,7 +240,9 @@ def _write_proposed(tmp_path) -> Path:
     path = tmp_path / "proposed.json"
     path.write_text(json.dumps({
         "generated_at": "2026-10-21",
-        "symbols": {"AAPL": {"dte": 30, "avg_annualized_yield": 0.18,
+        # Not AAPL: that's in OTHER_BOTS_SYMBOLS, which apply_watchlist.py
+        # now strips from every proposal before diffing/applying.
+        "symbols": {"KO": {"dte": 30, "avg_annualized_yield": 0.18,
                               "in_sample_yield": 0.18, "out_of_sample_yield": 0.16, "oos_gap_pp": 2.0}},
     }))
     return path
@@ -281,8 +283,9 @@ def test_confirm_writes_active_file_matching_proposed(tmp_path):
     # proposed's own generated_at (when the Oracle produced these numbers).
     assert "confirmed_at" in active
     assert active["confirmed_at"] != proposed.get("generated_at")
-    active_without_confirmed_at = {k: v for k, v in active.items() if k != "confirmed_at"}
-    assert active_without_confirmed_at == proposed
+    assert active["approved_by"] == "human"
+    active_without_stamps = {k: v for k, v in active.items() if k not in ("confirmed_at", "approved_by")}
+    assert active_without_stamps == proposed
 
 
 # ── _empirical_summary: missing sibling fields show "n/a", never 0.0% ───────

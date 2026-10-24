@@ -802,7 +802,8 @@ def test_apply_oracle_min_dte_floor_drops_everything_below_floor():
 
 def test_apply_oracle_min_dte_floor_uses_config_default():
     import config
-    kept, dropped = backtest.apply_oracle_min_dte_floor((7, 14, 21))
-    assert dropped == [7]
-    assert kept == (14, 21)
-    assert config.ORACLE_MIN_DTE == 14
+    below = config.ORACLE_MIN_DTE - 1
+    above = config.ORACLE_MIN_DTE + 1
+    kept, dropped = backtest.apply_oracle_min_dte_floor((below, config.ORACLE_MIN_DTE, above))
+    assert dropped == [below]
+    assert kept == (config.ORACLE_MIN_DTE, above)

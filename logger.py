@@ -357,27 +357,31 @@ def get_own_symbols() -> set[str] | None:
 def get_expected_share_qty(symbol: str) -> int | None:
     """
     This bot's own best guess at how many shares of `symbol` it should
-    currently hold, computed purely from its own trade log: one
-    SHARES_PER_LOT per logged BUY, minus one SHARES_PER_LOT per logged
-    ASSIGNED (this bot never buys or sells a partial lot, and only ever
-    holds at most one lot per symbol at a time -- see main.py's state
-    machine). This is NOT authoritative -- the broker's live share count
-    always is -- it exists purely as an overlap-detection signal: if the
-    broker's count doesn't match this, something touched this symbol's
-    position that this bot's own log doesn't know about (another bot on
-    this shared account, a human, a bug). Returns None if DATABASE_URL
-    isn't configured or the query fails -- callers must treat that as
-    "can't verify," not as "0 expected."
+    currently hold, computed purely from its own trade log: the sum of
+    every logged BUY's qty, minus one SHARES_PER_LOT per logged ASSIGNED
+    (an assignment always calls away exactly one full lot -- the covered
+    call it was written against covers SHARES_PER_LOT shares regardless of
+    how many BUY rows built that lot up -- see main.py's state machine).
+    Summed rather than counted: a lot can legitimately span more than one
+    BUY row (e.g. a partial fill topped up later via add_to_lot/
+    top_up_partial_lot.py) without that being a second lot. This is NOT
+    authoritative -- the broker's live share count always is -- it exists
+    purely as an overlap-detection signal: if the broker's count doesn't
+    match this, something touched this symbol's position that this bot's
+    own log doesn't know about (another bot on this shared account, a
+    human, a bug). Returns None if DATABASE_URL isn't configured or the
+    query fails -- callers must treat that as "can't verify," not as "0
+    expected."
     """
     if not DATABASE_URL:
         return None
     try:
         with _connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM share_trades WHERE symbol = %s AND side = 'BUY'", (symbol,))
-            buys = cur.fetchone()[0]
+            cur.execute("SELECT COALESCE(SUM(qty), 0) FROM share_trades WHERE symbol = %s AND side = 'BUY'", (symbol,))
+            bought_shares = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM option_trades WHERE symbol = %s AND action = 'ASSIGNED'", (symbol,))
             assignments = cur.fetchone()[0]
-            return max(0, buys - assignments) * SHARES_PER_LOT
+            return max(0, bought_shares - assignments * SHARES_PER_LOT)
     except Exception as e:
         logger.error("get_expected_share_qty failed: %s", e)
         return None
@@ -485,6 +489,55 @@ def get_open_lot(symbol: str) -> dict | None:
             return dict(zip(_LOT_COLS, row)) if row else None
     except Exception as e:
         logger.error("get_open_lot failed: %s", e)
+        raise DBUnavailable(str(e)) from e
+
+
+def add_to_lot(symbol: str, additional_qty: int, additional_cost_basis_per_share: float) -> None:
+    """
+    Blend `additional_qty` more shares (at additional_cost_basis_per_share)
+    into the CURRENTLY open lot for `symbol`, updating its qty and
+    cost_basis_per_share in place -- never opens a second lot row. For
+    reconciling a real fill that landed in more than one piece (e.g. a
+    partial fill via trader._walk_limit_order, followed by a manual
+    top-up to reach SHARES_PER_LOT) against the SAME lot a human already
+    approved, so "one open lot per symbol" stays true and the cost basis
+    stays accurate for every future pick_strike() floor check and P&L
+    calculation.
+
+    Raises DBUnavailable if DATABASE_URL is set but the update fails, OR
+    if there's no open lot to update at all -- the caller just recorded a
+    REAL fill (same contract as open_lot's callers), so a missing lot
+    here means the cost-basis record is already out of sync with the
+    broker, which must never pass silently. A deliberate no-op,
+    consistent with open_lot() itself, only when DATABASE_URL isn't
+    configured at all (no lot tracking is happening in that mode either).
+    """
+    if not DATABASE_URL:
+        return
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, qty, cost_basis_per_share FROM lots WHERE symbol = %s AND closed_at IS NULL "
+                "ORDER BY opened_at DESC LIMIT 1",
+                (symbol,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise DBUnavailable(f"add_to_lot({symbol}): no open lot found to update")
+            lot_id, old_qty, old_basis = row
+            old_qty = int(old_qty)
+            old_basis = float(old_basis)
+            new_qty = old_qty + additional_qty
+            new_basis = (old_qty * old_basis + additional_qty * additional_cost_basis_per_share) / new_qty
+            cur.execute(
+                "UPDATE lots SET qty = %s, cost_basis_per_share = %s WHERE id = %s",
+                (new_qty, new_basis, lot_id),
+            )
+            conn.commit()
+    except DBUnavailable:
+        raise
+    except Exception as e:
+        logger.error("add_to_lot(%s) failed: %s", symbol, e)
         raise DBUnavailable(str(e)) from e
 
 

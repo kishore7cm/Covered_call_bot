@@ -129,6 +129,17 @@ def test_get_own_symbols_and_expected_share_qty():
     assert logger.get_expected_share_qty("AAPL") == 0
 
 
+def test_get_expected_share_qty_sums_multi_row_lot_not_counts_rows():
+    """A lot legitimately built from more than one BUY row (e.g. a partial
+    fill topped up later via add_to_lot/top_up_partial_lot.py) must still
+    expect SHARES_PER_LOT in total, not SHARES_PER_LOT per row -- this is
+    the exact bug that produced a false-positive overlap skip for AMZN's
+    96+4 top-up in live paper trading."""
+    logger.log_share_trade("AAPL", "BUY", 96, price=248.68)
+    logger.log_share_trade("AAPL", "BUY", 4, price=250.00)
+    assert logger.get_expected_share_qty("AAPL") == 100
+
+
 def test_get_rolls_since_last_lot_open_cte_query_runs_and_counts_correctly():
     """This is the most SQL-complex query in logger.py (CTE + UNION ALL +
     cross join) -- exactly the kind of thing a monkeypatched unit test

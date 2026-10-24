@@ -17,6 +17,15 @@ a watchlist change stays a separate, deliberate human action. It also never
 touches main.py/trader.py — the live trader keeps running as its own
 independent process on its own schedule, same as before this script existed.
 
+EXCEPTION -- PAPER_AUTOPILOT (Kishore's decision, 2026-10-23, paper only):
+run_research(..., auto_confirm=True) -- used by main.py's weekly autopilot
+job, or `research --auto-confirm` by hand -- DOES approve its own proposal,
+via apply_watchlist.py --confirm --approved-by autopilot, and appends a
+record to AUTOPILOT_APPROVALS_LOG. Refused unless config.PAPER_AUTOPILOT is
+set, which config.py itself refuses against a non-paper account. An empty
+proposal is never auto-approved (the previous watchlist is left as is).
+Hands-off symbols (HANDS_OFF_SYMBOLS) are dropped before Scout even sees them.
+
 Run manually, or trigger it from an external scheduler (cron / a Railway
 scheduled job) for the research cadence (monthly/quarterly) — deliberately
 not a second always-running process like main.py's, since research doesn't
@@ -32,8 +41,12 @@ import logging
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 
-from config import MAX_CAPITAL_PER_SYMBOL, SHARES_PER_LOT, SIZER_MAX_PRICE_PER_SHARE
+from config import (
+    AUTOPILOT_APPROVALS_LOG, HANDS_OFF_SYMBOLS, MAX_CAPITAL_PER_SYMBOL, PAPER_AUTOPILOT,
+    SHARES_PER_LOT, SIZER_MAX_PRICE_PER_SHARE,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _log = logging.getLogger(__name__)
@@ -96,10 +109,43 @@ def filter_by_capital_caps(screened_path: str, out_path: str) -> list[tuple[str,
     return dropped
 
 
-def run_research(symbols: list[str], dte: str | None) -> None:
+def _proposed_symbols(path: str = PROPOSED_PATH) -> list[str]:
+    try:
+        with open(path) as f:
+            return sorted(json.load(f).get("symbols", {}))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _log_autopilot_approval(symbols: list[str], approved: bool, note: str) -> None:
+    os.makedirs(os.path.dirname(AUTOPILOT_APPROVALS_LOG), exist_ok=True)
+    with open(AUTOPILOT_APPROVALS_LOG, "a") as f:
+        f.write(json.dumps({
+            "at": datetime.now(timezone.utc).isoformat(),
+            "approved": approved, "symbols": symbols, "note": note,
+        }) + "\n")
+
+
+def run_research(symbols: list[str], dte: str | None, auto_confirm: bool = False) -> bool:
+    """
+    Returns True only when the pipeline completed AND (with auto_confirm)
+    a non-empty watchlist was approved. Without auto_confirm, True means
+    the pipeline completed and the diff was printed for a human.
+    """
+    if auto_confirm and not PAPER_AUTOPILOT:
+        raise RuntimeError("auto_confirm requires PAPER_AUTOPILOT=true (paper only)")
+
+    skipped = [s for s in symbols if s.upper() in HANDS_OFF_SYMBOLS]
+    symbols = [s for s in symbols if s.upper() not in HANDS_OFF_SYMBOLS]
+    if skipped:
+        print(f"Hands-off (not researched): {', '.join(skipped)}")
+    if not symbols:
+        _log.error("No symbols left to research after removing hands-off symbols.")
+        return False
+
     if not _run(["screener.py", *symbols, "--out", SCREENED_PATH]):
         _log.error("screener.py failed — stopping before backtest.py to avoid feeding it stale/empty input.")
-        return
+        return False
 
     if not _run(["sizer.py", "--screened", SCREENED_PATH]):
         _log.warning("sizer.py failed — continuing to backtest.py anyway (sizing is informational, not a gate).")
@@ -115,11 +161,25 @@ def run_research(symbols: list[str], dte: str | None) -> None:
         backtest_cmd += ["--dte", dte]
     if not _run(backtest_cmd):
         _log.error("backtest.py failed — stopping before the approval diff.")
-        return
+        if auto_confirm:
+            _log_autopilot_approval([], False, "backtest.py failed")
+        return False
 
     print("\n" + "=" * 60)
-    print("Research complete. Approving the watchlist is a human decision, not automated here:\n")
-    _run(["apply_watchlist.py"])  # no --confirm — prints the diff only, changes nothing
+    if not auto_confirm:
+        print("Research complete. Approving the watchlist is a human decision, not automated here:\n")
+        _run(["apply_watchlist.py"])  # no --confirm — prints the diff only, changes nothing
+        return True
+
+    proposed = [s for s in _proposed_symbols() if s not in HANDS_OFF_SYMBOLS]
+    if not proposed:
+        _log.warning("Autopilot: proposal is empty — NOT approving; previous watchlist left as is.")
+        _log_autopilot_approval([], False, "empty proposal")
+        return False
+    print(f"Research complete. PAPER AUTOPILOT approving: {', '.join(proposed)}\n")
+    ok = _run(["apply_watchlist.py", "--confirm", "--approved-by", "autopilot"])
+    _log_autopilot_approval(proposed, ok, "approved" if ok else "apply_watchlist.py failed")
+    return ok
 
 
 def run_analyze() -> None:
@@ -133,11 +193,14 @@ if __name__ == "__main__":
     research_p = sub.add_parser("research", help="screener.py -> backtest.py -> print the pending approval diff")
     research_p.add_argument("symbols", nargs="+")
     research_p.add_argument("--dte", default=None, help="comma-separated DTE buckets, passed through to backtest.py")
+    research_p.add_argument("--auto-confirm", action="store_true",
+                            help="PAPER_AUTOPILOT only: approve the proposal automatically")
 
     sub.add_parser("analyze", help="run analysis.py against logged trade history")
 
     args = parser.parse_args()
     if args.command == "research":
-        run_research(args.symbols, args.dte)
+        ok = run_research(args.symbols, args.dte, auto_confirm=args.auto_confirm)
+        sys.exit(0 if ok else 1)
     elif args.command == "analyze":
         run_analyze()

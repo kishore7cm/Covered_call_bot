@@ -85,6 +85,48 @@ def test_get_open_lot_returns_lot_dict_when_found(monkeypatch):
     assert lot["qty"] == 100
 
 
+# ── add_to_lot ───────────────────────────────────────────────────────────────
+
+def test_add_to_lot_is_a_noop_when_database_url_unset(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "")
+    logger.add_to_lot("AAPL", 4, 250.0)  # must not raise
+
+
+def test_add_to_lot_raises_dbunavailable_when_no_open_lot(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    monkeypatch.setattr(logger, "_connect", lambda: _FakeConn(_FakeCursor(fetchone_return=None)))
+    with pytest.raises(DBUnavailable):
+        logger.add_to_lot("AAPL", 4, 250.0)
+
+
+def test_add_to_lot_raises_dbunavailable_when_update_fails(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    monkeypatch.setattr(logger, "_connect", _raise_connect)
+    with pytest.raises(DBUnavailable):
+        logger.add_to_lot("AAPL", 4, 250.0)
+
+
+def test_add_to_lot_blends_cost_basis_correctly(monkeypatch):
+    monkeypatch.setattr(logger, "DATABASE_URL", "postgresql://irrelevant/doesnotmatter")
+    # 96 shares @ 248.68, topping up 4 more @ 250.00 -> blended basis.
+    row = (1, 96, 248.68)
+    captured = {}
+
+    class _CapturingCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            if sql.strip().startswith("UPDATE"):
+                captured["params"] = params
+            super().execute(sql, params)
+
+    monkeypatch.setattr(logger, "_connect", lambda: _FakeConn(_CapturingCursor(fetchone_return=row)))
+    logger.add_to_lot("AAPL", 4, 250.0)
+
+    new_qty, new_basis, lot_id = captured["params"]
+    assert new_qty == 100
+    assert new_basis == pytest.approx((96 * 248.68 + 4 * 250.0) / 100)
+    assert lot_id == 1
+
+
 # ── open_lot ──────────────────────────────────────────────────────────────────
 
 def test_open_lot_returns_none_when_database_url_unset(monkeypatch):

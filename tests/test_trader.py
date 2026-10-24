@@ -807,6 +807,34 @@ def test_client_order_id_includes_prefix_and_step(monkeypatch):
     assert coid.endswith("-s0")
 
 
+def test_buy_shares_client_order_id_suffix_is_opt_in(monkeypatch):
+    """Default (no suffix passed) must be byte-for-byte what every normal
+    caller (main.py's State 1) already gets -- this param exists solely
+    for top_up_partial_lot.py, which needs a distinct ID when buying the
+    same symbol a second time on the same day (see trader.buy_shares's
+    own docstring)."""
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked(monkeypatch)
+
+    trader.buy_shares("AAPL", qty=100, estimated_price=100.0)
+
+    coid = fake.submitted_orders[0].client_order_id
+    assert "-topup" not in coid
+    assert coid.startswith(f"{trader.CLIENT_ORDER_ID_PREFIX}-BUY-AAPL-")
+
+
+def test_buy_shares_client_order_id_suffix_when_provided(monkeypatch):
+    fake = FakeBroker()
+    monkeypatch.setattr(trader, "_client", fake)
+    _unblocked(monkeypatch)
+
+    trader.buy_shares("AAPL", qty=4, estimated_price=100.0, client_order_id_suffix="topup")
+
+    coid = fake.submitted_orders[0].client_order_id
+    assert "-topup-s0" in coid
+
+
 # ── Fill handling: partial fills, cancel-vs-fill race, unknown state ────────
 #
 # Each of these scripts get_order_by_id's successive responses via

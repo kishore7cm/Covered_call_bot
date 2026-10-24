@@ -28,7 +28,7 @@ def bs_call_price(spot: float, strike: float, t_years: float, rate: float, iv: f
 
     d1 = (math.log(spot / strike) + (rate + 0.5 * iv ** 2) * t_years) / (iv * math.sqrt(t_years))
     d2 = d1 - iv * math.sqrt(t_years)
-    return spot * norm.cdf(d1) - strike * math.exp(-rate * t_years) * norm.cdf(d2)
+    return float(spot * norm.cdf(d1) - strike * math.exp(-rate * t_years) * norm.cdf(d2))
 
 
 def bs_call_delta(spot: float, strike: float, t_years: float, rate: float, iv: float) -> float:
@@ -37,7 +37,10 @@ def bs_call_delta(spot: float, strike: float, t_years: float, rate: float, iv: f
         return 1.0 if spot > strike else 0.0
 
     d1 = (math.log(spot / strike) + (rate + 0.5 * iv ** 2) * t_years) / (iv * math.sqrt(t_years))
-    return norm.cdf(d1)
+    # norm.cdf returns a numpy float64 even for a plain-float input -- cast
+    # back to a real Python float so downstream consumers (psycopg2 params
+    # in particular, which can't adapt numpy scalar types) aren't handed one.
+    return float(norm.cdf(d1))
 
 
 def bs_call_theta_per_day(spot: float, strike: float, t_years: float, rate: float, iv: float) -> float:
@@ -59,7 +62,7 @@ def bs_call_theta_per_day(spot: float, strike: float, t_years: float, rate: floa
     term1 = -(spot * norm.pdf(d1) * iv) / (2 * math.sqrt(t_years))
     term2 = -rate * strike * math.exp(-rate * t_years) * norm.cdf(d2)
     theta_per_year = term1 + term2
-    return theta_per_year / 365.0
+    return float(theta_per_year / 365.0)
 
 
 def implied_vol(

@@ -717,13 +717,25 @@ def _walk_limit_order(order_symbol: str, underlying_symbol: str, side, qty: int,
 
 # ── Shares ────────────────────────────────────────────────────────────────────
 
-def buy_shares(symbol: str, qty: int = SHARES_PER_LOT, estimated_price: float | None = None) -> dict | None:
+def buy_shares(symbol: str, qty: int = SHARES_PER_LOT, estimated_price: float | None = None,
+               client_order_id_suffix: str | None = None) -> dict | None:
     """
     estimated_price is required for the hard capital caps (Task 2) to be
     enforceable at all -- caller must supply a current quote/trade price
     estimate. Omitting it doesn't skip the caps, it fails them closed (see
     _check_hard_limits): "can't verify the cap" blocks the same as "cap
     exceeded" would, it never defaults to "assume it's fine."
+
+    client_order_id_suffix is None for every normal caller (main.py's
+    State 1 never passes it) -- the base ID stays exactly
+    "{CLIENT_ORDER_ID_PREFIX}-BUY-{symbol}-{date}", unchanged. It exists
+    solely for top_up_partial_lot.py: live-confirmed (2026-10-23) that
+    Alpaca rejects a reused client_order_id outright even once the first
+    order has reached a terminal CANCELED state, not just while still
+    active as config.py's own comment on CLIENT_ORDER_ID_PREFIX assumed --
+    so a second real buy_shares() call for the same symbol on the same
+    day (completing a partial fill) needs a distinct ID to go through at
+    all. Never used by the main trading cycle itself.
     """
     estimated_dollars = qty * estimated_price if estimated_price is not None else None
     block_reason = _guard(
@@ -740,6 +752,8 @@ def buy_shares(symbol: str, qty: int = SHARES_PER_LOT, estimated_price: float | 
     bid, ask = quote
 
     client_order_id_base = f"{CLIENT_ORDER_ID_PREFIX}-BUY-{symbol}-{date.today().isoformat()}"
+    if client_order_id_suffix:
+        client_order_id_base += f"-{client_order_id_suffix}"
     order = _walk_limit_order(symbol, symbol, OrderSide.BUY, qty, bid, ask, None, client_order_id_base)
     if order is None:
         return None
